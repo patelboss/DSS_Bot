@@ -125,9 +125,10 @@ def _build_layout(fig: Figure):
         width_ratios=,
         height_ratios=,
     )
-    ax_map    = fig.add_subplot(gs)   # Main map
-    ax_legend = fig.add_subplot(gs)   # Right panel (legend + north arrow)
-    ax_table  = fig.add_subplot(gs[1, :])   # Bottom panel (statistics table)
+    ax_map    = fig.add_subplot(gs)   # Main map panel layout tracking
+    ax_legend = fig.add_subplot(gs)   # Right panel legend layout tracking
+    ax_table  = fig.add_subplot(gs[1, :])   # Bottom summary table layout tracking
+    
     for ax in (ax_map, ax_legend, ax_table):
         ax.set_facecolor(PALETTE["panel"])
         for spine in ax.spines.values():
@@ -157,7 +158,7 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
     # 🚀 MULTI-POLYGON DRAW ENGINE: Iterate across all sub-geometries explicitly
     geoms_list = [geom] if geom.geom_type == "Polygon" else list(geom.geoms)
 
-    # 1. Forest cover shade filling base layer
+    # Forest cover shade filling base layer
     fcm = results.get("fcm", {})
     dominant_name = fcm.get("dominant", "Non-Forest")
     class_id = next((cid for cid, name in FCM_CLASSES.items() if name == dominant_name), 5)
@@ -321,6 +322,7 @@ def _draw_table(ax, results: dict, filename: str) -> None:
 
     dem = results.get("dem", {})
     fcm = results.get("fcm", {})
+    centroid_vals = results.get('centroid', ('—', '—'))
 
     rows = [
         ("Total Area",         f"{results.get('area_ha', 0):.2f} hectares"),
@@ -331,8 +333,7 @@ def _draw_table(ax, results: dict, filename: str) -> None:
         ("Mean Slope",         f"{dem.get('slope_mean_deg', '—')}°"),
         ("Max Slope",          f"{dem.get('slope_max_deg', '—')}°"),
         ("Source File",        filename),
-        ("Centroid (lon/lat)", f"{results.get('centroid', ('—','—'))}  /  "
-                               f"{results.get('centroid', ('—','—'))}"),
+        ("Centroid (lon/lat)", f"{centroid_vals}  /  {centroid_vals}"),
     ]
 
     mid  = math.ceil(len(rows) / 2)
