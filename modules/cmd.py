@@ -58,9 +58,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "📖 *SDSS Bot — Usage Guide*\n\n"
         "*Supported Formats:*\n"
-        "• GeoJSON `.geojson` — Preferred format\n"
-        "• KML `.kml` — Google Earth export\n"
-        "• GeoPackage `.gpkg` — QGIS export\n\n"
+        "• GeoJSON `.geojson` / `.json` — Preferred format\n"
+        "• KML `.kml` / KMZ `.kmz` — Google Earth exports\n"
+        "• GeoPackage `.gpkg` — QGIS multi-layer vectors\n"
+        "• Shapefile Package `.zip` — Archive containing .shp, .shx, .dbf, .prj\n\n"
         "*Requirements:*\n"
         "• File size must be under 20 MB\n"
         "• Geometry must be a Polygon or MultiPolygon\n"
@@ -82,9 +83,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     document = message.document
     user = update.effective_user
 
+    # 🚀 FIXED: Added archive layout structures to allow passing front gate filters
     suffix = Path(document.file_name or "").suffix.lower()
-    if suffix not in {".geojson", ".json", ".kml", ".gpkg"}:
-        await message.reply_text("⚠️ Please upload a valid spatial `.geojson`, `.kml`, or `.gpkg` file.")
+    if suffix not in {".geojson", ".json", ".kml", ".gpkg", ".kmz", ".zip"}:
+        await message.reply_text(
+            "⚠️ Please upload a valid spatial `.geojson`, `.kml`, `.gpkg`, `.kmz`, or shapefile `.zip` archive.",
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
     status_msg = await message.reply_text("📥 *Processing vector layout properties…*", parse_mode=ParseMode.MARKDOWN)
@@ -122,7 +127,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
     except Exception as exc:
         log.error("Failed to parse or ingest uploaded vector document.", exc_info=True)
-        await status_msg.edit_text(f"❌ *Vector ingestion failed:* {exc}")
+        if status_msg:
+            await status_msg.edit_text(f"❌ *Vector ingestion failed:* {exc}")
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
@@ -135,7 +141,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     action = query.data
-    user = update.effective_user  # 🚀 FIXED: Instantiated user representation securely
+    user = update.effective_user  
     geojson_feature = context.user_data.get("current_feature")
     cached_records = context.user_data.get("cached_df_dict")
     filename = context.user_data.get("filename", "layer")
@@ -193,11 +199,9 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         sys.stdout.flush()
         
         try:
-            # Multi-threaded thread executor wrapping for non-blocking I/O operations
             results = await asyncio.get_event_loop().run_in_executor(None, run_analysis, geojson_feature)
             map_png = await asyncio.get_event_loop().run_in_executor(None, render_map, geojson_feature, results, filename)
 
-            # Store inside history logging database targets
             log_analysis(user.id, filename, geojson_feature, results, results["centroid"])
             summary = _build_summary(results, filename)
             
@@ -206,7 +210,8 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.reply_photo(photo=InputFile(map_png, filename="sdss_report.png"), caption="📊 *SDSS Cartographic Report*")
         except Exception as err:
             log.error("Analysis thread pipeline execution failed: %s", err, exc_info=True)
-            await status_msg.edit_text(f"❌ *Analysis processing failed:* {err}")
+            if status_msg:
+                await status_msg.edit_text(f"❌ *Analysis processing failed:* {err}")
         finally:
             sys.stdout.flush()
 
@@ -271,7 +276,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ── Unknown Message Fallback ──────────────────────────────────────────────────
 async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "📂 Please upload a spatial vector file (`.geojson`, `.kml`, or `.gpkg`) "
+        "📂 Please upload a spatial vector file (`.geojson`, `.kml`, `.gpkg`, `.kmz`, or shapefile `.zip`) "
         "to start analysis, or use /help for instructions.",
         parse_mode=ParseMode.MARKDOWN,
     )
