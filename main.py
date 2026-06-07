@@ -7,29 +7,58 @@ maintaining the Koyeb web-service health container checks cleanly.
 
 import logging
 import threading
+import traceback
 from http.server import SimpleHTTPRequestHandler
 from socketserver import TCPServer
 
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application, 
+    CommandHandler, 
+    MessageHandler, 
+    CallbackQueryHandler, 
+    filters, 
+    ContextTypes
+)
 
 from config import cfg
-# Import our new separated command engine mapping block
 from modules.cmd import (
-    cmd_start,
-    cmd_help,
-    cmd_history,
+    cmd_start, 
+    cmd_help, 
+    cmd_history, 
     cmd_status,
-    handle_document,
-    handle_button_click,
+    handle_document, 
+    handle_button_click, 
     handle_unknown
 )
 
+# ── Logging Setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+# ── Global Error Capture Callback System ──────────────────────────────────────
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Logs runtime exceptions with tracebacks and reports updates cleanly."""
+    log.error("💥 Critical Unhandled Exception caught by SDSS Hooks:", exc_info=context.error)
+    
+    # Extract traceback text to inspect inside server logs
+    tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
+    tb_string = "".join(tb_list)
+    log.error(f"Full traceback summary:\n{tb_string}")
+
+    # Notify user if the crash happened during an active conversation update hook
+    if isinstance(update, Update) and update.effective_message:
+        await update.effective_message.reply_text(
+            "❌ *A critical pipeline extraction error occurred.*\n\n"
+            "Please check the server logs for the full traceback.",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
 
 # ── Koyeb Infrastructure Port Binder ──────────────────────────────────────────
@@ -64,6 +93,9 @@ def build_application() -> Application:
     """Builds and wires up the unified Application environment mapping context."""
     app = Application.builder().token(cfg.TELEGRAM_TOKEN).build()
 
+    # Register the Global Error Handler
+    app.add_error_handler(global_error_handler)
+
     # Core Command Routes
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("help",    cmd_help))
@@ -97,4 +129,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
+    
