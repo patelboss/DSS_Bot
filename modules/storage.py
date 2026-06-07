@@ -9,6 +9,7 @@ the user's polygon bounding box — this keeps memory usage well under the
 
 import logging
 import os
+import sys
 from contextlib import contextmanager
 from typing import Generator
 
@@ -16,23 +17,40 @@ import numpy as np
 import rasterio
 from rasterio.crs import CRS
 from rasterio.mask import mask as rio_mask
-from rasterio.warp import transform_bounds
-from rasterio.windows import from_bounds
 from shapely.geometry import shape, mapping
 from supabase import create_client, Client
 
 from config import cfg
 
+# ── Force Stream / Unbuffered Stdout Logging Setup for Koyeb Console ─────────
 log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+
+if not log.handlers:
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    log.addHandler(stdout_handler)
 
 # ── Supabase client (singleton) ───────────────────────────────────────────────
 _sb: Client | None = None
 
 
 def _get_supabase() -> Client:
+    """Safely initializes and extracts the singleton Supabase storage client."""
     global _sb
     if _sb is None:
-        _sb = create_client(cfg.SUPABASE_URL, cfg.SUPABASE_KEY)
+        if not cfg.SUPABASE_URL or not cfg.SUPABASE_KEY:
+            log.critical("❌ Missing Supabase credentials in environment config parameters.")
+            sys.stdout.flush()
+            raise ValueError("Invalid Supabase environment configuration settings detected.")
+        try:
+            _sb = create_client(cfg.SUPABASE_URL, cfg.SUPABASE_KEY)
+            log.info("✅ Supabase Client initialization successful.")
+            sys.stdout.flush()
+        except Exception as e:
+            log.error(f"❌ Failed to build Supabase client target structure: {str(e)}")
+            sys.stdout.flush()
+            raise
     return _sb
 
 
@@ -44,12 +62,21 @@ def get_signed_url(object_name: str, expires_in: int = 3600) -> str:
     rasterio will use this URL via its VSICURL driver.
     """
     sb = _get_supabase()
-    response = sb.storage.from_(cfg.SUPABASE_BUCKET).create_signed_url(
-        object_name, expires_in
-    )
-    url: str = response["signedURL"]
-    log.debug("Signed URL generated for %s", object_name)
-    return url
+    try:
+        response = sb.storage.from_(cfg.SUPABASE_BUCKET).create_signed_url(
+            object_name, expires_in
+        )
+        if not response or "signedURL" not in response:
+            raise KeyError(f"Response dictionary map missing 'signedURL' key element.")
+        
+        url: str = response["signedURL"]
+        log.info("🔗 Signed URL successfully generated for COG storage layer: %s", object_name)
+        sys.stdout.flush()
+        return url
+    except Exception as err:
+        log.error(f"❌ Error generating signed storage URL connection for target [{object_name}]: {str(err)}")
+        sys.stdout.flush()
+        raise
 
 
 # ── Windowed raster reader ────────────────────────────────────────────────────
@@ -74,9 +101,10 @@ def open_cog(object_name: str) -> Generator[rasterio.DatasetReader, None, None]:
     with env:
         with rasterio.open(vsicurl_path) as src:
             log.info(
-                "Opened COG %s  |  CRS: %s  |  Shape: %s x %s",
+                "🌍 Opened COG %s  |  CRS: %s  |  Shape: %s x %s",
                 object_name, src.crs, src.height, src.width,
             )
+            sys.stdout.flush()
             yield src
 
 
@@ -119,6 +147,8 @@ def extract_masked_array(
                 all_touched=True,
             )
         except ValueError as exc:
+            log.error(f"❌ Geolocation masking overlap error for target layer [{object_name}].")
+            sys.stdout.flush()
             raise ValueError(
                 f"Polygon does not overlap raster layer '{object_name}'. "
                 "Ensure the polygon is within the study area extent."
@@ -128,8 +158,8 @@ def extract_masked_array(
         meta.update(
             {
                 "driver":    "GTiff",
-                "height":    out_image.shape[0],
-                "width":     out_image.shape[1],
+                "height":    out_image.shape,
+                "width":     out_image.shape,
                 "transform": out_transform,
                 "count":     1,
             }
@@ -142,7 +172,9 @@ def extract_masked_array(
             masked = np.ma.array(out_image)
 
         log.info(
-            "Extracted %d valid pixels from %s",
+            "📊 Extracted %d valid pixel cells securely from %s",
             masked.count(), object_name
         )
+        sys.stdout.flush()
         return masked, meta
+        
