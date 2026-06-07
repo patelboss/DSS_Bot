@@ -11,12 +11,16 @@ Command reference
 Upload workflow:
   User sends a .geojson / .kml / .gpkg file → bot runs the full
   analysis pipeline and replies with a summary + map PNG.
+
+Koyeb Update: Integrated a background HTTP daemon server to pass health checks cleanly.
 """
 
 import asyncio
 import logging
 import os
-import tempfile
+import threading
+from http.server import SimpleHTTPRequestHandler
+from socketserver import TCPServer
 from pathlib import Path
 
 from telegram import (
@@ -49,6 +53,35 @@ log = logging.getLogger(__name__)
 
 # Ensure temp directory exists
 Path(cfg.TEMP_DIR).mkdir(parents=True, exist_ok=True)
+
+
+# ── Koyeb Health Check Web Server ─────────────────────────────────────────────
+
+def run_koyeb_health_server():
+    """
+    Spins up a lightweight HTTP server on port 8080 to satisfy Koyeb's
+    internal infrastructure monitoring and keep the container alive.
+    """
+    class HealthHandler(SimpleHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == '/health':
+                self.send_response(200)
+                self.send_header("Content-type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"OK")
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    port = 8080
+    try:
+        # Allow reuse of address to prevent "Address already in use" errors on fast re-deploys
+        TCPServer.allow_reuse_address = True
+        with TCPServer(("", port), HealthHandler) as httpd:
+            log.info("🌍 Koyeb Background Health Server active on port %d", port)
+            httpd.serve_forever()
+    except Exception as e:
+        log.error("❌ Failed to start health server: %s", e)
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -327,7 +360,11 @@ def build_application() -> Application:
 
 
 def main() -> None:
-    log.info("Starting SDSS Telegram Bot …")
+    # 🚀 Kick off Koyeb Http listener daemon before building Telegram Application
+    health_thread = threading.Thread(target=run_koyeb_health_server, daemon=True)
+    health_thread.start()
+
+    log.info("Starting SDSS Telegram Bot with Health-Hooks…")
     app = build_application()
     app.run_polling(
         drop_pending_updates=True,
@@ -337,3 +374,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+  
