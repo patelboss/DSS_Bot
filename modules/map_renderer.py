@@ -2,7 +2,7 @@
 modules/map_renderer.py — Programmatic cartographic layout engine.
 
 Produces a publication-quality PNG with:
-  • Polygon boundary drawn over a light basemap grid
+  • Polygon & Multi-Polygon boundaries drawn over a light basemap grid
   • North arrow (custom SVG-like patch)
   • Auto-calculating scale bar
   • Dynamic legend for forest cover classes
@@ -12,6 +12,7 @@ Produces a publication-quality PNG with:
 import io
 import logging
 import math
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +30,14 @@ from shapely.geometry import shape
 
 from config import cfg, FCM_CLASSES, FCM_COLORS
 
+# ── Force Stream / Unbuffered Stdout Logging Setup for Koyeb Console ─────────
 log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+
+if not log.handlers:
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    log.addHandler(stdout_handler)
 
 # ── Colour palette ────────────────────────────────────────────────────────────
 PALETTE = {
@@ -59,7 +67,7 @@ def render_map(
 
     Parameters
     ----------
-    geojson_feature : GeoJSON Feature (polygon in WGS-84)
+    geojson_feature : GeoJSON Feature (Polygon or MultiPolygon in WGS-84)
     results         : dict from spatial_analysis.run_analysis()
     filename        : base name of the source file (for map title)
 
@@ -85,7 +93,9 @@ def render_map(
     )
     plt.close(fig)
     buf.seek(0)
-    log.info("Map rendered  |  format=%s  |  dpi=%d", cfg.OUTPUT_FORMAT, cfg.OUTPUT_DPI)
+    
+    log.info("✅ Map successfully rendered  |  format=%s  |  dpi=%d", cfg.OUTPUT_FORMAT, cfg.OUTPUT_DPI)
+    sys.stdout.flush()
     return buf.read()
 
 
@@ -112,11 +122,11 @@ def _build_layout(fig: Figure):
         left=0.04, right=0.96,
         top=0.88,  bottom=0.04,
         hspace=0.06, wspace=0.06,
-        width_ratios=[3, 1],
-        height_ratios=[3, 1],
+        width_ratios=,
+        height_ratios=,
     )
-    ax_map    = fig.add_subplot(gs[0, 0])   # Main map
-    ax_legend = fig.add_subplot(gs[0, 1])   # Right panel (legend + north arrow)
+    ax_map    = fig.add_subplot(gs)   # Main map
+    ax_legend = fig.add_subplot(gs)   # Right panel (legend + north arrow)
     ax_table  = fig.add_subplot(gs[1, :])   # Bottom panel (statistics table)
     for ax in (ax_map, ax_legend, ax_table):
         ax.set_facecolor(PALETTE["panel"])
@@ -132,35 +142,46 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
     geom = shape(geojson_feature["geometry"])
     minx, miny, maxx, maxy = geom.bounds
 
-    # Add 15% padding around the polygon
-    pad_x = (maxx - minx) * 0.15
-    pad_y = (maxy - miny) * 0.15
+    # Add 15% padding around the geometry bounding context box
+    pad_x = (maxx - minx) * 0.15 if (maxx - minx) > 0 else 0.01
+    pad_y = (maxy - miny) * 0.15 if (maxy - miny) > 0 else 0.01
     xlim  = (minx - pad_x, maxx + pad_x)
     ylim  = (miny - pad_y, maxy + pad_y)
 
-    # Light grey background grid
+    # Light grey background grid setup
     ax.set_xlim(*xlim)
     ax.set_ylim(*ylim)
     ax.set_facecolor("#e8ede8")
     ax.grid(True, color=PALETTE["grid"], linewidth=0.5, linestyle="--", alpha=0.7)
 
-    # Forest cover colour fill (if available)
-    _shade_polygon_by_cover(ax, geom, results)
+    # 🚀 MULTI-POLYGON DRAW ENGINE: Iterate across all sub-geometries explicitly
+    geoms_list = [geom] if geom.geom_type == "Polygon" else list(geom.geoms)
 
-    # Polygon boundary
-    xs, ys = _extract_coords(geom)
-    ax.fill(xs, ys, color=PALETTE["poly_fill"], linewidth=0, alpha=0.6)
-    ax.plot(xs, ys, color=PALETTE["poly_edge"], linewidth=2.0, solid_capstyle="round")
+    # 1. Forest cover shade filling base layer
+    fcm = results.get("fcm", {})
+    dominant_name = fcm.get("dominant", "Non-Forest")
+    class_id = next((cid for cid, name in FCM_CLASSES.items() if name == dominant_name), 5)
+    shade_color = FCM_COLORS.get(class_id, "#e8e8e8")
+
+    for part in geoms_list:
+        coords = list(part.exterior.coords)
+        xs = [c for c in coords]
+        ys = [c for c in coords]
+        
+        # Shade background by classification
+        ax.fill(xs, ys, color=shade_color, alpha=0.35, linewidth=0, zorder=2)
+        # Translucent white baseline fill
+        ax.fill(xs, ys, color=PALETTE["poly_fill"], linewidth=0, alpha=0.6, zorder=3)
+        # Vector crisp perimeter line plot
+        ax.plot(xs, ys, color=PALETTE["poly_edge"], linewidth=2.0, solid_capstyle="round", zorder=4)
 
     # Coordinate grid labels
     ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.4f°E"))
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.4f°N"))
     ax.tick_params(axis="both", labelsize=7, color=PALETTE["text_mid"])
 
-    # Scale bar
+    # Scale bar & North arrow assets
     _draw_scale_bar(ax, xlim, ylim)
-
-    # North arrow
     _draw_north_arrow(ax, xlim, ylim)
 
     ax.set_aspect("equal")
@@ -168,31 +189,10 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
     ax.set_ylabel("Latitude",  fontsize=8, color=PALETTE["text_mid"])
 
 
-def _shade_polygon_by_cover(ax, geom, results: dict) -> None:
-    """
-    Draw a hatched fill suggesting dominant forest class colour.
-    We can't draw actual raster pixels here (not downloaded locally),
-    so we use the dominant class colour as a semi-transparent polygon fill.
-    """
-    fcm = results.get("fcm", {})
-    dominant_name = fcm.get("dominant", "Non-Forest")
-
-    # Find the class_id from the name
-    class_id = next(
-        (cid for cid, name in FCM_CLASSES.items() if name == dominant_name),
-        5
-    )
-    color = FCM_COLORS.get(class_id, "#e8e8e8")
-
-    xs, ys = _extract_coords(geom)
-    ax.fill(xs, ys, color=color, alpha=0.35, linewidth=0, zorder=2)
-
-
 def _draw_scale_bar(ax, xlim, ylim) -> None:
     """Dynamic scale bar calculated from degree span."""
-    span_deg   = xlim[1] - xlim[0]
-    # 1 degree longitude ≈ 111 km * cos(lat) — approximate for label
-    mid_lat    = (ylim[0] + ylim[1]) / 2
+    span_deg   = xlim - xlim
+    mid_lat    = (ylim + ylim) / 2
     km_per_deg = 111.0 * math.cos(math.radians(mid_lat))
     span_km    = span_deg * km_per_deg
 
@@ -200,37 +200,36 @@ def _draw_scale_bar(ax, xlim, ylim) -> None:
     bar_km     = _round_to_nice(span_km * 0.20)
     bar_deg    = bar_km / km_per_deg
 
-    x0 = xlim[0] + (xlim[1] - xlim[0]) * 0.05
-    y0 = ylim[0] + (ylim[1] - ylim[0]) * 0.05
+    x0 = xlim + (xlim - xlim) * 0.05
+    y0 = ylim + (ylim - ylim) * 0.05
 
     # Alternating black/white segments
     for i in range(4):
         seg_color = "black" if i % 2 == 0 else "white"
         ax.barh(
             y0, bar_deg / 4, left=x0 + i * bar_deg / 4,
-            height=(ylim[1] - ylim[0]) * 0.012,
+            height=(ylim - ylim) * 0.012,
             color=seg_color, edgecolor="black", linewidth=0.5, zorder=6
         )
 
     ax.text(
-        x0 + bar_deg / 2, y0 + (ylim[1] - ylim[0]) * 0.025,
+        x0 + bar_deg / 2, y0 + (ylim - ylim) * 0.025,
         f"{bar_km:.1f} km",
         ha="center", va="bottom", fontsize=7,
         color=PALETTE["text_dark"], fontweight="bold", zorder=7
     )
     ax.text(
-        x0, y0 - (ylim[1] - ylim[0]) * 0.01,
+        x0, y0 - (ylim - ylim) * 0.01,
         "0", ha="center", fontsize=6, color=PALETTE["text_dark"], zorder=7
     )
 
 
 def _draw_north_arrow(ax, xlim, ylim) -> None:
     """Simple north arrow in the top-right corner of the map."""
-    x = xlim[0] + (xlim[1] - xlim[0]) * 0.92
-    y = ylim[0] + (ylim[1] - ylim[0]) * 0.88
-    h = (ylim[1] - ylim[0]) * 0.07
+    x = xlim + (xlim - xlim) * 0.92
+    y = ylim + (ylim - ylim) * 0.88
+    h = (ylim - ylim) * 0.07
 
-    # Filled black triangle (north half)
     ax.annotate(
         "", xy=(x, y + h), xytext=(x, y),
         arrowprops=dict(
@@ -241,7 +240,7 @@ def _draw_north_arrow(ax, xlim, ylim) -> None:
         zorder=8
     )
     ax.text(
-        x, y + h + (ylim[1] - ylim[0]) * 0.01, "N",
+        x, y + h + (ylim - ylim) * 0.01, "N",
         ha="center", va="bottom",
         fontsize=9, fontweight="bold",
         color=PALETTE["text_dark"], zorder=8
@@ -332,11 +331,10 @@ def _draw_table(ax, results: dict, filename: str) -> None:
         ("Mean Slope",         f"{dem.get('slope_mean_deg', '—')}°"),
         ("Max Slope",          f"{dem.get('slope_max_deg', '—')}°"),
         ("Source File",        filename),
-        ("Centroid (lon/lat)", f"{results.get('centroid', ('—','—'))[0]}  /  "
-                               f"{results.get('centroid', ('—','—'))[1]}"),
+        ("Centroid (lon/lat)", f"{results.get('centroid', ('—','—'))}  /  "
+                               f"{results.get('centroid', ('—','—'))}"),
     ]
 
-    # Two-column layout (split rows across two columns for space)
     mid  = math.ceil(len(rows) / 2)
     col1 = rows[:mid]
     col2 = rows[mid:]
@@ -378,7 +376,6 @@ def _draw_title(fig: Figure, filename: str) -> None:
         fontsize=9, color=PALETTE["text_mid"],
         style="italic"
     )
-    # Header rule
     fig.add_artist(
         plt.Line2D(
             [0.04, 0.96], [0.925, 0.925],
@@ -390,20 +387,10 @@ def _draw_title(fig: Figure, filename: str) -> None:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _extract_coords(geom):
-    """Extract exterior ring x/y for simple Polygon or MultiPolygon."""
-    if geom.geom_type == "Polygon":
-        coords = list(geom.exterior.coords)
-    else:  # MultiPolygon — take the largest
-        largest = max(geom.geoms, key=lambda p: p.area)
-        coords  = list(largest.exterior.coords)
-    xs = [c[0] for c in coords]
-    ys = [c[1] for c in coords]
-    return xs, ys
-
-
 def _round_to_nice(val: float) -> float:
     """Round a value to a 'nice' number (1, 2, 5, 10, 20, 50 …)."""
+    if val <= 0:
+        return 1.0
     magnitude = 10 ** math.floor(math.log10(val))
     residual  = val / magnitude
     if residual < 1.5:
@@ -414,3 +401,4 @@ def _round_to_nice(val: float) -> float:
         return 5 * magnitude
     else:
         return 10 * magnitude
+      
