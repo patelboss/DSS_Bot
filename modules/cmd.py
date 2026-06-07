@@ -62,13 +62,31 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
+
+
+# ── Interactive Callback Menu Router ──────────────────────────────────────────
+"""
+modules/cmd.py
+"""
 import io
 import csv
+import logging
+import asyncio
 import pandas as pd
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from pathlib import Path
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.constants import ParseMode, ChatAction
+from telegram.ext import ContextTypes
 
-# ── File Document Ingestion Handler ───────────────────────────────────────────
+from config import cfg
+from modules.database import upsert_user, log_analysis, get_user_history
+from modules.spatial_analysis import load_vector_file, run_analysis
+from modules.map_renderer import render_map
+
+log = logging.getLogger(__name__)
+
+# ... Keep cmd_start, cmd_help, cmd_history, cmd_status identical ...
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     document = message.document
@@ -80,57 +98,45 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     status_msg = await message.reply_text("📥 *Processing vector layout properties…*", parse_mode=ParseMode.MARKDOWN)
-
     tmp_path = Path(cfg.TEMP_DIR) / f"{user.id}_{document.file_name}"
+    
     try:
         tg_file = await context.bot.get_file(document.file_id)
         await tg_file.download_to_drive(str(tmp_path))
 
-        # Ingest both the polygon mask and the attribute data frame
         geojson_feature, gdf_attributes = load_vector_file(tmp_path)
 
-        # Cache variables cleanly inside session memory
+        # Cache variables inside temporary user session memory
         context.user_data["current_feature"] = geojson_feature
         context.user_data["filename"] = document.file_name
         
-        # Convert DataFrame to a serializable dictionary format to store safely in session memory
+        # Strip spatial data to safely cache attribute dataframe rows as serializable dict list
         attr_df = gdf_attributes.drop(columns=["geometry"], errors="ignore")
         context.user_data["cached_df_dict"] = attr_df.to_dict(orient="records")
 
-        # Construct Interactive Menu Options
         keyboard = [
             [InlineKeyboardButton("📋 View Attributes Table", callback_data="action_attributes")],
             [InlineKeyboardButton("🔬 Run Spatial DSS Analysis", callback_data="action_analysis")]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        total_features = len(gdf_attributes)
+        
         await status_msg.delete()
         await message.reply_text(
             f"✅ *Layer Ingested Successfully!*\n\n"
             f"📁 *File:* `{document.file_name}`\n"
-            f"📦 *Total Features (Polygons):* `{total_features}`\n\n"
-            f"What task should the SDSS execute?",
+            f"📦 *Total Features:* `{len(gdf_attributes)}` Polygons\n\n"
+            f"Select processing task:",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=reply_markup
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
-
-    except Exception as exc:
-        log.error("Ingestion failed for user %d: %s", user.id, exc, exc_info=True)
-        await status_msg.edit_text(f"⚠️ *Validation Error:*\n{exc}", parse_mode=ParseMode.MARKDOWN)
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
 
-
-# ── Interactive Callback Menu Router ──────────────────────────────────────────
 async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
 
     action = query.data
-    user = update.effective_user
-
     geojson_feature = context.user_data.get("current_feature")
     cached_records = context.user_data.get("cached_df_dict")
     filename = context.user_data.get("filename", "layer")
@@ -141,51 +147,43 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     base_name = Path(filename).stem
 
+    # 🚀 EXPORT BOTH: SENDS MESSAGE LAYOUT + DOCUMENT SPREADSHEET
     if action == "action_attributes":
         await query.message.reply_chat_action(ChatAction.UPLOAD_DOCUMENT)
-        
-        # Reconstruct DataFrame from context memory cache
         df = pd.DataFrame(cached_records)
         
-        # 1️⃣ Format a sleek text summary preview for the Telegram chat window
-        text_preview = f"📊 *Attributes Preview for `{filename}`*\n\n"
-        text_preview += f"🔹 Total rows detected: `{len(df)}` \n"
-        
-        # Generate clean text grid columns for the top 5 records
+        # 1. Format text-grid preview representation
+        text_preview = f"📊 *Attributes Table Preview for `{filename}`*\n"
+        text_preview += f"Total rows detected: `{len(df)}` \n\n"
         text_preview += "```text\n"
-        # Print column header line
-        cols_to_show = [c for c in df.columns if c not in ["description", "Description"]]
-        text_preview += " | ".join(cols_to_show[:4]) + "\n"
-        text_preview += "-" * 30 + "\n"
+        
+        # Isolate top columns for the preview card layout
+        cols = [c for c in df.columns if c not in ["description", "Description"]]
+        text_preview += " | ".join(cols[:4]) + "\n"
+        text_preview += "-" * 35 + "\n"
         
         for _, row in df.head(5).iterrows():
-            row_vals = [str(row[c])[:12] for c in cols_to_show[:4]]
-            text_preview += " | ".join(row_vals) + "\n"
-        
+            vals = [str(row[c])[:12] for c in cols[:4]]
+            text_preview += " | ".join(vals) + "\n"
+            
         if len(df) > 5:
-            text_preview += "... and more rows inside spreadsheet document below\n"
+            text_preview += "... data frame truncated for chat view.\n"
         text_preview += "```"
 
-        # 2️⃣ Generate the complete full-scale .csv file stream
+        # 2. Build full-scale backup spreadsheet (.csv) stream
         csv_buffer = io.StringIO()
         df.to_csv(csv_buffer, index=False)
         csv_bytes = csv_buffer.getvalue().encode('utf-8')
         csv_buffer.close()
 
-        # 3️⃣ Dispatch both presentation styles simultaneously!
-        # First send the visual text summary card
+        # Dispatch both styles to chat concurrently
         await query.message.reply_text(text_preview, parse_mode=ParseMode.MARKDOWN)
-        
-        # Immediately attach the actual downloadable spreadsheet file
         await query.message.reply_document(
             document=InputFile(io.BytesIO(csv_bytes), filename=f"{base_name}_attributes.csv"),
-            caption=f"📂 *Complete Attribute Spreadsheet Open-Ready* (`fid` included).",
+            caption=f"📂 *Complete Attribute Table Spreadsheet* (`fid` index mapped).",
             parse_mode=ParseMode.MARKDOWN
         )
-        
-        # Wipe the inline prompt button choice block to clean the log layout view
         await query.delete_message()
-
     elif action == "action_analysis":
         # Full analysis logic block remains intact...
         status_msg = await query.edit_message_text(
