@@ -171,18 +171,16 @@ def _get_centroid(geojson_feature: dict) -> tuple[float, float]:
 
 
 
+
 # ── File ingestion helpers ────────────────────────────────────────────────────
 
-def load_vector_file(file_path: str | Path) -> dict:
+def load_vector_file(file_path: str | Path) -> tuple[dict, str]:
     """
-    Reads any supported vector format (.kml, .gpkg, .geojson) via GeoPandas
-    and returns a single normalised GeoJSON Feature (first polygon layer).
-
-    Raises
-    ------
-    ValueError : if the file contains no polygon geometry
+    Reads any supported vector format (.kml, .gpkg, .geojson) via GeoPandas.
+    Returns a tuple containing:
+      1. The dissolved GeoJSON feature dictionary (for mapping/analysis)
+      2. A pre-formatted Markdown string summarizing the Attribute Table properties.
     """
-    # 🚀 FORCE ENABLE: Tell fiona's global registry to allow KML files
     import fiona
     fiona.drvsupport.supported_drivers['KML'] = 'r'
     fiona.drvsupport.supported_drivers['LIBKML'] = 'r'
@@ -202,7 +200,7 @@ def load_vector_file(file_path: str | Path) -> dict:
         kwargs["driver"] = driver_map[suffix]
 
     gdf: gpd.GeoDataFrame = gpd.read_file(str(path), **kwargs)
-  
+
     # Keep only polygon-type geometries
     gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
     if gdf.empty:
@@ -211,19 +209,29 @@ def load_vector_file(file_path: str | Path) -> dict:
             "Please provide a polygon layer (not points or lines)."
         )
 
+    # 📊 Extract and format the Attributes Table data
+    # Exclude geometry column to keep textual representation clean
+    attr_df = gdf.drop(columns=["geometry"], errors="ignore")
+    
+    if attr_df.empty:
+        attributes_summary = "ℹ️ No custom attribute columns found in this layer."
+    else:
+        # Get the first 3 rows as an example summary for Telegram
+        attributes_summary = "📋 *Attributes Table Preview:*\n"
+        for col in attr_df.columns:
+            vals = attr_df[col].head(3).tolist()
+            vals_str = ", ".join([str(v) for v in vals])
+            attributes_summary += f"• `{col}`: {vals_str} ...\n"
+
     # Re-project to WGS-84 if needed
     if gdf.crs is None:
-        log.warning("Input file has no CRS — assuming WGS-84.")
         gdf = gdf.set_crs(cfg.TARGET_CRS)
     elif gdf.crs.to_string() != cfg.TARGET_CRS:
         gdf = gdf.to_crs(cfg.TARGET_CRS)
 
-    # Dissolve all features into a single polygon (union)
+    # Dissolve features for the core analysis pipeline
     dissolved = gdf.dissolve()
-    feature   = dissolved.__geo_interface__["features"][0]
+    feature = dissolved.__geo_interface__["features"]
 
-    log.info(
-        "Loaded vector file '%s'  |  %d source feature(s) dissolved to 1",
-        path.name, len(gdf)
-    )
-    return feature
+    return feature, attributes_summary
+  
