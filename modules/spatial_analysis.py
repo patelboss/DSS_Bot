@@ -233,38 +233,100 @@ def load_vector_file(file_path: str | Path) -> tuple[dict, gpd.GeoDataFrame]:
     gdf = gpd.read_file(str(path), **kwargs)
     return _process_and_sanitize_gdf(gdf)
 
-
 def _process_and_sanitize_gdf(gdf: gpd.GeoDataFrame) -> tuple[dict, gpd.GeoDataFrame]:
-    """Cleans up attribute structures, handles projection matching, and extracts geometry summaries."""
+    """Cleans up attribute structures, repairs geometries, handles CRS, and extracts geometry summaries."""
+
     gdf = gdf.explode(index_parts=False).reset_index(drop=True)
     gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
-    
+
     if gdf.empty:
-        raise ValueError("The uploaded vector file contains no valid Polygon or MultiPolygon layouts.")
+        raise ValueError(
+            "The uploaded vector file contains no valid Polygon or MultiPolygon layouts."
+        )
 
     if "fid" not in gdf.columns:
         gdf.insert(0, "fid", gdf.index + 1)
 
-    noise_cols = ["Description", "description", "tessellate", "extrude", "visibility"]
+    noise_cols = [
+        "Description",
+        "description",
+        "tessellate",
+        "extrude",
+        "visibility"
+    ]
+
     for col in noise_cols:
         if col in gdf.columns:
             gdf = gdf.drop(columns=[col], errors="ignore")
+
+    # ------------------------------------------------------------------
+    # CRS handling
+    # ------------------------------------------------------------------
 
     if gdf.crs is None:
         gdf = gdf.set_crs(cfg.TARGET_CRS)
     elif gdf.crs.to_string() != cfg.TARGET_CRS:
         gdf = gdf.to_crs(cfg.TARGET_CRS)
 
-    combined_geometry = gdf.geometry.unary_union
-    
+    # ------------------------------------------------------------------
+    # Geometry repair
+    # ------------------------------------------------------------------
+
+    invalid_count = (~gdf.is_valid).sum()
+
+    if invalid_count:
+        log.warning(
+            f"Detected {invalid_count} invalid geometries. "
+            "Attempting automatic repair."
+        )
+        sys.stdout.flush()
+
+        try:
+            gdf["geometry"] = gdf.geometry.make_valid()
+        except Exception:
+            # Fallback for older shapely/geopandas versions
+            gdf["geometry"] = gdf.geometry.buffer(0)
+
+    # Remove null / empty geometries
+    gdf = gdf[
+        gdf.geometry.notnull() &
+        ~gdf.geometry.is_empty
+    ].copy()
+
+    if gdf.empty:
+        raise ValueError(
+            "All geometries became invalid after repair."
+        )
+
+    # ------------------------------------------------------------------
+    # Merge all polygons safely
+    # ------------------------------------------------------------------
+
+    try:
+        combined_geometry = gdf.geometry.unary_union
+
+    except Exception as exc:
+        log.warning(
+            f"Unary union failed ({exc}). "
+            "Applying secondary repair."
+        )
+        sys.stdout.flush()
+
+        gdf["geometry"] = gdf.geometry.buffer(0)
+
+        combined_geometry = gdf.geometry.unary_union
+
     geojson_feature = {
         "type": "Feature",
-        "properties": {"summary": "Unified Vector Track Collection"},
+        "properties": {
+            "summary": "Unified Vector Track Collection"
+        },
         "geometry": mapping(combined_geometry)
     }
 
-    log.info(f"Successfully processed {len(gdf)} discrete spatial layout features.")
+    log.info(
+        f"Successfully processed {len(gdf)} discrete spatial layout features."
+    )
     sys.stdout.flush()
 
     return geojson_feature, gdf
-  
