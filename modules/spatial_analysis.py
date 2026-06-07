@@ -169,6 +169,8 @@ def _get_centroid(geojson_feature: dict) -> tuple[float, float]:
     return (round(c.x, 6), round(c.y, 6))
 
 
+
+
 # ── File ingestion helpers ────────────────────────────────────────────────────
 
 def load_vector_file(file_path: str | Path) -> dict:
@@ -180,6 +182,11 @@ def load_vector_file(file_path: str | Path) -> dict:
     ------
     ValueError : if the file contains no polygon geometry
     """
+    # 🚀 FORCE ENABLE: Tell fiona's global registry to allow KML files
+    import fiona
+    fiona.drvsupport.supported_drivers['KML'] = 'r'
+    fiona.drvsupport.supported_drivers['LIBKML'] = 'r'
+
     path = Path(file_path)
     suffix = path.suffix.lower()
 
@@ -195,7 +202,7 @@ def load_vector_file(file_path: str | Path) -> dict:
         kwargs["driver"] = driver_map[suffix]
 
     gdf: gpd.GeoDataFrame = gpd.read_file(str(path), **kwargs)
-
+  
     # Keep only polygon-type geometries
     gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
     if gdf.empty:
