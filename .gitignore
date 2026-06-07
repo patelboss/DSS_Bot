@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.tif
+*.tiff
+*.gpkg
+*.kml
+*.geojson
+/tmp/
+*.log
+.DS_Store

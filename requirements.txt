@@ -1,0 +1,27 @@
+# ── Core Python version ───────────────────────────────────────────────────────
+# Requires Python 3.10+
+
+# ── Telegram Bot ──────────────────────────────────────────────────────────────
+python-telegram-bot==21.5
+
+# ── Geospatial computation ────────────────────────────────────────────────────
+rasterio==1.3.10          # COG windowed I/O + VSICURL HTTP streaming
+geopandas==0.14.4         # Vector file I/O (.geojson / .kml / .gpkg)
+shapely==2.0.5            # Geometry operations
+pyproj==3.6.1             # CRS transformations + geodesic area
+fiona==1.9.6              # GeoDataFrame backend driver
+
+# ── Map rendering ─────────────────────────────────────────────────────────────
+matplotlib==3.9.1         # Cartographic layout canvas
+
+# ── Database ──────────────────────────────────────────────────────────────────
+pymongo==4.8.0            # MongoDB Atlas driver
+dnspython==2.6.1          # Required for mongodb+srv:// URIs
+
+# ── Cloud Storage ─────────────────────────────────────────────────────────────
+supabase==2.5.3           # Supabase Storage client
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv==1.0.1      # .env file loading
+numpy==1.26.4             # Array operations (pinned for rasterio compatibility)
+click==8.1.7              # CLI for data_prep scripts
