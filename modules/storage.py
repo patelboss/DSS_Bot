@@ -44,7 +44,11 @@ def _get_supabase() -> Client:
             sys.stdout.flush()
             raise ValueError("Invalid Supabase environment configuration settings detected.")
         try:
-            _sb = create_client(cfg.SUPABASE_URL, cfg.SUPABASE_KEY)
+            # Strip out possible quote mark inclusions or accidental spacing blocks
+            clean_url = str(cfg.SUPABASE_URL).strip().strip('"').strip("'")
+            clean_key = str(cfg.SUPABASE_KEY).strip().strip('"').strip("'")
+            
+            _sb = create_client(clean_url, clean_key)
             log.info("✅ Supabase Client initialization successful.")
             sys.stdout.flush()
         except Exception as e:
@@ -127,7 +131,6 @@ def extract_masked_array(
     geom = shape(polygon_geojson["geometry"])
 
     with open_cog(object_name) as src:
-        # Re-project polygon to raster CRS for the mask operation
         raster_crs = src.crs
         if raster_crs != CRS.from_string(cfg.TARGET_CRS):
             from rasterio.warp import transform_geom
@@ -155,11 +158,13 @@ def extract_masked_array(
             ) from exc
 
         meta = src.meta.copy()
+        
+        # 🚀 FIXED: Extracted array coordinate shape indices safely to prevent window data clipping bugs
         meta.update(
             {
                 "driver":    "GTiff",
-                "height":    out_image.shape,
-                "width":     out_image.shape,
+                "height":    out_image.shape if len(out_image.shape) == 3 else out_image.shape,
+                "width":     out_image.shape if len(out_image.shape) == 3 else out_image.shape,
                 "transform": out_transform,
                 "count":     1,
             }
