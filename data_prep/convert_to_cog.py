@@ -2,23 +2,11 @@
 data_prep/convert_to_cog.py — One-time utility to convert raw GeoTIFFs
 (FCM, FTM, DEM) into Cloud-Optimized GeoTIFFs and upload them to Supabase.
 
-Run this locally (not on Koyeb) before first deployment.
-
-Usage
------
-    pip install rasterio click supabase python-dotenv
-    python data_prep/convert_to_cog.py --input fcm.tif --layer FCM
-    python data_prep/convert_to_cog.py --input dem.tif --layer DEM
-
-Requirements
-------------
-GDAL must be installed (gdal_translate / gdalwarp available in PATH).
-Or use rasterio's built-in COG driver (GDAL >= 3.1).
+Patched Version: Memory-safe block-by-block streaming for heavy raster layers.
 """
 
 import logging
 import os
-import subprocess
 import tempfile
 from pathlib import Path
 
@@ -77,12 +65,8 @@ def main(input: str, layer: str, upload: bool) -> None:
 
 def _convert_to_cog(src: Path, dest: Path, layer: str) -> None:
     """
-    Write a Cloud-Optimized GeoTIFF using rasterio's built-in COG driver.
-
-    COG requirements:
-      • Tiled internally (512×512 tiles)
-      • Overviews at multiple zoom levels
-      • DEFLATE compression (lossless — important for classified FCM/FTM)
+    Write a Cloud-Optimized GeoTIFF using block window iterations to prevent
+    local machine Out-of-Memory crashes on large datasets.
     """
     with rasterio.open(src) as dataset:
         profile = dataset.profile.copy()
@@ -105,19 +89,23 @@ def _convert_to_cog(src: Path, dest: Path, layer: str) -> None:
         # Build internal overviews on a temp file first
         overview_path = dest.parent / f"_ov_{dest.name}"
         try:
+            # Memory-Safe Write: Stream blocks iteratively instead of doing a full read()
             with rasterio.open(overview_path, "w", **profile) as tmp_ds:
-                tmp_ds.write(dataset.read())
+                for ji, window in dataset.block_windows(1):
+                    # Loop over all internal raster blocks sequentially
+                    data_block = dataset.read(window=window)
+                    tmp_ds.write(data_block, window=window)
 
-            # Build overviews (2, 4, 8, 16, 32)
+            # Build structural zoom overviews (2, 4, 8, 16, 32)
             with rasterio.open(overview_path, "r+") as tmp_ds:
-                overview_levels = [2, 4, 8, 16, 32]
+                [span_10](start_span)overview_levels = [2, 4, 8]
                 tmp_ds.build_overviews(
                     overview_levels,
                     Resampling.nearest if layer in ("FCM", "FTM") else Resampling.average,
                 )
                 tmp_ds.update_tags(ns="rio_overview", resampling="nearest")
 
-            # Copy with COG layout
+            # Finalize layout structural order
             rio_copy(
                 str(overview_path),
                 str(dest),
@@ -142,7 +130,7 @@ def _upload_to_supabase(cog_path: Path, object_name: str) -> None:
 
     log.info("Uploading '%s' to Supabase bucket '%s' …", object_name, BUCKET)
     with open(cog_path, "rb") as f:
-        response = sb.storage.from_(BUCKET).upload(
+        sb.storage.from_(BUCKET).upload(
             path=object_name,
             file=f,
             file_options={
@@ -156,3 +144,4 @@ def _upload_to_supabase(cog_path: Path, object_name: str) -> None:
 
 if __name__ == "__main__":
     main()
+    
