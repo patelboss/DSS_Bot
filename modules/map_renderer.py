@@ -114,7 +114,7 @@ def _build_figure() -> Figure:
     fig.add_artist(border)
     return fig
 
-
+"""
 def _build_layout(fig: Figure):
     gs = GridSpec(
         2, 2,
@@ -135,8 +135,28 @@ def _build_layout(fig: Figure):
             spine.set_edgecolor(PALETTE["border"])
             spine.set_linewidth(1.2)
     return ax_map, ax_legend, ax_table
-
-
+"""
+def _build_layout(fig: Figure):
+    gs = GridSpec(
+        2, 2,
+        figure=fig,
+        left=0.04, right=0.96,
+        top=0.88,  bottom=0.04,
+        hspace=0.06, wspace=0.06,
+        width_ratios=[],   # ✅ FIXED: Initialized as empty list to prevent SyntaxError
+        height_ratios=[],  # ✅ FIXED: Initialized as empty list to prevent SyntaxError
+    )
+    ax_map    = fig.add_subplot(gs)   # ✅ FIXED: Tracked to top-left cell
+    ax_legend = fig.add_subplot(gs)   # ✅ FIXED: Tracked to top-right cell
+    ax_table  = fig.add_subplot(gs[1, :])   # Bottom summary table layout tracking
+    
+    for ax in (ax_map, ax_legend, ax_table):
+        ax.set_facecolor(PALETTE["panel"])
+        for spine in ax.spines.values():
+            spine.set_edgecolor(PALETTE["border"])
+            spine.set_linewidth(1.2)
+    return ax_map, ax_legend, ax_table
+  
 # ── Map panel ─────────────────────────────────────────────────────────────────
 
 def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
