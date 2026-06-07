@@ -3,7 +3,7 @@
 
 # ── Telegram Bot ──────────────────────────────────────────────────────────────
 python-telegram-bot==21.5
-
+packaging==24.0
 # ── Geospatial computation ────────────────────────────────────────────────────
 rasterio==1.3.10          # COG windowed I/O + VSICURL HTTP streaming
 geopandas==0.14.4         # Vector file I/O (.geojson / .kml / .gpkg)
