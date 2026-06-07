@@ -212,7 +212,7 @@ def load_vector_file(file_path: str | Path) -> tuple[dict, gpd.GeoDataFrame]:
                 )
             
             # 🚀 FIXED: Extract index correctly to pull path string instead of raw list collection
-            target_shp = shp_files``
+            target_shp = shp_files[0]
             log.info(f"Targeting extracted shapefile: {target_shp.name}")
             sys.stdout.flush()
             
