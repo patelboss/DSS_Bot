@@ -1,7 +1,7 @@
 """
 modules/spatial_analysis.py — Core geospatial computation pipeline.
 
-Runs three analyses in parallel over the user's polygon:
+Runs three analyses in parallel over the user's polygon / multi-polygon structure:
   1. Forest Cover Map  (FCM) — canopy class breakdown
   2. Digital Elevation Model (DEM) — elevation + slope statistics
   3. Area calculation — accurate geodesic area in hectares
@@ -11,8 +11,6 @@ budget by using windowed / masked array operations, never loading full rasters.
 """
 
 import logging
-import os
-import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -33,12 +31,12 @@ log = logging.getLogger(__name__)
 
 def run_analysis(geojson_feature: dict) -> dict[str, Any]:
     """
-    Accepts a single GeoJSON Feature (polygon) and returns a unified
-    results dictionary with all computed spatial metrics.
+    Accepts a single GeoJSON Feature (Polygon or MultiPolygon) and returns 
+    a unified results dictionary with all computed spatial metrics.
 
     Parameters
     ----------
-    geojson_feature : dict   — GeoJSON Feature with a Polygon geometry
+    geojson_feature : dict   — GeoJSON Feature containing geometry
 
     Returns
     -------
@@ -74,7 +72,7 @@ def run_analysis(geojson_feature: dict) -> dict[str, Any]:
 def _analyse_forest_cover(geojson_feature: dict) -> tuple[str, dict]:
     """
     Returns pixel-count breakdown of FSI Forest Cover classes
-    within the polygon as percentages.
+    within the target polygon(s) as percentages.
     """
     masked, _ = extract_masked_array(
         cfg.COG_FCM, geojson_feature, band=1, nodata=255
@@ -111,7 +109,7 @@ def _analyse_forest_cover(geojson_feature: dict) -> tuple[str, dict]:
 
 def _analyse_elevation(geojson_feature: dict) -> tuple[str, dict]:
     """
-    Computes min / max / mean elevation and mean slope inside the polygon.
+    Computes min / max / mean elevation and mean slope inside the vector boundaries.
     Slope is derived via finite-difference gradient on the DEM window.
     """
     masked, meta = extract_masked_array(
@@ -132,6 +130,7 @@ def _analyse_elevation(geojson_feature: dict) -> tuple[str, dict]:
     dy, dx = np.gradient(data_2d, res_y, res_x)
     slope_rad = np.arctan(np.sqrt(dx**2 + dy**2))
     slope_deg = np.degrees(slope_rad)
+    
     # Mask slope where DEM was nodata
     slope_valid = slope_deg[~masked.mask] if masked.mask is not np.ma.nomask \
                   else slope_deg.ravel()
@@ -150,7 +149,7 @@ def _analyse_elevation(geojson_feature: dict) -> tuple[str, dict]:
 def _calculate_area_ha(geojson_feature: dict) -> float:
     """
     Accurate geodesic area in hectares using UTM re-projection.
-    UTM Zone 44N (EPSG:32644) is appropriate for Madhya Pradesh / Chhattisgarh.
+    Works natively across multiple distinct shapes or contiguous geometries.
     """
     geom_wgs84 = shape(geojson_feature["geometry"])
 
@@ -163,36 +162,21 @@ def _calculate_area_ha(geojson_feature: dict) -> float:
 
 
 def _get_centroid(geojson_feature: dict) -> tuple[float, float]:
-    """Returns (longitude, latitude) of the polygon centroid."""
+    """Returns (longitude, latitude) of the overall geometric center."""
     geom = shape(geojson_feature["geometry"])
     c    = geom.centroid
     return (round(c.x, 6), round(c.y, 6))
 
 
-
-
-
 # ── File ingestion helpers ────────────────────────────────────────────────────
-
-"""
-modules/spatial_analysis.py
-"""
-import logging
-from pathlib import Path
-from typing import Any, tuple
-import geopandas as gpd
-from pyproj import Transformer
-from shapely.geometry import shape
-from shapely.ops import transform as shapely_transform
-from config import cfg
-
-log = logging.getLogger(__name__)
 
 def load_vector_file(file_path: str | Path) -> tuple[dict, gpd.GeoDataFrame]:
     """
     Reads any supported vector format (.kml, .gpkg, .geojson) via GeoPandas.
+    Supports both Polygons and complex MultiPolygons.
+
     Returns:
-      1. geojson_feature (dict): The dissolved shape for raster masking.
+      1. geojson_feature (dict): The dissolved singular GeoJSON dict feature for raster masking.
       2. gdf (GeoDataFrame): The clean attribute table data frame with explicit fids.
     """
     import fiona
@@ -212,12 +196,12 @@ def load_vector_file(file_path: str | Path) -> tuple[dict, gpd.GeoDataFrame]:
 
     gdf = gpd.read_file(str(path), **kwargs)
 
-    # Keep only polygon geometries
+    # Keep only target valid closed geometries (Polygons & MultiPolygons)
     gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
     if gdf.empty:
-        raise ValueError("The uploaded file contains no polygon geometry.")
+        raise ValueError("The uploaded file contains no usable polygon or multi-polygon geometry.")
 
-    # 🚀 EXPLICIT FID MAPPING: Assign clean, human-readable Feature IDs starting from 1
+    # Assign clean, human-readable Feature IDs starting from 1
     if "fid" not in gdf.columns:
         gdf.insert(0, "fid", gdf.index + 1)
 
@@ -227,13 +211,17 @@ def load_vector_file(file_path: str | Path) -> tuple[dict, gpd.GeoDataFrame]:
         if col in gdf.columns and col != gdf.columns:
             gdf = gdf.drop(columns=[col], errors="ignore")
 
-    # Save target coordinate reference transformations
+    # Handle Coordinate Reference System transformations safely
     if gdf.crs is None:
         gdf = gdf.set_crs(cfg.TARGET_CRS)
     elif gdf.crs.to_string() != cfg.TARGET_CRS:
         gdf = gdf.to_crs(cfg.TARGET_CRS)
 
+    # Dissolve combines rows into one consolidated row (collapsing Polygons/MultiPolygons into a single geometry)
     dissolved = gdf.dissolve()
+    
+    # Extract the first feature dictionary securely from the overall collection feature list 
     geojson_feature = dissolved.__geo_interface__["features"]
 
     return geojson_feature, gdf
+  
