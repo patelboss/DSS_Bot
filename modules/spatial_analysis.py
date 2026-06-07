@@ -48,6 +48,7 @@ def run_analysis(geojson_feature: Any) -> dict[str, Any]:
     log.info("Starting spatial analysis pipeline …")
     sys.stdout.flush()
 
+    # 🚀 FIXED: Safely unpack the first element if an array list is received
     if isinstance(geojson_feature, list):
         log.warning("Pipeline received a list instead of a dict. Unpacking first feature entry automatically.")
         if len(geojson_feature) > 0:
@@ -165,7 +166,7 @@ def _get_centroid(geojson_feature: dict) -> tuple[float, float]:
 
 def load_vector_file(file_path: str | Path) -> tuple[dict, gpd.GeoDataFrame]:
     """
-    Reads spatial formats including .geojson, .kml, .gpkg, .kmz, and shapefile .zip.
+    Reads any supported vector format (.geojson, .kml, .gpkg, .kmz, or shapefile .zip).
     """
     import fiona
     fiona.drvsupport.supported_drivers['KML'] = 'r'
@@ -177,7 +178,7 @@ def load_vector_file(file_path: str | Path) -> tuple[dict, gpd.GeoDataFrame]:
     log.info(f"Ingesting uploaded dataset file payload: {path.name}")
     sys.stdout.flush()
 
-    # 1. 🚀 INTERCEPT: Handle KMZ Archives (Extract KML internally)
+    # 1. Handle KMZ Archives (Extract KML internally)
     if suffix == ".kmz":
         log.info("Extracting KMZ archive container stream…")
         with zipfile.ZipFile(path, 'r') as zip_ref:
@@ -190,7 +191,7 @@ def load_vector_file(file_path: str | Path) -> tuple[dict, gpd.GeoDataFrame]:
             path = Path(extracted_kml)
             suffix = ".kml"
 
-    # 2. 🚀 INTERCEPT: Handle Shapefile ZIP Archives
+    # 2. Handle Shapefile ZIP Archives safely
     if suffix == ".zip":
         log.info("Extracting Shapefile ZIP archive container layout safely…")
         sys.stdout.flush()
@@ -200,15 +201,26 @@ def load_vector_file(file_path: str | Path) -> tuple[dict, gpd.GeoDataFrame]:
             with zipfile.ZipFile(path, 'r') as zip_ref:
                 zip_ref.extractall(tmp_extract_dir)
             
-            shp_files = list(tmp_extract_dir.glob("**/*.shp"))
-            if not shp_files:
-                raise ValueError("Invalid Shapefile ZIP: Could not find any underlying .shp file inside.")
+            shp_files = [
+                f for f in tmp_extract_dir.glob("**/*.shp") 
+                if f.is_file() and not f.name.startswith("._")
+            ]
             
-            gdf = gpd.read_file(str(shp_files))
+            if not shp_files:
+                raise ValueError(
+                    "Invalid Shapefile ZIP: Could not find any valid, underlying .shp file data inside the archive."
+                )
+            
+            # 🚀 FIXED: Extract index correctly to pull path string instead of raw list collection
+            target_shp = shp_files
+            log.info(f"Targeting extracted shapefile: {target_shp.name}")
+            sys.stdout.flush()
+            
+            gdf = gpd.read_file(str(target_shp))
             return _process_and_sanitize_gdf(gdf)
         finally:
             shutil.rmtree(tmp_extract_dir, ignore_errors=True)
-
+          
     # 3. Standard Vector Reader
     driver_map = {".kml": "KML", ".gpkg": "GPKG", ".geojson": None, ".json": None}
     if suffix not in driver_map:
