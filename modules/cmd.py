@@ -3,9 +3,12 @@ modules/cmd.py — Command handlers and conversation flows for the SDSS bot.
 Separated from main.py to maintain deployment health stability.
 """
 
-import asyncio
+import io
+import csv
 import logging
-import os
+import sys
+import asyncio
+import pandas as pd
 from pathlib import Path
 
 from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,7 +20,15 @@ from modules.database import upsert_user, log_analysis, get_user_history
 from modules.spatial_analysis import load_vector_file, run_analysis
 from modules.map_renderer import render_map
 
+# ── Force Stream / Unbuffered Stdout Logging Setup for Koyeb Console ─────────
 log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+
+if not log.handlers:
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    log.addHandler(stdout_handler)
+
 
 # ── /start ────────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -39,6 +50,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "_Upload your file to begin_ 👆"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    sys.stdout.flush()
 
 
 # ── /help ─────────────────────────────────────────────────────────────────────
@@ -61,32 +73,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Ensure the polygon falls within the study area extent"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    sys.stdout.flush()
 
 
-
-# ── Interactive Callback Menu Router ──────────────────────────────────────────
-"""
-modules/cmd.py
-"""
-import io
-import csv
-import logging
-import asyncio
-import pandas as pd
-from pathlib import Path
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-from telegram.constants import ParseMode, ChatAction
-from telegram.ext import ContextTypes
-
-from config import cfg
-from modules.database import upsert_user, log_analysis, get_user_history
-from modules.spatial_analysis import load_vector_file, run_analysis
-from modules.map_renderer import render_map
-
-log = logging.getLogger(__name__)
-
-# ... Keep cmd_start, cmd_help, cmd_history, cmd_status identical ...
-
+# ── Vector File Document Catch Mechanism ──────────────────────────────────────
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     document = message.document
@@ -98,6 +88,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     status_msg = await message.reply_text("📥 *Processing vector layout properties…*", parse_mode=ParseMode.MARKDOWN)
+    sys.stdout.flush()
+    
     tmp_path = Path(cfg.TEMP_DIR) / f"{user.id}_{document.file_name}"
     
     try:
@@ -123,20 +115,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text(
             f"✅ *Layer Ingested Successfully!*\n\n"
             f"📁 *File:* `{document.file_name}`\n"
-            f"📦 *Total Features:* `{len(gdf_attributes)}` Polygons\n\n"
+            f"📦 *Total Features:* `{len(gdf_attributes)}` Polygons/Parts\n\n"
             f"Select processing task:",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+    except Exception as exc:
+        log.error("Failed to parse or ingest uploaded vector document.", exc_info=True)
+        await status_msg.edit_text(f"❌ *Vector ingestion failed:* {exc}")
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
+        sys.stdout.flush()
 
+
+# ── Interactive Callback Menu Router ──────────────────────────────────────────
 async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
 
     action = query.data
+    user = update.effective_user  # 🚀 FIXED: Instantiated user representation securely
     geojson_feature = context.user_data.get("current_feature")
     cached_records = context.user_data.get("cached_df_dict")
     filename = context.user_data.get("filename", "layer")
@@ -147,7 +146,6 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     base_name = Path(filename).stem
 
-    # 🚀 EXPORT BOTH: SENDS MESSAGE LAYOUT + DOCUMENT SPREADSHEET
     if action == "action_attributes":
         await query.message.reply_chat_action(ChatAction.UPLOAD_DOCUMENT)
         df = pd.DataFrame(cached_records)
@@ -184,20 +182,22 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode=ParseMode.MARKDOWN
         )
         await query.delete_message()
+        sys.stdout.flush()
+
     elif action == "action_analysis":
-        # Full analysis logic block remains intact...
         status_msg = await query.edit_message_text(
             "🔬 *Running full spatial intersection algorithms…*\n"
             "_(Streaming raster tiles from cloud matrices)_",
             parse_mode=ParseMode.MARKDOWN
         )
+        sys.stdout.flush()
+        
         try:
-            from modules.spatial_analysis import run_analysis
-            from modules.map_renderer import render_map
-            
+            # Multi-threaded thread executor wrapping for non-blocking I/O operations
             results = await asyncio.get_event_loop().run_in_executor(None, run_analysis, geojson_feature)
             map_png = await asyncio.get_event_loop().run_in_executor(None, render_map, geojson_feature, results, filename)
 
+            # Store inside history logging database targets
             log_analysis(user.id, filename, geojson_feature, results, results["centroid"])
             summary = _build_summary(results, filename)
             
@@ -205,9 +205,12 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN)
             await query.message.reply_photo(photo=InputFile(map_png, filename="sdss_report.png"), caption="📊 *SDSS Cartographic Report*")
         except Exception as err:
-            log.error("Analysis thread failed: %s", err, exc_info=True)
+            log.error("Analysis thread pipeline execution failed: %s", err, exc_info=True)
             await status_msg.edit_text(f"❌ *Analysis processing failed:* {err}")
-            
+        finally:
+            sys.stdout.flush()
+
+
 # ── /history ──────────────────────────────────────────────────────────────────
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -233,6 +236,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    sys.stdout.flush()
 
 
 # ── /status ───────────────────────────────────────────────────────────────────
@@ -261,8 +265,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append(f"*{service}:* {status}")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-
+    sys.stdout.flush()
 
 
 # ── Unknown Message Fallback ──────────────────────────────────────────────────
@@ -299,5 +302,5 @@ def _build_summary(results: dict, filename: str) -> str:
         f"📉 *Slope:*\n"
         f"  • Mean: `{dem.get('slope_mean_deg', '—')}°`\n"
         f"  • Max: `{dem.get('slope_max_deg', '—')}°`\n"
-)
-
+    )
+    
