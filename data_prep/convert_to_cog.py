@@ -26,8 +26,6 @@ from shapely.geometry import shape, mapping
 from shapely.ops import transform as shapely_transform
 
 from config import cfg, FCM_CLASSES
-
-# We import extract_masked_array safely
 from modules.storage import extract_masked_array
 
 # ── Force Stream / Unbuffered Stdout Logging Setup for Koyeb Console ─────────
@@ -58,7 +56,7 @@ def run_analysis(geojson_feature: Any) -> dict[str, Any]:
     log.info("Starting spatial analysis pipeline …")
     sys.stdout.flush()
 
-    # If a list of features was passed, safely extract the first element
+    # 🚀 FIXED: Unpacks the first feature entry from the array safely
     if isinstance(geojson_feature, list):
         log.warning("Pipeline received a list instead of a dict. Unpacking first feature entry automatically.")
         if len(geojson_feature) > 0:
@@ -198,19 +196,30 @@ def load_vector_file(file_path: str | Path) -> tuple[dict, gpd.GeoDataFrame]:
             if not kml_files:
                 raise ValueError("Invalid KMZ layout: No underlying .kml files found inside.")
             
-            # Unpack to a temporary file tracking directory location context
             tmp_extract_dir = Path(tempfile.mkdtemp())
             extracted_kml = zip_ref.extract(kml_files, path=tmp_extract_dir)
             path = Path(extracted_kml)
             suffix = ".kml"
 
-    # 2. Handle Zip Archives (Esri Shapefile distribution bundle packages)
+    # 2. 🚀 FIXED: Pure Python Multi-part Unzip routing for Shapefiles
     elif suffix == ".zip":
-        log.info("Evaluating zipped archive container layout via GDAL VSI Virtual Filesystem…")
-        # Use Rasterio/GDAL vsizip handler to read directly without manual decompression overhead
-        vsi_zip_path = f"/vsizip/{path}"
-        gdf = gpd.read_file(vsi_zip_path)
-        return _process_and_sanitize_gdf(gdf)
+        log.info("Extracting Shapefile ZIP archive container layout safely…")
+        sys.stdout.flush()
+        
+        tmp_extract_dir = Path(tempfile.mkdtemp())
+        try:
+            with zipfile.ZipFile(path, 'r') as zip_ref:
+                zip_ref.extractall(tmp_extract_dir)
+            
+            # Find the core structural .shp coordinate asset line
+            shp_files = list(tmp_extract_dir.glob("**/*.shp"))
+            if not shp_files:
+                raise ValueError("Invalid Shapefile ZIP: Could not find any underlying .shp file inside.")
+            
+            gdf = gpd.read_file(str(shp_files))
+            return _process_and_sanitize_gdf(gdf)
+        finally:
+            shutil.rmtree(tmp_extract_dir, ignore_errors=True)
 
     # 3. Standard Ingestion Router
     driver_map = {".kml": "KML", ".gpkg": "GPKG", ".geojson": None, ".json": None}
@@ -264,4 +273,4 @@ def _process_and_sanitize_gdf(gdf: gpd.GeoDataFrame) -> tuple[dict, gpd.GeoDataF
     sys.stdout.flush()
 
     return geojson_feature, gdf
-    
+          
