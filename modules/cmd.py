@@ -1,24 +1,32 @@
 """
-modules/cmd.py — Command handlers and conversation flows for the SDSS bot.
-Separated from main.py to maintain deployment health stability.
+modules/spatial_analysis.py — Core geospatial computation pipeline.
+
+Runs three analyses in parallel over the user's polygon / multi-polygon structure:
+  1. Forest Cover Map  (FCM) — canopy class breakdown
+  2. Digital Elevation Model (DEM) — elevation + slope statistics
+  3. Area calculation — accurate geodesic area in hectares
+
+Everything is structured to work within the 512 MB Koyeb free-tier RAM
+budget by using windowed / masked array operations, never loading full rasters.
 """
 
-import io
-import csv
 import logging
 import sys
-import asyncio
-import pandas as pd
+import zipfile
+import tempfile
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 
-from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode, ChatAction
-from telegram.ext import ContextTypes
+import geopandas as gpd
+import numpy as np
+from pyproj import Transformer
+from shapely.geometry import shape, mapping
+from shapely.ops import transform as shapely_transform
 
-from config import cfg
-from modules.database import upsert_user, log_analysis, get_user_history
-from modules.spatial_analysis import load_vector_file, run_analysis
-from modules.map_renderer import render_map
+from config import cfg, FCM_CLASSES
+from modules.storage import extract_masked_array
 
 # ── Force Stream / Unbuffered Stdout Logging Setup for Koyeb Console ─────────
 log = logging.getLogger(__name__)
@@ -30,282 +38,236 @@ if not log.handlers:
     log.addHandler(stdout_handler)
 
 
-# ── /start ────────────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    upsert_user(user.id, user.username, user.full_name)
+# ── Public entry point ────────────────────────────────────────────────────────
 
-    text = (
-        f"🌿 *Welcome to the SDSS Bot, {user.first_name}!*\n\n"
-        "This system performs automated spatial analysis on forest polygons "
-        "for the *Madhya Pradesh Forest Department*.\n\n"
-        "*What to do:*\n"
-        "1️⃣  Upload a spatial boundary file (`.geojson`, `.kml`, or `.gpkg`)\n"
-        "2️⃣  Choose whether to view attributes or run environmental analysis\n"
-        "3️⃣  Receive your custom reporting metrics instantly\n\n"
-        "*Commands:*\n"
-        "/help — Detailed instructions\n"
-        "/history — Your last 5 analysis runs\n"
-        "/status — Check system health\n\n"
-        "_Upload your file to begin_ 👆"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+def run_analysis(geojson_feature: Any) -> dict[str, Any]:
+    """
+    Accepts a GeoJSON Feature (Polygon or MultiPolygon) and returns 
+    a unified results dictionary with all computed spatial metrics.
+
+    Parameters
+    ----------
+    geojson_feature : dict or list — GeoJSON Feature context data
+
+    Returns
+    -------
+    dict with keys: area_ha, fcm, dem, centroid
+    """
+    log.info("Starting spatial analysis pipeline …")
     sys.stdout.flush()
 
+    if isinstance(geojson_feature, list):
+        log.warning("Pipeline received a list instead of a dict. Unpacking first feature entry automatically.")
+        if len(geojson_feature) > 0:
+            geojson_feature = geojson_feature
+        else:
+            raise ValueError("The provided geojson feature collection list is empty.")
 
-# ── /help ─────────────────────────────────────────────────────────────────────
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "📖 *SDSS Bot — Usage Guide*\n\n"
-        "*Supported Formats:*\n"
-        "• GeoJSON `.geojson` / `.json` — Preferred format\n"
-        "• KML `.kml` / KMZ `.kmz` — Google Earth exports\n"
-        "• GeoPackage `.gpkg` — QGIS multi-layer vectors\n"
-        "• Shapefile Package `.zip` — Archive containing .shp, .shx, .dbf, .prj\n\n"
-        "*Requirements:*\n"
-        "• File size must be under 20 MB\n"
-        "• Geometry must be a Polygon or MultiPolygon\n"
-        "• Any coordinate reference system is accepted (auto-converted)\n\n"
-        "*Output Report options:*\n"
-        "• Custom Attributes Table inspection metrics\n"
-        "• FSI Forest Cover class breakdowns and Terrain Elevation maps\n\n"
-        "*Tips:*\n"
-        "• Export polygons from QGIS/ArcGIS as GeoJSON for best results\n"
-        "• Ensure the polygon falls within the study area extent"
-    )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    if "geometry" not in geojson_feature and "type" in geojson_feature:
+        geojson_feature = {
+            "type": "Feature",
+            "properties": {},
+            "geometry": geojson_feature
+        }
+
+    results: dict[str, Any] = {}
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_fcm = pool.submit(_analyse_forest_cover, geojson_feature)
+        future_dem = pool.submit(_analyse_elevation,    geojson_feature)
+
+        for future in as_completed([future_fcm, future_dem]):
+            try:
+                key, value = future.result()
+                results[key] = value
+            except Exception as exc:
+                log.error("Analysis sub-task failed: %s", exc, exc_info=True)
+                sys.stdout.flush()
+                raise
+
+    results["area_ha"] = _calculate_area_ha(geojson_feature)
+    results["centroid"] = _get_centroid(geojson_feature)
+
+    log.info("Analysis complete → area=%.2f ha", results["area_ha"])
     sys.stdout.flush()
+    return results
 
 
-# ── Vector File Document Catch Mechanism ──────────────────────────────────────
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.message
-    document = message.document
-    user = update.effective_user
+# ── Sub-analysis functions ────────────────────────────────────────────────────
 
-    # 🚀 FIXED: Added archive layout structures to allow passing front gate filters
-    suffix = Path(document.file_name or "").suffix.lower()
-    if suffix not in {".geojson", ".json", ".kml", ".gpkg", ".kmz", ".zip"}:
-        await message.reply_text(
-            "⚠️ Please upload a valid spatial `.geojson`, `.kml`, `.gpkg`, `.kmz`, or shapefile `.zip` archive.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
+def _analyse_forest_cover(geojson_feature: dict) -> tuple[str, dict]:
+    """Returns pixel-count breakdown of FSI Forest Cover classes as percentages."""
+    masked, _ = extract_masked_array(cfg.COG_FCM, geojson_feature, band=1, nodata=255)
 
-    status_msg = await message.reply_text("📥 *Processing vector layout properties…*", parse_mode=ParseMode.MARKDOWN)
-    sys.stdout.flush()
+    total_valid = masked.count()
+    if total_valid == 0:
+        return "fcm", {"error": "No valid pixels in extent", "classes": {}}
+
+    class_stats: dict[str, dict] = {}
+    flat = masked.compressed()
+
+    for class_val, class_name in FCM_CLASSES.items():
+        count = int(np.sum(flat == class_val))
+        pct   = round((count / total_valid) * 100, 2) if total_valid > 0 else 0.0
+        if count > 0:
+            class_stats[class_name] = {
+                "pixel_count":   count,
+                "percentage":    pct,
+                "class_id":      class_val,
+            }
+
+    forest_classes = {k: v for k, v in class_stats.items() if "Water" not in k}
+    dominant = max(forest_classes, key=lambda k: forest_classes[k]["pixel_count"]) \
+               if forest_classes else "Non-Forest"
+
+    return "fcm", {
+        "classes":  class_stats,
+        "dominant": dominant,
+        "total_valid_pixels": total_valid,
+    }
+
+
+def _analyse_elevation(geojson_feature: dict) -> tuple[str, dict]:
+    """Computes min / max / mean elevation and mean slope inside boundaries."""
+    masked, meta = extract_masked_array(cfg.COG_DEM, geojson_feature, band=1, nodata=-9999)
+
+    if masked.count() == 0:
+        return "dem", {"error": "No valid pixels in extent"}
+
+    valid = masked.compressed().astype(np.float32)
+    res_x = abs(meta["transform"].a)
+    res_y = abs(meta["transform"].e)
+
+    data_2d = masked.filled(np.nan).astype(np.float32)
+    dy, dx = np.gradient(data_2d, res_y, res_x)
+    slope_rad = np.arctan(np.sqrt(dx**2 + dy**2))
+    slope_deg = np.degrees(slope_rad)
     
-    tmp_path = Path(cfg.TEMP_DIR) / f"{user.id}_{document.file_name}"
-    
-    try:
-        tg_file = await context.bot.get_file(document.file_id)
-        await tg_file.download_to_drive(str(tmp_path))
+    slope_valid = slope_deg[~masked.mask] if masked.mask is not np.ma.nomask else slope_deg.ravel()
 
-        geojson_feature, gdf_attributes = load_vector_file(tmp_path)
-
-        # Cache variables inside temporary user session memory
-        context.user_data["current_feature"] = geojson_feature
-        context.user_data["filename"] = document.file_name
-        
-        # Strip spatial data to safely cache attribute dataframe rows as serializable dict list
-        attr_df = gdf_attributes.drop(columns=["geometry"], errors="ignore")
-        context.user_data["cached_df_dict"] = attr_df.to_dict(orient="records")
-
-        keyboard = [
-            [InlineKeyboardButton("📋 View Attributes Table", callback_data="action_attributes")],
-            [InlineKeyboardButton("🔬 Run Spatial DSS Analysis", callback_data="action_analysis")]
-        ]
-        
-        await status_msg.delete()
-        await message.reply_text(
-            f"✅ *Layer Ingested Successfully!*\n\n"
-            f"📁 *File:* `{document.file_name}`\n"
-            f"📦 *Total Features:* `{len(gdf_attributes)}` Polygons/Parts\n\n"
-            f"Select processing task:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    except Exception as exc:
-        log.error("Failed to parse or ingest uploaded vector document.", exc_info=True)
-        if status_msg:
-            await status_msg.edit_text(f"❌ *Vector ingestion failed:* {exc}")
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink()
-        sys.stdout.flush()
+    return "dem", {
+        "elevation_min_m":  round(float(valid.min()),  1),
+        "elevation_max_m":  round(float(valid.max()),  1),
+        "elevation_mean_m": round(float(valid.mean()), 1),
+        "slope_mean_deg":   round(float(slope_valid.mean()), 1) if len(slope_valid) else 0.0,
+        "slope_max_deg":    round(float(slope_valid.max()),  1) if len(slope_valid) else 0.0,
+    }
 
 
-# ── Interactive Callback Menu Router ──────────────────────────────────────────
-async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
+def _calculate_area_ha(geojson_feature: dict) -> float:
+    """Accurate geodesic area calculation in hectares using UTM zone mapping."""
+    geom_wgs84 = shape(geojson_feature["geometry"])
+    transformer = Transformer.from_crs(cfg.TARGET_CRS, cfg.AREA_CRS, always_xy=True)
+    geom_utm = shapely_transform(transformer.transform, geom_wgs84)
+    return round(geom_utm.area / 10000, 4)
 
-    action = query.data
-    user = update.effective_user  
-    geojson_feature = context.user_data.get("current_feature")
-    cached_records = context.user_data.get("cached_df_dict")
-    filename = context.user_data.get("filename", "layer")
 
-    if not geojson_feature or cached_records is None:
-        await query.edit_message_text("❌ Session expired. Please upload your vector file again.")
-        return
+def _calculate_utm_zone(lon: float) -> int:
+    """Calculate the UTM zone number from longitude coordinate inputs."""
+    return int((lon + 180) / 6) + 1
 
-    base_name = Path(filename).stem
 
-    if action == "action_attributes":
-        await query.message.reply_chat_action(ChatAction.UPLOAD_DOCUMENT)
-        df = pd.DataFrame(cached_records)
-        
-        # 1. Format text-grid preview representation
-        text_preview = f"📊 *Attributes Table Preview for `{filename}`*\n"
-        text_preview += f"Total rows detected: `{len(df)}` \n\n"
-        text_preview += "```text\n"
-        
-        # Isolate top columns for the preview card layout
-        cols = [c for c in df.columns if c not in ["description", "Description"]]
-        text_preview += " | ".join(cols[:4]) + "\n"
-        text_preview += "-" * 35 + "\n"
-        
-        for _, row in df.head(5).iterrows():
-            vals = [str(row[c])[:12] for c in cols[:4]]
-            text_preview += " | ".join(vals) + "\n"
+def _get_centroid(geojson_feature: dict) -> tuple[float, float]:
+    """Returns (longitude, latitude) of the overall geometric center."""
+    geom = shape(geojson_feature["geometry"])
+    c = geom.centroid
+    return (round(c.x, 6), round(c.y, 6))
+
+
+# ── Advanced Multi-Format File Ingestion Helpers ──────────────────────────────
+
+def load_vector_file(file_path: str | Path) -> tuple[dict, gpd.GeoDataFrame]:
+    """
+    Reads any supported spatial format (.geojson, .kml, .gpkg, .kmz, or shapefile .zip).
+    Handles MultiPolygons natively without flattening feature records destructively.
+    """
+    import fiona
+    fiona.drvsupport.supported_drivers['KML'] = 'r'
+    fiona.drvsupport.supported_drivers['LIBKML'] = 'r'
+
+    path = Path(file_path)
+    suffix = path.suffix.lower()
+
+    log.info(f"Ingesting uploaded dataset file payload: {path.name}")
+    sys.stdout.flush()
+
+    # 1. Handle KMZ Archives (Decompress internally to parse embedded doc.kml)
+    if suffix == ".kmz":
+        log.info("Extracting KMZ archive container stream…")
+        with zipfile.ZipFile(path, 'r') as zip_ref:
+            kml_files = [f for f in zip_ref.namelist() if f.lower().endswith('.kml')]
+            if not kml_files:
+                raise ValueError("Invalid KMZ layout: No underlying .kml files found inside.")
             
-        if len(df) > 5:
-            text_preview += "... data frame truncated for chat view.\n"
-        text_preview += "```"
+            tmp_extract_dir = Path(tempfile.mkdtemp())
+            extracted_kml = zip_ref.extract(kml_files, path=tmp_extract_dir)
+            path = Path(extracted_kml)
+            suffix = ".kml"
 
-        # 2. Build full-scale backup spreadsheet (.csv) stream
-        csv_buffer = io.StringIO()
-        df.to_csv(csv_buffer, index=False)
-        csv_bytes = csv_buffer.getvalue().encode('utf-8')
-        csv_buffer.close()
-
-        # Dispatch both styles to chat concurrently
-        await query.message.reply_text(text_preview, parse_mode=ParseMode.MARKDOWN)
-        await query.message.reply_document(
-            document=InputFile(io.BytesIO(csv_bytes), filename=f"{base_name}_attributes.csv"),
-            caption=f"📂 *Complete Attribute Table Spreadsheet* (`fid` index mapped).",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        await query.delete_message()
-        sys.stdout.flush()
-
-    elif action == "action_analysis":
-        status_msg = await query.edit_message_text(
-            "🔬 *Running full spatial intersection algorithms…*\n"
-            "_(Streaming raster tiles from cloud matrices)_",
-            parse_mode=ParseMode.MARKDOWN
-        )
+    # 2. 🚀 INTERCEPT WINDOW: Pure Python Multi-part Unzip routing for Shapefiles
+    if suffix == ".zip":
+        log.info("Extracting Shapefile ZIP archive container layout safely…")
         sys.stdout.flush()
         
+        tmp_extract_dir = Path(tempfile.mkdtemp())
         try:
-            results = await asyncio.get_event_loop().run_in_executor(None, run_analysis, geojson_feature)
-            map_png = await asyncio.get_event_loop().run_in_executor(None, render_map, geojson_feature, results, filename)
-
-            log_analysis(user.id, filename, geojson_feature, results, results["centroid"])
-            summary = _build_summary(results, filename)
+            with zipfile.ZipFile(path, 'r') as zip_ref:
+                zip_ref.extractall(tmp_extract_dir)
             
-            await status_msg.delete()
-            await query.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN)
-            await query.message.reply_photo(photo=InputFile(map_png, filename="sdss_report.png"), caption="📊 *SDSS Cartographic Report*")
-        except Exception as err:
-            log.error("Analysis thread pipeline execution failed: %s", err, exc_info=True)
-            if status_msg:
-                await status_msg.edit_text(f"❌ *Analysis processing failed:* {err}")
+            # Find the core structural .shp coordinate asset line
+            shp_files = list(tmp_extract_dir.glob("**/*.shp"))
+            if not shp_files:
+                raise ValueError("Invalid Shapefile ZIP: Could not find any underlying .shp file inside.")
+            
+            gdf = gpd.read_file(str(shp_files))
+            return _process_and_sanitize_gdf(gdf)
         finally:
-            sys.stdout.flush()
+            shutil.rmtree(tmp_extract_dir, ignore_errors=True)
+
+    # 3. Standard Ingestion Router (Only executes if it isn't a .zip)
+    driver_map = {".kml": "KML", ".gpkg": "GPKG", ".geojson": None, ".json": None}
+    if suffix not in driver_map:
+        raise ValueError(f"Unsupported file format structure '{suffix}'. Please upload a .geojson, .gpkg, .kml, .kmz, or .zip file.")
+
+    kwargs = {}
+    if driver_map[suffix]:
+        kwargs["driver"] = driver_map[suffix]
+
+    gdf = gpd.read_file(str(path), **kwargs)
+    return _process_and_sanitize_gdf(gdf)
 
 
-# ── /history ──────────────────────────────────────────────────────────────────
-async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    logs = get_user_history(user.id, limit=5)
+def _process_and_sanitize_gdf(gdf: gpd.GeoDataFrame) -> tuple[dict, gpd.GeoDataFrame]:
+    """Cleans up attribute structures, handles projection matching, and extracts geometry summaries."""
+    gdf = gdf.explode(index_parts=False).reset_index(drop=True)
 
-    if not logs:
-        await update.message.reply_text(
-            "📭 No analysis history found. Upload a file to get started!"
-        )
-        return
+    gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
+    if gdf.empty:
+        raise ValueError("The uploaded vector file contains no valid Polygon or MultiPolygon layouts.")
 
-    lines = ["📋 *Your Last 5 Analyses:*\n"]
-    for i, entry in enumerate(logs, 1):
-        r   = entry.get("results", {})
-        ts  = entry.get("created_at", "—")
-        ts_str = ts.strftime("%d %b %Y %H:%M UTC") if hasattr(ts, "strftime") else str(ts)
-        lines.append(
-            f"*{i}.* `{entry.get('filename', '—')}`\n"
-            f"   📅 {ts_str}\n"
-            f"   🌲 {r.get('fcm', {}).get('dominant', '—')} | "
-            f"📐 {r.get('area_ha', '—')} ha | "
-            f"⛰ {r.get('dem', {}).get('elevation_mean_m', '—')} m\n"
-        )
+    if "fid" not in gdf.columns:
+        gdf.insert(0, "fid", gdf.index + 1)
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-    sys.stdout.flush()
+    noise_cols = ["Description", "description", "tessellate", "extrude", "visibility"]
+    for col in noise_cols:
+        if col in gdf.columns:
+            gdf = gdf.drop(columns=[col], errors="ignore")
 
+    if gdf.crs is None:
+        gdf = gdf.set_crs(cfg.TARGET_CRS)
+    elif gdf.crs.to_string() != cfg.TARGET_CRS:
+        gdf = gdf.to_crs(cfg.TARGET_CRS)
 
-# ── /status ───────────────────────────────────────────────────────────────────
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_chat_action(ChatAction.TYPING)
-    checks = {}
-
-    # MongoDB Check
-    try:
-        from modules.database import _get_db
-        _get_db().command("ping")
-        checks["MongoDB Atlas"] = "✅ Connected"
-    except Exception as exc:
-        checks["MongoDB Atlas"] = f"❌ Error: {exc}"
-
-    # Supabase Check
-    try:
-        from modules.storage import _get_supabase
-        _get_supabase().storage.from_(cfg.SUPABASE_BUCKET).list()
-        checks["Supabase Storage"] = "✅ Connected"
-    except Exception as exc:
-        checks["Supabase Storage"] = f"❌ Error: {exc}"
-
-    lines = ["🔧 *System Status*\n"]
-    for service, status in checks.items():
-        lines.append(f"*{service}:* {status}")
-
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-    sys.stdout.flush()
-
-
-# ── Unknown Message Fallback ──────────────────────────────────────────────────
-async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "📂 Please upload a spatial vector file (`.geojson`, `.kml`, `.gpkg`, `.kmz`, or shapefile `.zip`) "
-        "to start analysis, or use /help for instructions.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-# ── Report Text Builder Helper ────────────────────────────────────────────────
-def _build_summary(results: dict, filename: str) -> str:
-    fcm = results.get("fcm", {})
-    dem = results.get("dem", {})
-    lon, lat = results.get("centroid", ("—", "—"))
-
-    classes = fcm.get("classes", {})
-    cover_lines = ""
-    for name, stats in classes.items():
-        cover_lines += f"  • {name}: {stats['percentage']:.1f}%\n"
-
-    return (
-        f"✅ *Analysis Complete*\n\n"
-        f"📁 *File:* `{filename}`\n"
-        f"📍 *Centroid:* `{lon}, {lat}`\n\n"
-        f"📐 *Area:* `{results.get('area_ha', '—')} hectares`\n\n"
-        f"🌲 *Forest Cover (dominant):* `{fcm.get('dominant', '—')}`\n"
-        f"{cover_lines}\n"
-        f"⛰ *Elevation:*\n"
-        f"  • Min: `{dem.get('elevation_min_m', '—')} m`\n"
-        f"  • Max: `{dem.get('elevation_max_m', '—')} m`\n"
-        f"  • Mean: `{dem.get('elevation_mean_m', '—')} m`\n\n"
-        f"📉 *Slope:*\n"
-        f"  • Mean: `{dem.get('slope_mean_deg', '—')}°`\n"
-        f"  • Max: `{dem.get('slope_max_deg', '—')}°`\n"
-    )
+    combined_geometry = gdf.geometry.unary_union
     
+    geojson_feature = {
+        "type": "Feature",
+        "properties": {"summary": "Unified Vector Track Collection"},
+        "geometry": mapping(combined_geometry)
+    }
+
+    log.info(f"Successfully processed {len(gdf)} discrete spatial layout features.")
+    sys.stdout.flush()
+
+    return geojson_feature, gdf
+
