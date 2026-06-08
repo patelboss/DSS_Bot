@@ -62,7 +62,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         )
         return
 
-    data_type = args.upper()
+    data_type = args[0].upper()
     document = message.reply_to_message.document
     suffix = Path(document.file_name or "").suffix.lower()
 
@@ -152,7 +152,8 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 logger.error("❌ Extraction Error: Could not locate a valid .shp tracking node inside file package.")
                 raise ValueError("No valid .shp file found inside uploaded archive package.")
 
-            target_shp = shp_files
+            # 🚀 FIXED: Extract index from your shapefile list match array
+            target_shp = shp_files[0]
             logger.info(f"🎯 Target shapefile found: {target_shp.name}")
             master_gdf = gpd.read_file(target_shp)
         else:
@@ -276,41 +277,73 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 zipped_filesize = os.path.getsize(zip_out_path)
                 logger.info(f"  └─ ZIP Done. Compressed size: {zipped_filesize / (1024*1024):.2f} MB")
 
-                storage_mode = "telegram_zipped"
-                final_upload_path = zip_out_path
-                final_filename = zip_filename
-                chunk_out_path.unlink(missing_ok=True)
+                if zipped_filesize < 49 * 1024 * 1024:
+                    storage_mode = "telegram_zipped"
+                    final_upload_path = zip_out_path
+                    final_filename = zip_filename
+                    chunk_out_path.unlink(missing_ok=True)
+                else:
+                    # 🚀 FIXED: Fallback safety net to capture strings if zip still breaches limits
+                    logger.error("  └─ 🚨 CRITICAL: Compressed file sizes still break upload metrics. Routing to MongoDB Text-Chunking pipeline...")
+                    storage_mode = "mongodb_geojson_chunks"
 
             # ── 🚀 Pyrogram Send Matrix: Uploads heavy files seamlessly up to 2GB ──
-            logger.info(f"  └─ Shipping {final_filename} to Telegram Channel Storage Drive via MTProto client link...")
-            channel_msg = await client.send_document(
-                chat_id=CHANNEL_CHAT_ID,
-                document=str(final_upload_path),
-                caption=(
-                    f"📦 Grid Reference Asset Layout: {final_filename}\n"
-                    f"Type: #{data_type} #Grid_{grid_id} Mode: #{storage_mode}"
+            if storage_mode in ("telegram_raw", "telegram_zipped"):
+                logger.info(f"  └─ Shipping {final_filename} to Telegram Channel Storage Drive via MTProto client link...")
+                channel_msg = await client.send_document(
+                    chat_id=CHANNEL_CHAT_ID,
+                    document=str(final_upload_path),
+                    caption=(
+                        f"📦 Grid Reference Asset Layout: {final_filename}\n"
+                        f"Type: #{data_type} #Grid_{grid_id} Mode: #{storage_mode}"
+                    )
                 )
-            )
-            
-            # Extract internal message id directly out of Pyrogram's message object model
-            logger.info(f"  └─ Channel link accepted transmission. Registered Message ID: {channel_msg.id}")
-            
-            # Write tracking details to catalog index
-            collection.update_one(
-                {"_id": f"{data_type}@Grid_{grid_id}"},
-                {
-                    "$set": {
-                        "grid_id": str(grid_id),
-                        "data_type": data_type,
-                        "storage_mode": storage_mode,
-                        "channel_chat_id": CHANNEL_CHAT_ID,
-                        "channel_message_id": channel_msg.id, # Pyrogram targets .id instead of .message_id
-                        "file_name": final_filename,
-                    }
-                },
-                upsert=True
-            )
-            final_upload_path.unlink(missing_ok=True)
+                
+                logger.info(f"  └─ Channel link accepted transmission. Registered Message ID: {channel_msg.id}")
+                
+                # Write tracking details to catalog index
+                collection.update_one(
+                    {"_id": f"{data_type}@Grid_{grid_id}"},
+                    {
+                        "$set": {
+                            "grid_id": str(grid_id),
+                            "data_type": data_type,
+                            "storage_mode": storage_mode,
+                            "channel_chat_id": CHANNEL_CHAT_ID,
+                            "channel_message_id": channel_msg.id, 
+                            "file_name": final_filename,
+                        }
+                    },
+                    upsert=True
+                )
+                final_upload_path.unlink(missing_ok=True)
+
+            elif storage_mode == "mongodb_geojson_chunks":
+                logger.info("  └─ Serializing polygon structures directly into string layouts...")
+                geojson_str = chunk.to_json()
+                
+                chunk_packet_size = 12 * 1024 * 1024 
+                string_text_arrays = [geojson_str[i:i+chunk_packet_size] for i in range(0, len(geojson_str), chunk_packet_size)]
+                logger.info(f"  └─ Vector string split across {len(string_text_arrays)} collection arrays fragments layout blocks.")
+
+                collection.update_one(
+                    {"_id": f"{data_type}@Grid_{grid_id}"},
+                    {
+                        "$set": {
+                            "grid_id": str(grid_id),
+                            "data_type": data_type,
+                            "storage_mode": storage_mode,
+                            "geojson_chunks": string_text_arrays,
+                            "chunk_count": len(string_text_arrays)
+                        }
+                    },
+                    upsert=True
+                )
+                logger.info(f"  └─ MongoDB Atlas index finalized for Grid_{grid_id}.")
+                chunk_out_path.unlink(missing_ok=True)
+                if 'zip_out_path' in locals():
+                    zip_out_path.unlink(missing_ok=True)
+
             counter += 1
             logger.info(f"📈 [SUCCESS] Grid chunk processing index loop locked in -> Count: {counter}")
 
@@ -331,4 +364,4 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         sys.stdout.flush()
         logger.info("✨ Scratch environment fully restored to pristine state.")
-            
+
