@@ -26,3 +26,4 @@ supabase==2.5.3           # Supabase Storage client
 python-dotenv==1.0.1      # .env file loading
 numpy==1.26.4             # Array operations (pinned for rasterio compatibility)
 click==8.1.7              # CLI for data_prep scripts
+aiohttp==3.9.5            # 🚀 Async web driver layer for keeping Koyeb alive permanently
