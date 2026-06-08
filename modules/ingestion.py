@@ -64,7 +64,6 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         )
         return
 
-    # FIXED: args is the command string itself, args contains your datatype string parameter
     data_type = args[1].upper()
     document = message.reply_to_message.document
     suffix = Path(document.file_name or "").suffix.lower()
@@ -155,7 +154,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 logger.error("❌ Extraction Error: Could not locate a valid .shp tracking node inside file package.")
                 raise ValueError("No valid .shp file found inside uploaded archive package.")
 
-            # 🚀 FIXED: Extract index from your shapefile list match array
+            # 🚀 FIXED: Retain native Path object parsing structure
             target_shp = shp_files[0]
             logger.info(f"🎯 Target shapefile found: {target_shp.name}")
             master_gdf = gpd.read_file(str(target_shp))
@@ -267,12 +266,13 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             parse_mode=ParseMode.MARKDOWN
         )
 
-except Exception as pipeline_err:
-    logger.error("A critical execution error derailed data ingestion pipeline.", exc_info=True)
-    if 'status_msg' in locals():
-        await status_msg.edit_text(f"❌ Master Ingestion Pipeline Crashed: {pipeline_err}")
-finally:
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
-    sys.stdout.flush()
-
+    # 🚀 FIXED INDENTATION: Aligned precisely beneath parent 'try' scope boundary tracking tree line
+    except Exception as pipeline_err:
+        logger.error("A critical execution error derailed data ingestion pipeline.", exc_info=True)
+        if 'status_msg' in locals():
+            await status_msg.edit_text(f"❌ Master Ingestion Pipeline Crashed: {pipeline_err}")
+    finally:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        sys.stdout.flush()
+        
