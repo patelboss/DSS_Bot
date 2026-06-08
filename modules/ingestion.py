@@ -137,10 +137,10 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             if not shp_files:
                 raise ValueError("No valid .shp file found inside uploaded archive package.")
             
-            # FIX 2: Check for file array clutter safely before choosing index element
+            # FIX 2: Corrected index referencing on both string print and assignment fields
             if len(shp_files) > 1:
                 logger.warning(f"Multiple shapefiles found in archive. Using first: {shp_files}")
-            final_master_source = shp_files
+            final_master_source = shp_files[0]
 
         # FIX 3: Extract and validate CRS parameters natively via Fiona
         with fiona.open(str(final_master_source)) as src:
@@ -225,6 +225,8 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 payload = {
                     "grid_id": grid_id,
                     "data_type": data_type,
+                    "channel_chat_id": CHANNEL_CHAT_ID,
+                    "channel_message_id": chan_msg.id,
                     "file_id": chan_msg.document.file_id,
                     "file_name": chunk_filename,
                     "feature_count": len(clipped_gdf),
@@ -259,4 +261,4 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             logger.exception("Failed to remove temporary directory")
 
         sys.stdout.flush()
-        
+
