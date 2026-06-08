@@ -332,4 +332,3 @@ async def cmd_manual_broadcast(client: Client, message: Message) -> None:
     except Exception as broadcast_err:
         logger.error("Diagnostic broadcast execution derailed.", exc_info=True)
         await message.reply_text(f"❌ *Broadcast delivery failed:* `{broadcast_err}`", parse_mode=ParseMode.MARKDOWN)
-                        
