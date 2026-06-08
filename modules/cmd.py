@@ -287,7 +287,7 @@ async def cmd_status(client: Client, message: Message) -> None:
 
 
 # ── Unknown Message Fallbacks ─────────────────────────────────────────────────
-@Client.on_message(filters.text & filters.private & ~filters.command())
+@Client.on_message(filters.text & filters.private & ~filters.regex(r"^/"))
 async def handle_unknown(client: Client, message: Message) -> None:
     await message.reply_text(
         "📂 Please upload a spatial vector file (`.geojson`, `.kml`, `.gpkg`, `.kmz`, or shapefile `.zip`) "
