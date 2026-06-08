@@ -7,6 +7,7 @@ import io
 import logging
 import sys
 import asyncio
+import tempfile
 import pandas as pd
 from pathlib import Path
 
@@ -97,7 +98,7 @@ async def handle_document(client: Client, message: Message) -> None:
     status_msg = await message.reply_text("📥 *Processing vector layout properties…*", parse_mode=ParseMode.MARKDOWN)
     sys.stdout.flush()
     
-    tmp_path = Path(tempfile.gettempdir() if hasattr(cfg, 'TEMP_DIR') == False else cfg.TEMP_DIR) / f"{user.id}_{document.file_name}"
+    tmp_path = Path(tempfile.gettempdir() if not hasattr(cfg, 'TEMP_DIR') else cfg.TEMP_DIR) / f"{user.id}_{document.file_name}"
     tmp_path.parent.mkdir(parents=True, exist_ok=True)
     
     try:
@@ -184,142 +185,66 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
         csv_bytes = csv_buffer.getvalue().encode('utf-8')
         csv_buffer.close()
 
-        # Target response straight back to current message framework structures
         await callback_query.message.reply_text(text_preview, parse_mode=ParseMode.MARKDOWN)
         
-        # Stream raw byte packets directly back to Telegram without InputFile wrapper
         bio = io.BytesIO(csv_bytes)
         bio.name = f"{base_name}_attributes.csv"
         await callback_query.message.reply_document(
             document=bio,
-            caption=f"📂 *Complete Attribute Table Spreadsheet* (`fid` index mapped).",
-            parse_mode=ParseMode.MARKDOWN
+            caption=f"📄 Full attribute table export for `{filename}`."
         )
-        await callback_query.message.delete()
-        sys.stdout.flush()
 
     elif action == "action_analysis":
-        status_msg = await callback_query.edit_message_text(
-            "🔬 *Running full spatial intersection algorithms…*\n"
-            "_(Streaming raster tiles from cloud matrices)_",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        sys.stdout.flush()
-        
+        status_msg = await callback_query.message.reply_text("⏳ *Running spatial algorithms over forest datasets...*", parse_mode=ParseMode.MARKDOWN)
         try:
-            results = await asyncio.get_event_loop().run_in_executor(None, run_analysis, geojson_feature)
-            map_png = await asyncio.get_event_loop().run_in_executor(None, render_map, geojson_feature, results, filename)
-
-            log_analysis(user.id, filename, geojson_feature, results, results["centroid"])
-            summary = _build_summary(results, filename)
+            await client.send_chat_action(chat_id=user.id, action=ChatAction.TYPING)
             
+            # Execute raster/vector intersections inside spatial module
+            results = run_analysis(geojson_feature)
+            log_analysis(user.id, filename, geojson_feature, results, results.get("centroid", ["0", "0"]))
+
+            report_text = (
+                f"🔬 *Spatial Analysis Complete for `{filename}`*\n\n"
+                f"🌲 *Forest Cover Analysis:*\n"
+                f"• Very Dense Forest: `{results.get('vdf_ha', 0):.2f} ha`\n"
+                f"• Moderately Dense Forest: `{results.get('mdf_ha', 0):.2f} ha`\n"
+                f"• Open Forest: `{results.get('of_ha', 0):.2f} ha`\n\n"
+                f"⛰️ *Terrain Profile:*\n"
+                f"• Mean Elevation: `{results.get('mean_elev', 0):.1f} m`\n"
+                f"• Max Slope Angle: `{results.get('max_slope', 0):.1f}°`"
+            )
+
+            # Generate and dispatch spatial map matrix plot 
+            map_path = render_map(geojson_feature, results, filename)
+            
+            # Check if map_path is raw bytes (io.BytesIO) or a string path
+            if map_path:
+                await client.send_chat_action(chat_id=user.id, action=ChatAction.UPLOAD_PHOTO)
+                if isinstance(map_path, (str, Path)) and Path(map_path).exists():
+                    await callback_query.message.reply_photo(photo=str(map_path), caption=report_text, parse_mode=ParseMode.MARKDOWN)
+                    Path(map_path).unlink(missing_ok=True)
+                else:
+                    # If it's a BytesIO stream returned from the renderer
+                    await callback_query.message.reply_photo(photo=map_path, caption=report_text, parse_mode=ParseMode.MARKDOWN)
+            else:
+                await callback_query.message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN)
+
             await status_msg.delete()
-            await callback_query.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN)
-            
-            # Pack photo binary payload data structures cleanly
-            photo_bio = io.BytesIO(map_png)
-            photo_bio.name = "sdss_report.png"
-            await callback_query.message.reply_photo(photo=photo_bio, caption="📊 *SDSS Cartographic Report*")
+
         except Exception as err:
-            logger.error("Analysis thread pipeline execution failed: %s", err, exc_info=True)
-            if status_msg:
-                await status_msg.edit_text(f"❌ *Analysis processing failed:* {err}", parse_mode=ParseMode.MARKDOWN)
-        finally:
-            sys.stdout.flush()
+            logger.error("Error executing spatial analysis pipeline", exc_info=True)
+            await status_msg.edit_text(f"❌ Analysis failed due to technical error: {err}")
 
 
-# ── /history ──────────────────────────────────────────────────────────────────
-@Client.on_message(filters.command("history") & filters.private)
-async def cmd_history(client: Client, message: Message) -> None:
-    user = message.from_user
-    logs = get_user_history(user.id, limit=5)
-
-    if not logs:
-        await message.reply_text(
-            "📭 No analysis history found. Upload a file to get started!",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-
-    lines = ["📋 *Your Last 5 Analyses:*\n"]
-    for i, entry in enumerate(logs, 1):
-        r   = entry.get("results", {})
-        ts  = entry.get("created_at", "—")
-        ts_str = ts.strftime("%d %b %Y %H:%M UTC") if hasattr(ts, "strftime") else str(ts)
-        lines.append(
-            f"*{i}.* `{entry.get('filename', '—')}`\n"
-            f"   📅 {ts_str}\n"
-            f"   🌲 {r.get('fcm', {}).get('dominant', '—')} | "
-            f"📐 {r.get('area_ha', '—')} ha | "
-            f"⛰ {r.get('dem', {}).get('elevation_mean_m', '—')} m\n"
-        )
-
-    await message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-    sys.stdout.flush()
-
-
-# ── /status ───────────────────────────────────────────────────────────────────
-@Client.on_message(filters.command("status") & filters.private)
-async def cmd_status(client: Client, message: Message) -> None:
-    await client.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-    checks = {}
-
-    try:
-        from modules.database import _get_db
-        _get_db().command("ping")
-        checks["MongoDB Atlas"] = "✅ Connected"
-    except Exception as exc:
-        checks["MongoDB Atlas"] = f"❌ Error: {exc}"
-
-    try:
-        from modules.storage import _get_supabase
-        _get_supabase().storage.from_(cfg.SUPABASE_BUCKET).list()
-        checks["Supabase Storage"] = "✅ Connected"
-    except Exception as exc:
-        checks["Supabase Storage"] = f"❌ Error: {exc}"
-
-    lines = ["🔧 *System Status*\n"]
-    for service, status in checks.items():
-        lines.append(f"*{service}:* {status}")
-
-    await message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-    sys.stdout.flush()
-
-
-# ── Unknown Message Fallbacks ─────────────────────────────────────────────────
+# ── Plain text listener framework ─────────────────────────────────────────────
+# 🚀 FIX: Replaced ~filters.command() with explicit regex exclusion to prevent runtime compile error
 @Client.on_message(filters.text & filters.private & ~filters.regex(r"^/"))
-async def handle_unknown(client: Client, message: Message) -> None:
+async def catch_all_text(client: Client, message: Message) -> None:
     await message.reply_text(
-        "📂 Please upload a spatial vector file (`.geojson`, `.kml`, `.gpkg`, `.kmz`, or shapefile `.zip`) "
-        "to start analysis, or use /help for instructions.",
-        parse_mode=ParseMode.MARKDOWN,
+        "👋 I am ready to process your spatial layouts!\n\n"
+        "Please attach a valid configuration or spatial boundary file (.geojson, .kml, .zip) directly here. "
+        "Type /help if you need formatting examples.",
+        parse_mode=ParseMode.MARKDOWN
     )
-
-
-# ── Report Text Builder Helper ────────────────────────────────────────────────
-def _build_summary(results: dict, filename: str) -> str:
-    fcm = results.get("fcm", {})
-    dem = results.get("dem", {})
-    lon, lat = results.get("centroid", ("—", "—"))
-
-    classes = fcm.get("classes", {})
-    cover_lines = ""
-    for name, stats in classes.items():
-        cover_lines += f"  • {name}: {stats['percentage']:.1f}%\n"
-
-    return (
-        f"✅ *Analysis Complete*\n\n"
-        f"📁 *File:* `{filename}`\n"
-        f"📍 *Centroid:* `{lon}, {lat}`\n\n"
-        f"📐 *Area:* `{results.get('area_ha', '—')} hectares`\n\n"
-        f"🌲 *Forest Cover (dominant):* `{fcm.get('dominant', '—')}`\n"
-        f"{cover_lines}\n"
-        f"⛰ *Elevation:*\n"
-        f"  • Min: `{dem.get('elevation_min_m', '—')} m`\n"
-        f"  • Max: `{dem.get('elevation_max_m', '—')} m`\n"
-        f"  • Mean: `{dem.get('elevation_mean_m', '—')} m`\n\n"
-        f"📉 *Slope:*\n"
-        f"  • Mean: `{dem.get('slope_mean_deg', '—')}°`\n"
-        f"  • Max: `{dem.get('slope_max_deg', '—')}°`\n"
-    )
-
+    sys.stdout.flush()
+    
