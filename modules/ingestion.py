@@ -42,9 +42,9 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
     Admin Command: /upload_master [DATA_TYPE] (Sent as a reply to a document)
     Slices by grid, uploads files to a channel via MTProto, and indexes in MongoDB.
     """
-    # 1. Verification Guardrails with Explicit Logging Traces
+    # 1. Verification Guardrails
     if not message.reply_to_message or not message.reply_to_message.document:
-        logger.warning("❌ Ingestion Rejected: Command was executed without replying to a valid file document.")
+        logger.warning("❌ Ingestion Rejected: Command executed without replying to a valid file document.")
         await message.reply_text(
             "⚠️ *Usage Instruction:*\n\n"
             "1. Upload your master vector file.\n"
@@ -54,7 +54,6 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         )
         return
 
-    # Pyrogram parses arguments into text split parameters
     args = message.text.split() if message.text else []
     if len(args) < 2:
         logger.warning("❌ Ingestion Rejected: Missing DATA_TYPE parameter argument.")
@@ -65,7 +64,15 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         )
         return
 
+    # FIX 1: Explicit argument extraction with strict type verification validation guards
     data_type = args[1].upper()
+    if data_type not in {"FCM", "FTM"}:
+        await message.reply_text(
+            "⚠️ Invalid DATA_TYPE.\nUsage: `/upload_master FCM` or `/upload_master FTM`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
     document = message.reply_to_message.document
     suffix = Path(document.file_name or "").suffix.lower()
 
@@ -77,8 +84,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
     if suffix not in {".geojson", ".gpkg", ".zip"}:
         logger.warning(f"❌ Ingestion Rejected: File extension '{suffix}' is unsupported.")
         await message.reply_text(
-            "⚠️ Unsupported master format. "
-            "Use `.geojson`, `.gpkg`, or shapefile `.zip`.",
+            "⚠️ Unsupported master format. Use `.geojson`, `.gpkg`, or shapefile `.zip`.",
             parse_mode=ParseMode.MARKDOWN
         )
         return
@@ -95,45 +101,33 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
     master_path = tmp_dir / document.file_name
     grid_path = tmp_dir / "state_fishnet_grid.gpkg"
 
+    # FIX 8: Main structural try block begins here (indented to match inside function scope)
     try:
-        # -------------------------------------------------------------
-        # Download uploaded file
-        # -------------------------------------------------------------
+        # Download Master Vector Dataset
         logger.info(f"📥 Downloading raw file asset '{document.file_name}' via Pyrogram client...")
         await status_msg.edit_text(
             "📥 *Downloading master vector layer from Telegram updates…*",
             parse_mode=ParseMode.MARKDOWN
         )
-
         await client.download_media(message.reply_to_message, file_name=str(master_path))
         logger.info(f"💾 Local download locked in. Path: {master_path} | Size: {os.path.getsize(master_path) / (1024*1024):.2f} MB")
 
-        # -------------------------------------------------------------
-        # Download grid from Supabase
-        # -------------------------------------------------------------
-        logger.info(f"🛰 Fetching structural grid 'state_grid.gpkg' from Supabase Bucket: '{cfg.SUPABASE_BUCKET}'...")
+        # Download Framework Grid
+        logger.info(f"🛰 Fetching structural grid 'state_grid.gpkg' from Supabase Bucket...")
         await status_msg.edit_text(
             "🛰 *Streaming Master Fishnet Grid framework from Supabase Storage…*",
             parse_mode=ParseMode.MARKDOWN
         )
-
         supabase = _get_supabase()
         with open(grid_path, "wb") as f:
-            res = (
-                supabase.storage
-                .from_(cfg.SUPABASE_BUCKET)
-                .download("state_grid.gpkg")
-            )
+            res = supabase.storage.from_(cfg.SUPABASE_BUCKET).download("state_grid.gpkg")
             f.write(res)
         logger.info(f"📐 Framework grid downloaded. Path: {grid_path} | Size: {os.path.getsize(grid_path) / (1024*1024):.2f} MB")
 
-        # -------------------------------------------------------------
-        # Read Bounding Framework Grid Only
-        # -------------------------------------------------------------
         grid_gdf = gpd.read_file(str(grid_path))
         logger.info(f"📊 Grid Records initialized: {len(grid_gdf)} mapping cells available.")
 
-        # Determine target file tracking source path node
+        # Resolve Master File Tracking Source Node Path
         final_master_source = master_path
         if suffix == ".zip":
             logger.info("🗜 Expanding zipped shapefile archive contents...")
@@ -142,95 +136,105 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             shp_files = [s for s in tmp_dir.glob("**/*.shp") if s.is_file() and not s.name.startswith("._")]
             if not shp_files:
                 raise ValueError("No valid .shp file found inside uploaded archive package.")
+            
+            # FIX 2: Check for file array clutter safely before choosing index element
+            if len(shp_files) > 1:
+                logger.warning(f"Multiple shapefiles found in archive. Using first: {shp_files}")
             final_master_source = shp_files
 
-        # Determine CRS alignment properties without reading geometries yet
+        # FIX 3: Extract and validate CRS parameters natively via Fiona
         with fiona.open(str(final_master_source)) as src:
             master_crs = src.crs
 
-        # Setup database collections
+        if not master_crs:
+            raise ValueError("Master dataset does not contain a valid CRS definition.")
+
         db = _get_db()
-        collection_name = "fcm_layers" if data_type == "FCM" else "ftm_layers"
+        # FIX 6: Map dataset collection target names dynamically using a collection lookup dictionary
+        collection_map = {
+            "FCM": "fcm_layers",
+            "FTM": "ftm_layers"
+        }
+        collection_name = collection_map[data_type]
         col = db[collection_name]
 
         success_count = 0
         logger.info(f"✂️ Spatial streaming processes active. Target DB Collection: {collection_name}")
 
-        # -------------------------------------------------------------
-        # 🚀 MEMORY OPTIMIZATION LAYER: Spatial Bounding-Box Streaming Loop
-        # -------------------------------------------------------------
-        for idx, cell in grid_gdf.iterrows():
-            grid_id = cell.get("grid_id", f"cell_{idx}")
-            cell_geom = cell.geometry
+        # FIX 9: Hoist fiona.open outside of the iteration loop for a massive performance upgrade
+        with fiona.open(str(final_master_source)) as source_stream:
             
-            # Align the bounding box of our cell target to the master layer CRS system profile
-            cell_bbox_gdf = gpd.GeoDataFrame(geometry=[cell_geom], crs=grid_gdf.crs).to_crs(master_crs)
-            cell_bbox = cell_bbox_gdf.geometry.iloc.bounds  # Returns (minx, miny, maxx, maxy)
+            for idx, cell in grid_gdf.iterrows():
+                grid_id = cell.get("grid_id", f"cell_{idx}")
+                cell_geom = cell.geometry
+                
+                # Align cell geometry frame bounding box to master layer CRS projection profile
+                cell_bbox_gdf = gpd.GeoDataFrame(geometry=[cell_geom], crs=grid_gdf.crs).to_crs(master_crs)
+                cell_bbox = tuple(cell_bbox_gdf.total_bounds)
 
-            # 🛠 Fiona reads ONLY the geometric items inside this cell box from disk into memory
-            with fiona.open(str(final_master_source)) as source_stream:
+                # Query open file descriptor directly using hoisted stream pointer
                 features_in_box = list(source_stream.filter(bbox=cell_bbox))
 
-            if not features_in_box:
-                continue
+                if not features_in_box:
+                    continue
 
-            # Load the filtered lightweight subset items into our active pandas matrix frame
-            clipped_gdf = gpd.GeoDataFrame.from_features(features_in_box, crs=master_crs)
-            
-            # Re-align projections to match grid frameworks
-            if clipped_gdf.crs != grid_gdf.crs:
-                clipped_gdf = clipped_gdf.to_crs(grid_gdf.crs)
+                # Parse features array into memory frame
+                clipped_gdf = gpd.GeoDataFrame.from_features(features_in_box, crs=master_crs)
+                
+                if clipped_gdf.crs != grid_gdf.crs:
+                    clipped_gdf = clipped_gdf.to_crs(grid_gdf.crs)
 
-            # Topology correction pass
-            clipped_gdf["geometry"] = clipped_gdf.geometry.make_valid()
-            
-            # Clip vectors tightly to our bounding lines
-            clipped_gdf["geometry"] = clipped_gdf.geometry.intersection(cell_geom)
-            clipped_gdf = clipped_gdf[~clipped_gdf.geometry.is_empty & clipped_gdf.geometry.notnull()].copy()
-
-            if clipped_gdf.empty:
-                continue
-
-            # Throttle status update signals to clear out rate-limiting rules
-            if success_count % 5 == 0:
+                # FIX 4: Defensive fallback handling for geometry invalidations
                 try:
-                    await status_msg.edit_text(
-                        f"✂️ *Streaming & Slicing vector assets safely…*\n\n"
-                        f"📍 Active Segment: `Grid_{grid_id}`\n"
-                        f"📦 Total Cached Parts: `{success_count}` chunks",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
+                    clipped_gdf["geometry"] = clipped_gdf.geometry.make_valid()
                 except Exception:
-                    pass
+                    clipped_gdf["geometry"] = clipped_gdf.geometry.buffer(0)
+                
+                # Crop precisely to the cell geometry bounds
+                clipped_gdf["geometry"] = clipped_gdf.geometry.intersection(cell_geom)
+                
+                # FIX 5: Safer geometry filter splits to avoid single-pass mutation dropouts
+                clipped_gdf = clipped_gdf[clipped_gdf.geometry.notnull()].copy()
+                clipped_gdf = clipped_gdf[~clipped_gdf.geometry.is_empty].copy()
 
-            # Export individual slice arrays out to workspace paths
-            chunk_filename = f"{data_type.lower()}_{grid_id}.geojson"
-            chunk_filepath = tmp_dir / chunk_filename
-            clipped_gdf.to_file(str(chunk_filepath), driver="GeoJSON")
-            
-            # Dispatch directly over MTProto channel interface links
-            logger.info(f"📤 Uploading partition chunk: {chunk_filename} over to Channel ID: {CHANNEL_CHAT_ID}")
-            chan_msg = await client.send_document(
-                chat_id=CHANNEL_CHAT_ID,
-                document=str(chunk_filepath),
-                caption=f"📦 SDSS Production Master Part Asset\n• DataType: {data_type}\n• Partition Index: {grid_id}"
-            )
-            
-            # Record tracking metadata information blocks to MongoDB Cluster Index collections
-            payload = {
-                "grid_id": grid_id,
-                "data_type": data_type,
-                "file_id": chan_msg.document.file_id,
-                "file_name": chunk_filename,
-                "feature_count": len(clipped_gdf),
-                "updated_at": pd.Timestamp.now().isoformat()
-            }
-            col.update_one({"grid_id": grid_id}, {"$set": payload}, upsert=True)
-            
-            success_count += 1
-            chunk_filepath.unlink(missing_ok=True)
+                if clipped_gdf.empty:
+                    continue
 
-        # Operational closure metrics pass
+                if success_count % 5 == 0:
+                    try:
+                        await status_msg.edit_text(
+                            f"✂️ *Streaming & Slicing vector assets safely…*\n\n"
+                            f"📍 Active Segment: `Grid_{grid_id}`\n"
+                            f"📦 Total Cached Parts: `{success_count}` chunks",
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                    except Exception:
+                        pass
+
+                chunk_filename = f"{data_type.lower()}_{grid_id}.geojson"
+                chunk_filepath = tmp_dir / chunk_filename
+                clipped_gdf.to_file(str(chunk_filepath), driver="GeoJSON")
+                
+                logger.info(f"📤 Uploading partition chunk: {chunk_filename} over to Channel ID: {CHANNEL_CHAT_ID}")
+                chan_msg = await client.send_document(
+                    chat_id=CHANNEL_CHAT_ID,
+                    document=str(chunk_filepath),
+                    caption=f"📦 SDSS Production Master Part Asset\n• DataType: {data_type}\n• Partition Index: {grid_id}"
+                )
+                
+                payload = {
+                    "grid_id": grid_id,
+                    "data_type": data_type,
+                    "file_id": chan_msg.document.file_id,
+                    "file_name": chunk_filename,
+                    "feature_count": len(clipped_gdf),
+                    "updated_at": pd.Timestamp.now().isoformat()
+                }
+                col.update_one({"grid_id": grid_id}, {"$set": payload}, upsert=True)
+                
+                success_count += 1
+                chunk_filepath.unlink(missing_ok=True)
+
         await status_msg.delete()
         await message.reply_text(
             f"✅ *Master Ingestion Pipeline Completed Successfully!*\n\n"
@@ -240,12 +244,19 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             parse_mode=ParseMode.MARKDOWN
         )
 
+    # FIX 8: Handlers are now properly indented to match try block alignment
     except Exception as pipeline_err:
         logger.error("A critical execution error derailed data ingestion pipeline.", exc_info=True)
         if 'status_msg' in locals():
             await status_msg.edit_text(f"❌ Master Ingestion Pipeline Crashed: {pipeline_err}")
-    finally:
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
-        sys.stdout.flush()
     
+    # FIX 7: Exception-wrapped filesystem cleanup block
+    finally:
+        try:
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
+        except Exception:
+            logger.exception("Failed to remove temporary directory")
+
+        sys.stdout.flush()
+        
