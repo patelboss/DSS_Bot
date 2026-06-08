@@ -68,7 +68,7 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    CHANNEL_CHAT_ID = -100358841607
+    CHANNEL_CHAT_ID = -1003588416077
 
     status_msg = await message.reply_text(
         f"⏳ *Initializing channel-drive pipeline for master {data_type} ingestion…*",
