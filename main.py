@@ -1,5 +1,5 @@
 """
-main.py — SDSS Telegram Bot Starter (python-telegram-bot v21, async)
+main.py — SDSS Telegram Bot Orchestrator Engine (Pyrogram MTProto Edition)
 
 Main orchestrator file responsible for handling thread boot routines and
 maintaining the Koyeb web-service health container checks cleanly.
@@ -7,20 +7,11 @@ maintaining the Koyeb web-service health container checks cleanly.
 
 import logging
 import threading
-import traceback
 from http.server import SimpleHTTPRequestHandler
 from socketserver import TCPServer
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application, 
-    CommandHandler, 
-    MessageHandler, 
-    CallbackQueryHandler, 
-    filters, 
-    ContextTypes
-)
+from pyrogram import Client, filters
+from pyrogram.types import Message, CallbackQuery
 
 from config import cfg
 from modules.cmd import (
@@ -42,22 +33,54 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Reduce verbose session network noise from internal Pyrogram operations
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
-# ── Global Error Capture Callback System ──────────────────────────────────────
-async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Logs runtime exceptions with tracebacks and reports updates cleanly."""
-    log.error("💥 Critical Unhandled Exception caught by SDSS Hooks:", exc_info=context.error)
-    
-    tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
-    tb_string = "".join(tb_list)
-    log.error(f"Full traceback summary:\n{tb_string}")
 
-    if isinstance(update, Update) and update.effective_message:
-        await update.effective_message.reply_text(
-            "❌ *A critical pipeline extraction error occurred.*\n\n"
-            "Please check the server logs for the full traceback.",
-            parse_mode=ParseMode.MARKDOWN
-        )
+# ── Initialize Pyrogram App Client ───────────────────────────────────────────
+app = Client(
+    name="sdss_core_bot",
+    api_id=cfg.API_ID,          # 👈 Make sure these are declared in config / env vars
+    api_hash=cfg.API_HASH,      # 👈 Generated from my.telegram.org
+    bot_token=cfg.TELEGRAM_TOKEN
+)
+
+
+# ── Register Core Pyrogram Command & Message Decoders ────────────────────────
+@app.on_message(filters.command("start"))
+async def route_start(client: Client, message: Message):
+    await cmd_start(client, message)
+
+@app.on_message(filters.command("help"))
+async def route_help(client: Client, message: Message):
+    await cmd_help(client, message)
+
+@app.on_message(filters.command("history"))
+async def route_history(client: Client, message: Message):
+    await cmd_history(client, message)
+
+@app.on_message(filters.command("status"))
+async def route_status(client: Client, message: Message):
+    await cmd_status(client, message)
+
+@app.on_message(filters.command("upload_master"))
+async def route_upload_master(client: Client, message: Message):
+    await cmd_upload_master(client, message)
+
+# Handle inline keyboard interactive click updates
+@app.on_callback_query()
+async def route_callback_query(client: Client, callback_query: CallbackQuery):
+    await handle_button_click(client, callback_query)
+
+# Route incoming shapefiles, geopackages, or tracking vectors
+@app.on_message(filters.document)
+async def route_document(client: Client, message: Message):
+    await handle_document(client, message)
+
+# Default routing layout for unhandled text prompts
+@app.on_message(filters.text & ~filters.command)
+async def route_unknown(client: Client, message: Message):
+    await handle_unknown(client, message)
 
 
 # ── Koyeb Infrastructure Port Binder ──────────────────────────────────────────
@@ -68,20 +91,17 @@ def run_koyeb_health_server():
     """
     class HealthHandler(SimpleHTTPRequestHandler):
         def do_GET(self):
-            # 🚀 FIXED: Respond with 200 OK for both root (/) and /health 
-            # This ensures Koyeb's default check keeps the container active!
             if self.path in ('/', '/health'):
                 self.send_response(200)
                 self.send_header("Content-type", "text/plain")
                 self.end_headers()
-                self.wfile.write(b"SDSS Core Engine Active")
+                self.wfile.write(b"SDSS Core Engine Active (MTProto)")
             else:
                 self.send_response(404)
                 self.end_headers()
 
-        # Suppress spammy log entries for health pings inside the Koyeb console
         def log_message(self, format, *args):
-            return
+            return  # Suppress health check spam lines inside server logs
 
     port = 8080
     try:
@@ -93,46 +113,18 @@ def run_koyeb_health_server():
         log.error("❌ Failed to start health server: %s", e)
 
 
-# ── Application Bootstrap Setup ───────────────────────────────────────────────
-def build_application() -> Application:
-    """Builds and wires up the unified Application environment mapping context."""
-    app = Application.builder().token(cfg.TELEGRAM_TOKEN).build()
-
-    # Register the Global Error Handler
-    app.add_error_handler(global_error_handler)
-
-    # Core Command Routes
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("help",    cmd_help))
-    app.add_handler(CommandHandler("history", cmd_history))
-    app.add_handler(CommandHandler("status",  cmd_status))
-    app.add_handler(CommandHandler("upload_master", cmd_upload_master))
-
-    # Inline Keyboard Interaction Query Route
-    app.add_handler(CallbackQueryHandler(handle_button_click))
-
-    # Structural Document Upload & Fallback Streams
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown))
-
-    return app
-
-
+# ── Application Bootstrap Run ─────────────────────────────────────────────────
 def main() -> None:
     # 1. Fire daemon health listener thread up immediately
     health_thread = threading.Thread(target=run_koyeb_health_server, daemon=True)
     health_thread.start()
 
-    log.info("Starting SDSS Telegram Bot Orchestrator Engine…")
+    log.info("Starting SDSS Telegram Bot Orchestrator Engine via Pyrogram...")
     
-    # 2. Start the unified Telegram client instance polling loop
-    app = build_application()
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=["message", "callback_query"],
-    )
+    # 2. Boot the native Pyrogram server polling loop environment
+    app.run()
 
 
 if __name__ == "__main__":
     main()
-    
+
