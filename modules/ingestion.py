@@ -200,6 +200,11 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 if clipped_gdf.empty:
                     continue
 
+                for col in clipped_gdf.columns:
+                    if isinstance(clipped_gdf[col].dtype, pd.StringDtype):
+                        clipped_gdf[col] = clipped_gdf[col].astype(object)
+        
+
                 if success_count % 5 == 0:
                     try:
                         await status_msg.edit_text(
