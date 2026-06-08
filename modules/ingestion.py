@@ -38,8 +38,8 @@ if not logger.handlers:
 @Client.on_message(filters.command("upload_master") & filters.private)
 async def cmd_upload_master(client: Client, message: Message) -> None:
     """
-    Admin Command: /upload_master [DATA_TYPE] (Sent as a reply to a document)
-    Slices by grid, uploads files to a channel via MTProto, and indexes in MongoDB.
+   # Admin Command: /upload_master [DATA_TYPE] (Sent as a reply to a document)
+   # Slices by grid, uploads files to a channel via MTProto, and indexes in MongoDB.
     """
     # 1. Verification Guardrails with Explicit Logging Traces
     if not message.reply_to_message or not message.reply_to_message.document:
