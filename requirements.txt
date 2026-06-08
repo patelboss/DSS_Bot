@@ -11,6 +11,7 @@ geopandas==0.14.4         # Vector file I/O (.geojson / .kml / .gpkg)
 shapely==2.0.5            # Geometry operations
 pyproj==3.6.1             # CRS transformations + geodesic area
 fiona==1.9.6              # GeoDataFrame backend driver
+packaging==24.0           # 🚀 RESTORED: Required by GeoPandas internal drivers to check version alignments
 
 # ── Map rendering ─────────────────────────────────────────────────────────────
 matplotlib==3.9.1         # Cartographic layout canvas
@@ -22,8 +23,8 @@ dnspython==2.6.1          # Required for mongodb+srv:// URIs
 # ── Cloud Storage ─────────────────────────────────────────────────────────────
 supabase==2.5.3           # Supabase Storage client
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
+# ── Utilities & Web Servers ───────────────────────────────────────────────────
+aiohttp==3.9.5            # Async web driver layer for keeping Koyeb alive permanently
 python-dotenv==1.0.1      # .env file loading
 numpy==1.26.4             # Array operations (pinned for rasterio compatibility)
 click==8.1.7              # CLI for data_prep scripts
-aiohttp==3.9.5            # 🚀 Async web driver layer for keeping Koyeb alive permanently
