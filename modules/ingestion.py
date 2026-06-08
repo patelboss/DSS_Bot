@@ -64,6 +64,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         )
         return
 
+    # FIXED: args is the command string itself, args contains your datatype string parameter
     data_type = args[1].upper()
     document = message.reply_to_message.document
     suffix = Path(document.file_name or "").suffix.lower()
@@ -154,7 +155,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 logger.error("❌ Extraction Error: Could not locate a valid .shp tracking node inside file package.")
                 raise ValueError("No valid .shp file found inside uploaded archive package.")
 
-            # 🚀 FIXED: Retain native Path object parsing structure
+            # 🚀 FIXED: Extract index from your shapefile list match array
             target_shp = shp_files[0]
             logger.info(f"🎯 Target shapefile found: {target_shp.name}")
             master_gdf = gpd.read_file(str(target_shp))
@@ -221,13 +222,19 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             if clipped_gdf.empty:
                 continue
 
-            # 🚀 FIXED INDENTATION BLOCK: Everything inside the loop tracking context is safely aligned
-            await status_msg.edit_text(
-                f"✂️ Slicing vector assets into matrix fields…\n"
-                f"Processing: Grid {grid_id} ({success_count + 1} variants found)",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            
+            # 🚀 RATE-LIMITER FIX: Throttles message status modifications using a modulo operator
+            # Updates users every 5 matching intersections to eliminate FloodWait penalties.
+            if success_count % 5 == 0:
+                try:
+                    await status_msg.edit_text(
+                        f"✂️ *Slicing vector assets into matrix fields…*\n\n"
+                        f"📍 Active Segment: `Grid_{grid_id}`\n"
+                        f"📦 Total Cached Parts: `{success_count}` chunks",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                except Exception:
+                    pass  # Gracefully swallow minor Telegram pipeline timeout conflicts
+
             # Export individual slice package arrays out to temporary workspace tracks
             chunk_filename = f"{data_type.lower()}_{grid_id}.geojson"
             chunk_filepath = tmp_dir / chunk_filename
@@ -266,13 +273,12 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             parse_mode=ParseMode.MARKDOWN
         )
 
-    # 🚀 FIXED INDENTATION: Aligned precisely beneath parent 'try' scope boundary tracking tree line
-    except Exception as pipeline_err:
-        logger.error("A critical execution error derailed data ingestion pipeline.", exc_info=True)
-        if 'status_msg' in locals():
-            await status_msg.edit_text(f"❌ Master Ingestion Pipeline Crashed: {pipeline_err}")
-    finally:
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
-        sys.stdout.flush()
-        
+except Exception as pipeline_err:
+    logger.error("A critical execution error derailed data ingestion pipeline.", exc_info=True)
+    if 'status_msg' in locals():
+        await status_msg.edit_text(f"❌ Master Ingestion Pipeline Crashed: {pipeline_err}")
+finally:
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    sys.stdout.flush()
+
