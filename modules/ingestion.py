@@ -1,8 +1,8 @@
 """
 modules/ingestion.py — Admin data ingestion pipeline.
 Slices massive master vector datasets using a Supabase grid framework,
-uploads the chunk files to a private Telegram channel drive (with ZIP fallback),
-and falls back cleanly to MongoDB chunking for files exceeding limits.
+uploads the chunk files to a private Telegram channel drive via Pyrogram MTProto,
+and logs the permanent mapping indices cleanly into MongoDB Atlas.
 """
 
 import logging
@@ -14,65 +14,61 @@ import zipfile
 from pathlib import Path
 import geopandas as gpd
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import ContextTypes
+from pyrogram import Client
+from pyrogram.types import Message
+from pyrogram.enums import ParseMode
 
 from config import cfg
 from modules.database import _get_db      # Dynamic helper targeting your active Atlas DB
 from modules.storage import _get_supabase # Supabase client handler
 
-# ── Link directly to the main root orchestrator logging pipeline ──────────────
-logger = logging.getLogger(__name__)
+# ── Logging Setup linked to standard output for Koyeb Console visibility ──────
+logger = logging.getLogger("main.ingestion")
 logger.setLevel(logging.INFO)
 
-# Create a stream handler for stdout
-stdout_handler = logging.StreamHandler(sys.stdout)
-stdout_handler.setLevel(logging.INFO)
+if not logger.handlers:
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    stdout_handler.setFormatter(formatter)
+    logger.addHandler(stdout_handler)
 
-# Set a formatter for better readability
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-stdout_handler.setFormatter(formatter)
 
-# Add the handler to the logger
-logger.addHandler(stdout_handler)
-
-async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_upload_master(client: Client, message: Message) -> None:
     """
-    Admin Command: /upload_master [DATA_TYPE]
-    Reply to a master vector file and the dataset will be sliced by grid,
-    uploaded to Telegram storage, and indexed in MongoDB.
+    Admin Command: /upload_master [DATA_TYPE] (Sent as a reply to a document)
+    Slices by grid, uploads files to a channel via MTProto, and indexes in MongoDB.
     """
-    message = update.message
-
     # 1. Verification Guardrails with Explicit Logging Traces
     if not message.reply_to_message or not message.reply_to_message.document:
-        log.warning("❌ Ingestion Rejected: Command was executed without replying to a valid file document.")
+        logger.warning("❌ Ingestion Rejected: Command was executed without replying to a valid file document.")
         await message.reply_text(
             "⚠️ *Usage Instruction:*\n\n"
             "1. Upload your master vector file.\n"
             "2. Reply to that file.\n"
             "3. Send `/upload_master FCM` (or FTM).",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    if not context.args:
+    # Pyrogram parses arguments into text split parameters
+    args = message.text.split() if message.text else []
+    if len(args) < 2:
         logger.warning("❌ Ingestion Rejected: Missing DATA_TYPE parameter argument.")
         await message.reply_text(
             "⚠️ Missing data type variable.\n"
             "Usage: Reply with `/upload_master FCM` or `/upload_master FTM`",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    data_type = context.args[0].upper()
+    data_type = args.upper()
     document = message.reply_to_message.document
     suffix = Path(document.file_name or "").suffix.lower()
 
     logger.info("==========================================================================")
     logger.info(f"🚀 INGESTION TRIGGERED | Type: {data_type} | Target Asset Name: {document.file_name}")
-    logger.info(f"📦 Telegram Document File ID Pointer: {document.file_id}")
+    logger.info(f"📦 Pyrogram Document File ID Pointer: {document.file_id}")
     logger.info("==========================================================================")
 
     if suffix not in {".geojson", ".gpkg", ".zip"}:
@@ -80,14 +76,16 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await message.reply_text(
             "⚠️ Unsupported master format. "
             "Use `.geojson`, `.gpkg`, or shapefile `.zip`.",
+            parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    CHANNEL_CHAT_ID = -1003588416077
+    # Pulled directly from your updated central config
+    CHANNEL_CHAT_ID = cfg.TELEGRAM_CHANNEL_ID
 
     status_msg = await message.reply_text(
-        f"⏳ *Initializing channel-drive pipeline for master {data_type} ingestion…*",
-        parse_mode=ParseMode.MARKDOWN,
+        f"⏳ *Initializing MTProto channel-drive pipeline for master {data_type} ingestion…*",
+        parse_mode=ParseMode.MARKDOWN
     )
     sys.stdout.flush()
 
@@ -99,14 +97,14 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # -------------------------------------------------------------
         # Download uploaded file
         # -------------------------------------------------------------
-        logger.info(f"📥 Downloading raw file asset '{document.file_name}' into ephemeral path node...")
+        logger.info(f"📥 Downloading raw file asset '{document.file_name}' via Pyrogram client...")
         await status_msg.edit_text(
             "📥 *Downloading master vector layer from Telegram updates…*",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.MARKDOWN
         )
 
-        tg_file = await context.bot.get_file(document.file_id)
-        await tg_file.download_to_drive(str(master_path))
+        # Pyrogram uses download_media directly targeting the message object
+        await client.download_media(message.reply_to_message, file_name=str(master_path))
         logger.info(f"💾 Local download locked in. Path: {master_path} | Size: {os.path.getsize(master_path) / (1024*1024):.2f} MB")
 
         # -------------------------------------------------------------
@@ -115,7 +113,7 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         logger.info(f"🛰 Fetching structural grid 'state_grid.gpkg' from Supabase Bucket: '{cfg.SUPABASE_BUCKET}'...")
         await status_msg.edit_text(
             "🛰 *Streaming Master Fishnet Grid framework from Supabase Storage…*",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.MARKDOWN
         )
 
         supabase = _get_supabase()
@@ -135,7 +133,7 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await status_msg.edit_text(
             "🔬 *Executing spatial intersection matrix split…*\n"
             "(This might take a minute)",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.MARKDOWN
         )
         sys.stdout.flush()
 
@@ -154,7 +152,7 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 logger.error("❌ Extraction Error: Could not locate a valid .shp tracking node inside file package.")
                 raise ValueError("No valid .shp file found inside uploaded archive package.")
 
-            target_shp = shp_files[0]
+            target_shp = shp_files
             logger.info(f"🎯 Target shapefile found: {target_shp.name}")
             master_gdf = gpd.read_file(target_shp)
         else:
@@ -194,9 +192,6 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         master_gdf = repair_geometries(master_gdf, "Master Layer Data")
         grid_gdf = repair_geometries(grid_gdf, "Fishnet Grid Framework")
-
-        if master_gdf.empty or grid_gdf.empty:
-            raise ValueError("Dataframes are empty post matrix cleanup execution.")
 
         # -------------------------------------------------------------
         # Spatial join
@@ -268,9 +263,10 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             final_upload_path = chunk_out_path
             final_filename = gpkg_filename
 
-            # 🚀 CHECK TELEGRAM 50MB FILE LIMIT BOUNDARY LAWS
+            # 🚀 MTProto allows up to 2GB uploads natively, but we still compress heavy files 
+            # above 48MB into high-efficiency ZIP archives to save bandwidth.
             if raw_filesize > 48 * 1024 * 1024:
-                logger.warning(f"  └─ ⚠️ File exceeds stable bot thresholds. Passing to ZIP compression engine...")
+                logger.warning(f"  └─ ⚠️ File exceeds stable threshold size. Compressing to high-efficiency ZIP archive...")
                 zip_filename = f"{data_type}@Grid_{grid_id}.zip"
                 zip_out_path = tmp_dir / zip_filename
 
@@ -278,77 +274,43 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     zf.write(chunk_out_path, arcname=gpkg_filename)
                 
                 zipped_filesize = os.path.getsize(zip_out_path)
-                logger.info(f"  └─ ZIP Done. Size: {zipped_filesize / (1024*1024):.2f} MB")
+                logger.info(f"  └─ ZIP Done. Compressed size: {zipped_filesize / (1024*1024):.2f} MB")
 
-                if zipped_filesize < 49 * 1024 * 1024:
-                    storage_mode = "telegram_zipped"
-                    final_upload_path = zip_out_path
-                    final_filename = zip_filename
-                    chunk_out_path.unlink(missing_ok=True)
-                else:
-                    # 🚀 ROUTE FALLBACK ROUTINE TO MONGODB CHUNKS IF FILE IS ABSOLUTELY HUGE
-                    logger.error(f"  └─ 🚨 CRITICAL: Zipped size ({zipped_filesize / (1024*1024):.2f} MB) STILL breaks Telegram limits. Routing straight onto MongoDB String-Chunking matrix...")
-                    storage_mode = "mongodb_geojson_chunks"
-
-            # ── 🚀 FIXED CRASH: Strictly route execution paths based on storage mode ──
-            if storage_mode in ("telegram_raw", "telegram_zipped"):
-                logger.info(f"  └─ Shipping {final_filename} to Telegram Storage Channel Drive...")
-                with open(final_upload_path, "rb") as fp:
-                    channel_msg = await context.bot.send_document(
-                        chat_id=CHANNEL_CHAT_ID,
-                        document=fp,
-                        caption=(
-                            f"📦 Grid Reference Asset Layout: {final_filename}\n"
-                            f"Type: #{data_type} #Grid_{grid_id} Mode: #{storage_mode}"
-                        ),
-                    )
-                
-                logger.info(f"  └─ Channel response accepted. Uploaded message sequence registered at ID: {channel_msg.message_id}")
-                
-                # Write tracking details to catalog
-                collection.update_one(
-                    {"_id": f"{data_type}@Grid_{grid_id}"},
-                    {
-                        "$set": {
-                            "grid_id": str(grid_id),
-                            "data_type": data_type,
-                            "storage_mode": storage_mode,
-                            "channel_chat_id": CHANNEL_CHAT_ID,
-                            "channel_message_id": channel_msg.message_id,
-                            "file_name": final_filename,
-                        }
-                    },
-                    upsert=True
-                )
-                final_upload_path.unlink(missing_ok=True)
-
-            elif storage_mode == "mongodb_geojson_chunks":
-                logger.info("  └─ Serializing polygon structures directly into string layouts...")
-                geojson_str = chunk.to_json()
-                
-                # Split payload string text into clean 12MB block arrays to clear MongoDB 16MB document cap limits safely
-                chunk_packet_size = 12 * 1024 * 1024 
-                string_text_arrays = [geojson_str[i:i+chunk_packet_size] for i in range(0, len(geojson_str), chunk_packet_size)]
-                logger.info(f"  └─ Vector string split across {len(string_text_arrays)} collection arrays fragments layout blocks.")
-
-                collection.update_one(
-                    {"_id": f"{data_type}@Grid_{grid_id}"},
-                    {
-                        "$set": {
-                            "grid_id": str(grid_id),
-                            "data_type": data_type,
-                            "storage_mode": storage_mode,
-                            "geojson_chunks": string_text_arrays,
-                            "chunk_count": len(string_text_arrays)
-                        }
-                    },
-                    upsert=True
-                )
-                logger.info(f"  └─ MongoDB Atlas transactional document tracking index finalized for Grid_{grid_id}.")
+                storage_mode = "telegram_zipped"
+                final_upload_path = zip_out_path
+                final_filename = zip_filename
                 chunk_out_path.unlink(missing_ok=True)
-                if 'zip_out_path' in locals():
-                    zip_out_path.unlink(missing_ok=True)
 
+            # ── 🚀 Pyrogram Send Matrix: Uploads heavy files seamlessly up to 2GB ──
+            logger.info(f"  └─ Shipping {final_filename} to Telegram Channel Storage Drive via MTProto client link...")
+            channel_msg = await client.send_document(
+                chat_id=CHANNEL_CHAT_ID,
+                document=str(final_upload_path),
+                caption=(
+                    f"📦 Grid Reference Asset Layout: {final_filename}\n"
+                    f"Type: #{data_type} #Grid_{grid_id} Mode: #{storage_mode}"
+                )
+            )
+            
+            # Extract internal message id directly out of Pyrogram's message object model
+            logger.info(f"  └─ Channel link accepted transmission. Registered Message ID: {channel_msg.id}")
+            
+            # Write tracking details to catalog index
+            collection.update_one(
+                {"_id": f"{data_type}@Grid_{grid_id}"},
+                {
+                    "$set": {
+                        "grid_id": str(grid_id),
+                        "data_type": data_type,
+                        "storage_mode": storage_mode,
+                        "channel_chat_id": CHANNEL_CHAT_ID,
+                        "channel_message_id": channel_msg.id, # Pyrogram targets .id instead of .message_id
+                        "file_name": final_filename,
+                    }
+                },
+                upsert=True
+            )
+            final_upload_path.unlink(missing_ok=True)
             counter += 1
             logger.info(f"📈 [SUCCESS] Grid chunk processing index loop locked in -> Count: {counter}")
 
@@ -356,9 +318,9 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await status_msg.edit_text(
             f"✅ *Ingestion Completed Successfully!*\n\n"
             f"📊 *Dataset:* `Master {data_type}`\n"
-            f"📡 *Storage Backend:* `Hybrid Managed Environment`\n"
+            f"📡 *Storage Backend:* `Pyrogram MTProto Channel Drive`\n"
             f"📦 *Slices Processed & Cataloged:* `{counter}` Grid Chunks.",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.MARKDOWN
         )
 
     except Exception as exc:
@@ -369,4 +331,4 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         shutil.rmtree(tmp_dir, ignore_errors=True)
         sys.stdout.flush()
         logger.info("✨ Scratch environment fully restored to pristine state.")
-        
+            
