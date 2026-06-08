@@ -60,7 +60,7 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    data_type = context.args.upper()
+    data_type = context.args[0].upper()
     document = message.reply_to_message.document
     suffix = Path(document.file_name or "").suffix.lower()
 
@@ -145,7 +145,7 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 log.error("Structural mapping file array check failed: Missing native inside zip wrapper.")
                 raise ValueError("No valid .shp file found inside uploaded archive package.")
 
-            target_shp = shp_files
+            target_shp = shp_files[0]
             log.info(f"Targeting active shapefile geometry path resource: {target_shp.name}")
             master_gdf = gpd.read_file(target_shp)
         else:
