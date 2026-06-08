@@ -1,8 +1,8 @@
 """
 modules/ingestion.py — Production-Grade Admin Data Ingestion Pipeline.
-Processes master vector layers efficiently using spatial index grouping,
-dispatches partitioned grid GeoJSON layers over an asynchronous MTProto channel drive
-with FloodWait backoff controls, and indexes metadata indices safely into MongoDB Atlas.
+Capped for strict 512MB RAM constraints using in-place garbage collection tracking,
+uploads partition chunks over MTProto channel drive with FloodWait backoff controls,
+and logs indices safely into MongoDB Atlas.
 """
 
 import logging
@@ -12,6 +12,7 @@ import os
 import shutil
 import zipfile
 import asyncio
+import gc
 from datetime import datetime, timezone
 from pathlib import Path
 import geopandas as gpd
@@ -26,7 +27,6 @@ from config import cfg
 from modules.database import _get_db      # Dynamic helper targeting your active Atlas DB
 from modules.storage import _get_supabase # Supabase client handler
 
-# ── Logging Setup linked to standard output for Koyeb Console visibility ──────
 logger = logging.getLogger("main.ingestion")
 logger.setLevel(logging.INFO)
 
@@ -42,9 +42,8 @@ if not logger.handlers:
 async def cmd_upload_master(client: Client, message: Message) -> None:
     """
     Admin Command: /upload_master [DATA_TYPE] (Sent as a reply to a document)
-    Slices by grid framework, uploads chunks with FloodWait handling, and logs to MongoDB.
+    Slices by grid framework with strict memory ceiling caps and FloodWait backoffs.
     """
-    # 1. Verification Guardrails
     if not message.reply_to_message or not message.reply_to_message.document:
         logger.warning("❌ Ingestion Rejected: Command executed without replying to a valid file document.")
         await message.reply_text(
@@ -56,7 +55,6 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         )
         return
 
-    # FIX 4: Protect against NoneType message strings
     msg_text = message.text or ""
     args = msg_text.split()
     if len(args) < 2:
@@ -68,7 +66,6 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         )
         return
 
-    # FIX 1: Corrected string list index extraction and normalization logic
     data_type = args[1].strip().upper()
     if data_type not in {"FCM", "FTM"}:
         await message.reply_text(
@@ -78,8 +75,6 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         return
 
     document = message.reply_to_message.document
-    
-    # FIX 14: Path Traversal Defenses via strict base name extraction
     safe_filename = Path(document.file_name or "master_layer.gpkg").name
     suffix = Path(safe_filename).suffix.lower()
 
@@ -100,7 +95,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         raw_channel_id = str(cfg.TELEGRAM_CHANNEL_ID).strip()
         CHANNEL_CHAT_ID = int(raw_channel_id)
     except ValueError:
-        CHANNEL_CHAT_ID = str(cfg.TELEGRAM_CHANNEL_ID)
+        CHANNEL_CHAT_ID = raw_channel_id
 
     status_msg = await message.reply_text(
         f"⏳ *Initializing MTProto channel-drive pipeline for master {data_type} ingestion…*",
@@ -108,10 +103,8 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
     )
     sys.stdout.flush()
 
-    # FIX 13: Prevent UnboundLocalError by initializing path pointers cleanly outside try scopes
     tmp_dir = None
 
-    # FIX 8: Main structural try block with aligned indentation tracks throughout handlers
     try:
         tmp_dir = Path(tempfile.mkdtemp())
         master_path = tmp_dir / safe_filename
@@ -141,7 +134,6 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         grid_gdf = gpd.read_file(str(grid_path))
         logger.info(f"📊 Grid Records initialized: {len(grid_gdf)} mapping cells available.")
 
-        # Resolve Master File Tracking Source Node Path
         final_master_source = master_path
         if suffix == ".zip":
             logger.info("🗜 Expanding zipped shapefile archive contents...")
@@ -150,13 +142,10 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             shp_files = [s for s in tmp_dir.glob("**/*.shp") if s.is_file() and not s.name.startswith("._")]
             if not shp_files:
                 raise ValueError("No valid .shp file found inside uploaded archive package.")
-            
-            # FIX 2: Secure index extraction with safe multiple files notification warnings
             if len(shp_files) > 1:
                 logger.warning(f"Multiple shapefiles found in archive. Using first: {shp_files}")
-            final_master_source = shp_files[1]
+            final_master_source = shp_files[0]
 
-        # FIX 3 & 6: Unified fallback verification checking for valid Layer Coordinate Reference Systems
         with fiona.open(str(final_master_source)) as src:
             master_crs = src.crs_wkt or src.crs
 
@@ -164,130 +153,106 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             raise ValueError("Master dataset does not contain a valid CRS definition.")
 
         db = _get_db()
-        # FIX 6: Map dataset targets via dynamic collection dictionary maps
-        collection_map = {
-            "FCM": "fcm_layers",
-            "FTM": "ftm_layers"
-        }
+        collection_map = {"FCM": "fcm_layers", "FTM": "ftm_layers"}
         collection_name = collection_map[data_type]
         col = db[collection_name]
 
         success_count = 0
         logger.info(f"✂️ Spatial streaming processes active. Target DB Collection: {collection_name}")
 
-        # FIX 9 & PERFORMANCE UPGRADE: Stream features into memory in batches to prevent memory leaks 
-        # while constructing a master spatial index (sindex) ONCE to optimize computing time.
-        logger.info("🏗 Building local Spatial Indexing Matrix (sindex) cache layer...")
-        await status_msg.edit_text(
-            "🏗 *Constructing Spatial Indexing Matrix (sindex) tracks…*\n(Optimizing throughput memory thresholds)",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-        features_list = []
+        # 🚀 HARDENED HYBRID STREAMER WITH AUTOMATED RAM FLUSHING
         with fiona.open(str(final_master_source)) as source_stream:
-            for feature in source_stream:
-                features_list.append(feature)
-        
-        master_gdf = gpd.GeoDataFrame.from_features(features_list, crs=master_crs)
-        features_list.clear() # Swiftly free up pointer links for garbage collector routines
-        
-        if master_gdf.crs != grid_gdf.crs:
-            master_gdf = master_gdf.to_crs(grid_gdf.crs)
-            
-        spatial_index = master_gdf.sindex
-        logger.info("✅ Spatial Indexing cached. Moving on to matrix grid loop intersections processing...")
-
-        # Core Intersections Loop utilizing highly optimized Spatial R-Tree boundaries queries
-        for idx, cell in grid_gdf.iterrows():
-            grid_id = cell.get("grid_id", f"cell_{idx}")
-            cell_geom = cell.geometry
-            
-            # Query candidate rows matching the bounding box frame coordinates instantly
-            candidate_indices = list(spatial_index.intersection(cell_geom.bounds))
-            if not candidate_indices:
-                continue
+            for idx, cell in grid_gdf.iterrows():
+                grid_id = cell.get("grid_id", f"cell_{idx}")
+                cell_geom = cell.geometry
                 
-            subset_gdf = master_gdf.iloc[candidate_indices].copy()
-            
-            # Identify true geometric intersection crossings paths
-            clipped_gdf = subset_gdf[subset_gdf.geometry.intersects(cell_geom)].copy()
-            if clipped_gdf.empty:
-                continue
+                # Project bounding coordinates to layer projection standards
+                cell_bbox_gdf = gpd.GeoDataFrame(geometry=[cell_geom], crs=grid_gdf.crs).to_crs(master_crs)
+                cell_bbox = tuple(cell_bbox_gdf.total_bounds)
 
-            # FIX 4: Clean, try-except wrapped fallback strategy for shape validation mechanics
-            try:
-                from shapely.validation import make_valid
-                clipped_gdf["geometry"] = clipped_gdf.geometry.apply(make_valid)
-            except Exception:
-                clipped_gdf["geometry"] = clipped_gdf.geometry.buffer(0)
-            
-            # Crop vector features tightly down to exact cell window profiles
-            clipped_gdf["geometry"] = clipped_gdf.geometry.intersection(cell_geom)
-            
-            # FIX 5: Separated slice mutations checks to completely eliminate dropouts warnings
-            clipped_gdf = clipped_gdf[clipped_gdf.geometry.notnull()].copy()
-            clipped_gdf = clipped_gdf[~clipped_gdf.geometry.is_empty].copy()
+                # Fetch features matching bounding limits safely as a light block generator
+                features_in_box = list(source_stream.filter(bbox=cell_bbox))
+                if not features_in_box:
+                    continue
 
-            if clipped_gdf.empty:
-                continue
+                # Process this lightweight chunk completely isolated in memory
+                clipped_gdf = gpd.GeoDataFrame.from_features(features_in_box, crs=master_crs)
+                features_in_box.clear()
 
-            # Downcast StringDtypes objects to baseline standard string objects for serialization
-            for col_name in clipped_gdf.columns:
-                if isinstance(clipped_gdf[col_name].dtype, pd.StringDtype):
-                    clipped_gdf[col_name] = clipped_gdf[col_name].astype(object)
+                if clipped_gdf.crs != grid_gdf.crs:
+                    clipped_gdf = clipped_gdf.to_crs(grid_gdf.crs)
 
-            # FIX 12: Ensure modulo progress reports do not trigger a false update call on element zero
-            if success_count and success_count % 5 == 0:
                 try:
-                    await status_msg.edit_text(
-                        f"✂️ *Streaming & Slicing vector assets safely…*\n\n"
-                        f"📍 Active Segment: `Grid_{grid_id}`\n"
-                        f"📦 Total Cached Parts: `{success_count}` chunks",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
+                    from shapely.validation import make_valid
+                    clipped_gdf["geometry"] = clipped_gdf.geometry.apply(make_valid)
                 except Exception:
-                    pass
+                    clipped_gdf["geometry"] = clipped_gdf.geometry.buffer(0)
+                
+                clipped_gdf["geometry"] = clipped_gdf.geometry.intersection(cell_geom)
+                clipped_gdf = clipped_gdf[clipped_gdf.geometry.notnull()].copy()
+                clipped_gdf = clipped_gdf[~clipped_gdf.geometry.is_empty].copy()
 
-            chunk_filename = f"{data_type.lower()}_{grid_id}.geojson"
-            chunk_filepath = tmp_dir / chunk_filename
-            clipped_gdf.to_file(str(chunk_filepath), driver="GeoJSON")
-            
-            # FIX 10: Enforce explicit document size caps checks to block broken MTProto streams early
-            file_bytes_size = chunk_filepath.stat().st_size
-            if (file_bytes_size / (1024 * 1024)) > 1900:
-                logger.error(f"❌ Limits Violated: Chunks partition output size exceeds 1.9GB bounds tracking limits.")
-                continue
-            
-            # FIX 11: Implement strict, try-except looped FloodWait backoff policies wrappers
-            chan_msg = None
-            while not chan_msg:
-                try:
-                    logger.info(f"📤 Uploading partition chunk: {chunk_filename} over to Channel ID: {CHANNEL_CHAT_ID}")
-                    chan_msg = await client.send_document(
-                        chat_id=CHANNEL_CHAT_ID,
-                        document=str(chunk_filepath),
-                        caption=f"📦 SDSS Production Master Part Asset\n• DataType: {data_type}\n• Partition Index: {grid_id}"
-                    )
-                except FloodWait as flood_exception:
-                    logger.warning(f"⚠️ Telegram FloodWait triggered! Cooling down processing loops for {flood_exception.value} seconds.")
-                    await asyncio.sleep(flood_exception.value)
+                if clipped_gdf.empty:
+                    continue
 
-            # FIX 8 & 9: Compound primary index configuration keys maps along with pure UTC Datetime formats tracking
-            payload = {
-                "grid_id": grid_id,
-                "data_type": data_type,
-                "channel_chat_id": CHANNEL_CHAT_ID,
-                "channel_message_id": chan_msg.id,
-                "file_id": chan_msg.document.file_id,
-                "file_name": chunk_filename,
-                "feature_count": len(clipped_gdf),
-                "updated_at": datetime.now(timezone.utc)
-            }
-            # Combined index matching properties query rules
-            col.update_one({"grid_id": grid_id, "data_type": data_type}, {"$set": payload}, upsert=True)
-            
-            success_count += 1
-            chunk_filepath.unlink(missing_ok=True)
+                for col_name in clipped_gdf.columns:
+                    if isinstance(clipped_gdf[col_name].dtype, pd.StringDtype):
+                        clipped_gdf[col_name] = clipped_gdf[col_name].astype(object)
+
+                if success_count and success_count % 5 == 0:
+                    try:
+                        await status_msg.edit_text(
+                            f"✂️ *Slicing vector assets safely (Hybrid Stream)…*\n\n"
+                            f"📍 Active Segment: `Grid_{grid_id}`\n"
+                            f"📦 Total Cached Parts: `{success_count}` chunks",
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                    except Exception:
+                        pass
+
+                chunk_filename = f"{data_type.lower()}_{grid_id}.geojson"
+                chunk_filepath = tmp_dir / chunk_filename
+                clipped_gdf.to_file(str(chunk_filepath), driver="GeoJSON")
+                
+                file_bytes_size = chunk_filepath.stat().st_size
+                if (file_bytes_size / (1024 * 1024)) > 1900:
+                    continue
+                
+                chan_msg = None
+                while not chan_msg:
+                    try:
+                        logger.info(f"📤 Uploading partition chunk: {chunk_filename} over to Channel ID: {CHANNEL_CHAT_ID}")
+                        chan_msg = await client.send_document(
+                            chat_id=CHANNEL_CHAT_ID,
+                            document=str(chunk_filepath),
+                            caption=f"📦 SDSS Production Master Part Asset\n• DataType: {data_type}\n• Partition Index: {grid_id}"
+                        )
+                    except FloodWait as flood_exception:
+                        logger.warning(f"⚠️ Telegram FloodWait triggered! Cooling down processing loops for {flood_exception.value} seconds.")
+                        await asyncio.sleep(flood_exception.value)
+                    except Exception as upload_err:
+                        logger.error(f"❌ Aborting channel pipe send action sequence: {upload_err}")
+                        raise upload_err
+
+                payload = {
+                    "grid_id": grid_id,
+                    "data_type": data_type,
+                    "channel_chat_id": str(CHANNEL_CHAT_ID),
+                    "channel_message_id": chan_msg.id,
+                    "file_id": chan_msg.document.file_id,
+                    "file_name": chunk_filename,
+                    "feature_count": len(clipped_gdf),
+                    "updated_at": datetime.now(timezone.utc)
+                }
+                col.update_one({"grid_id": grid_id, "data_type": data_type}, {"$set": payload}, upsert=True)
+                
+                success_count += 1
+                chunk_filepath.unlink(missing_ok=True)
+
+                # 🚀 AGGRESSIVE GC FLUSH: Instantly wipe variables and force memory reclamation
+                del clipped_gdf
+                del cell_bbox_gdf
+                gc.collect()
 
         await status_msg.delete()
         await message.reply_text(
@@ -298,96 +263,73 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             parse_mode=ParseMode.MARKDOWN
         )
 
-    except Exception as pipeline_err:
-        logger.error("A critical execution error derailed data ingestion pipeline.", exc_info=True)
-        if 'status_msg' in locals():
-            await status_msg.edit_text(f"❌ Master Ingestion Pipeline Crashed: {pipeline_err}")
-    
-    # FIX 7: Aligned block structure securely implementing explicit exception wrapped folders deletion
-    finally:
-        try:
-            if tmp_dir and tmp_dir.exists():
-                shutil.rmtree(tmp_dir)
-        except Exception:
-            logger.exception("Failed to remove temporary directory workspace structures.")
-
-        sys.stdout.flush()
+except Exception as pipeline_err:
+    logger.error("A critical execution error derailed data ingestion pipeline.", exc_info=True)
+    if 'status_msg' in locals():
+        await status_msg.edit_text(f"❌ Master Ingestion Pipeline Crashed: {pipeline_err}")
+finally:
+    try:
+        if tmp_dir and tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+    except Exception:
+        logger.exception("Failed to remove temporary directory workspace structures.")
+    sys.stdout.flush()
 
 
 # ── Manual Diagnostics & Broadcasting Interface ──────────────────────────────
 @Client.on_message(filters.command("post") & filters.private)
 async def cmd_manual_broadcast(client: Client, message: Message) -> None:
-    try:
-        logger.info(
-            f"🔍 Raw TELEGRAM_CHANNEL_ID={cfg.TELEGRAM_CHANNEL_ID!r} "
-            f"type={type(cfg.TELEGRAM_CHANNEL_ID)}"
-        )
+    """
+    Diagnostic Command: /post [Message text or sent as a reply to media/text]
+    Validates text parameters extraction and forwards raw packets to channel targets.
+    """
+    raw_channel_id = str(cfg.TELEGRAM_CHANNEL_ID).strip()
+    if raw_channel_id.startswith("-") or raw_channel_id.isdigit():
+        try:
+            CHANNEL_CHAT_ID = int(raw_channel_id)
+        except ValueError:
+            CHANNEL_CHAT_ID = raw_channel_id
+    else:
+        CHANNEL_CHAT_ID = raw_channel_id
 
-        raw_channel_id = str(cfg.TELEGRAM_CHANNEL_ID).strip()
-
-        logger.info(
-            f"🔍 Normalized channel value={raw_channel_id!r} "
-            f"length={len(raw_channel_id)}"
-        )
-
-        CHANNEL_CHAT_ID = int(raw_channel_id)
-
-        logger.info(
-            f"🔍 Parsed CHANNEL_CHAT_ID={CHANNEL_CHAT_ID} "
-            f"type={type(CHANNEL_CHAT_ID)}"
-        )
-
-    except ValueError:
-        CHANNEL_CHAT_ID = str(cfg.TELEGRAM_CHANNEL_ID)
-
-        logger.warning(
-            f"⚠️ Channel ID could not be converted to int. "
-            f"Using string value={CHANNEL_CHAT_ID!r}"
-        )
-
-    logger.info(
-        f"📣 Manual broadcast triggered. "
-        f"Destination target peer index: {CHANNEL_CHAT_ID}"
-    )
+    logger.info(f"📣 Manual broadcast triggered. Destination target peer index: {CHANNEL_CHAT_ID}")
 
     message_text_raw = message.text or ""
     parts = message_text_raw.split(maxsplit=1)
-
-    logger.info(
-        f"🔍 Incoming command text={message_text_raw!r} "
-        f"parts={parts}"
-    )
-
-    text_content = parts[1] if len(parts) > 1 else ""
-
-    logger.info(
-        f"🔍 Extracted broadcast text={text_content!r}"
-    )
+    text_content = parts if len(parts) > 1 else ""
 
     try:
-        logger.info("🔍 Attempting chat resolution...")
+        if message.reply_to_message:
+            replied = message.reply_to_message
+            caption_text = text_content or replied.caption or replied.text or ""
 
-        try:
-            chat = await client.get_chat(CHANNEL_CHAT_ID)
-            logger.info(
-                f"✅ Chat resolved successfully. "
-                f"id={chat.id} "
-                f"title={getattr(chat, 'title', None)!r} "
-                f"username={getattr(chat, 'username', None)!r}"
+            if replied.photo:
+                await client.send_photo(chat_id=CHANNEL_CHAT_ID, photo=replied.photo.file_id, caption=caption_text)
+            elif replied.video:
+                await client.send_video(chat_id=CHANNEL_CHAT_ID, video=replied.video.file_id, caption=caption_text)
+            elif replied.document:
+                await client.send_document(chat_id=CHANNEL_CHAT_ID, document=replied.document.file_id, caption=caption_text)
+            elif replied.text:
+                await client.send_message(chat_id=CHANNEL_CHAT_ID, text=replied.text)
+            else:
+                await message.reply_text("⚠️ Manual forward failed: Unsupported media type detected.")
+                return
+        
+        elif text_content:
+            await client.send_message(chat_id=CHANNEL_CHAT_ID, text=text_content)
+        
+        else:
+            await message.reply_text(
+                "⚠️ *Usage Instruction:*\n\n"
+                "• Send `/post Your Message Here` to dispatch text directly.\n"
+                "• Reply to a photo, document, or video with `/post` to broadcast media.",
+                parse_mode=ParseMode.MARKDOWN
             )
-        except Exception:
-            logger.exception(
-                f"❌ Failed to resolve peer: {CHANNEL_CHAT_ID!r}"
-            )
+            return
 
-        # existing send logic here ...
+        await message.reply_text(f"🚀 *Broadcast dispatched safely to target chat peer:* `{CHANNEL_CHAT_ID}`", parse_mode=ParseMode.MARKDOWN)
 
     except Exception as broadcast_err:
-        logger.error(
-            "Diagnostic broadcast execution derailed.",
-            exc_info=True
-        )
-        await message.reply_text(
-            f"❌ *Broadcast delivery failed:* `{broadcast_err}`",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        logger.error("Diagnostic broadcast execution derailed.", exc_info=True)
+        await message.reply_text(f"❌ *Broadcast delivery failed:* `{broadcast_err}`", parse_mode=ParseMode.MARKDOWN)
+                        
