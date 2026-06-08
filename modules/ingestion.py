@@ -57,7 +57,8 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    data_type = context.args.upper()
+    #data_type = context.args.upper()
+    data_type = context.args[0].upper()
     document = message.reply_to_message.document
     suffix = Path(document.file_name or "").suffix.lower()
 
@@ -134,7 +135,7 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     "No valid .shp file found inside uploaded archive package."
                 )
 
-            target_shp = shp_files
+            target_shp = shp_files[0]
             log.info(f"Using extracted shapefile: {target_shp.name}")
             sys.stdout.flush()
 
