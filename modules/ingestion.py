@@ -33,7 +33,7 @@ if not logger.handlers:
     stdout_handler.setFormatter(formatter)
     logger.addHandler(stdout_handler)
 
-
+@Client.on_message(filters.command("upload_master") & filters.private)
 async def cmd_upload_master(client: Client, message: Message) -> None:
     """
     Admin Command: /upload_master [DATA_TYPE] (Sent as a reply to a document)
