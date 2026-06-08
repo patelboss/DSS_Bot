@@ -32,6 +32,7 @@ from modules.cmd import (
     handle_button_click, 
     handle_unknown
 )
+from modules.ingestion import cmd_upload_master
 
 # ── Logging Setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
