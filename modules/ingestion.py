@@ -30,43 +30,46 @@ if not log.handlers:
     stdout_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     log.addHandler(stdout_handler)
 
-
 async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Admin Command: /upload_master [DATA_TYPE]
-    Expects a document attachment (.geojson, .gpkg, or shapefile .zip).
-    Slices by grid, uploads files to a channel, and indexes them in MongoDB.
+    Admin Command: /upload_master [DATA_TYPE] (Sent as a REPLY to a spatial document)
+    Slices the replied-to file by grid, uploads to a channel, and indexes in MongoDB.
     """
     message = update.message
     
-    # 1. Simple Guardrails
-    if not message.document:
-        await message.reply_text("⚠️ Please run this command by attaching your master vector file.")
-        return
-
-    if not context.args:
+    # 1. 🚀 FIXED: Check if this command is a reply to an existing document file
+    if not message.reply_to_message or not message.reply_to_message.document:
         await message.reply_text(
-            "⚠️ Missing data type variable.\nUsage: `/upload_master FCM` or `/upload_master FTM`", 
+            "⚠️ *Usage Instruction:*\n\n"
+            "1. Upload your master vector file to the chat first.\n"
+            "2. Right-click or long-press that file and click **Reply**.\n"
+            "3. Type `/upload_master FCM` (or FTM) and send it!",
             parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    # 🚀 FIXED: Context args is a list, safely index the first argument string
+    if not context.args:
+        await message.reply_text(
+            "⚠️ Missing data type variable.\nUsage: Reply with `/upload_master FCM` or `/upload_master FTM`", 
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # Target the document from the replied message target framework
+    document = message.reply_to_message.document
     data_type = context.args.upper()
-    document = message.document
     suffix = Path(document.file_name or "").suffix.lower()
 
     if suffix not in {".geojson", ".gpkg", ".zip"}:
-        await message.reply_text("⚠️ Unsupported master format. Please upload a `.geojson`, `.gpkg`, or shapefile `.zip` archive.")
+        await message.reply_text("⚠️ Unsupported master format. Please ensure the target file is a `.geojson`, `.gpkg`, or shapefile `.zip` archive.")
         return
 
-    # 🎯 CONFIG: Set your target Channel ID and database configuration targets
-    # Make sure your bot is added as an Administrator to this channel!
-    CHANNEL_CHAT_ID = -100358841607  # 👈 Replace this with your private channel's actual Chat ID
+    # 🎯 CONFIG: Set your target Channel ID
+    CHANNEL_CHAT_ID = -100358841607  
     
     status_msg = await message.reply_text(f"⏳ *Initializing channel-drive pipeline for master {data_type} ingestion…*", parse_mode=ParseMode.MARKDOWN)
     sys.stdout.flush()
-
+    
     tmp_dir = Path(tempfile.mkdtemp())
     master_path = tmp_dir / document.file_name
     grid_path = tmp_dir / "state_fishnet_grid.gpkg"
