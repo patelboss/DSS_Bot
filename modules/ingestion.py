@@ -13,8 +13,9 @@ import shutil
 import zipfile
 from pathlib import Path
 import geopandas as gpd
+import pandas as pd
 
-from pyrogram import Client
+from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.enums import ParseMode
 
@@ -32,6 +33,7 @@ if not logger.handlers:
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     stdout_handler.setFormatter(formatter)
     logger.addHandler(stdout_handler)
+
 
 @Client.on_message(filters.command("upload_master") & filters.private)
 async def cmd_upload_master(client: Client, message: Message) -> None:
@@ -62,7 +64,8 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         )
         return
 
-    data_type = args[0].upper()
+    # FIXED: args is the command string itself, args contains your datatype string parameter
+    data_type = args[1].upper()
     document = message.reply_to_message.document
     suffix = Path(document.file_name or "").suffix.lower()
 
@@ -155,7 +158,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             # 🚀 FIXED: Extract index from your shapefile list match array
             target_shp = shp_files[0]
             logger.info(f"🎯 Target shapefile found: {target_shp.name}")
-            master_gdf = gpd.read_file(target_shp)
+            master_gdf = gpd.read_file(str(target_shp))
         else:
             master_gdf = gpd.read_file(str(master_path))
 
@@ -182,186 +185,94 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                     except Exception as err:
                         logger.warning(f"make_valid crashed ({err}). Defaulting to buffer(0) scaling fallback.")
                         gdf["geometry"] = gdf.geometry.buffer(0)
-
-                gdf = gdf[gdf.geometry.notnull() & ~gdf.geometry.is_empty].copy()
-                return gdf
-            except Exception as severe_err:
-                logger.error(f"❌ Severe crash in topology correction matrix for {name}: {severe_err}")
+            except Exception as outer_err:
+                logger.error(f"Error checking topologies inside {name}: {outer_err}")
                 gdf["geometry"] = gdf.geometry.buffer(0)
-                gdf = gdf[gdf.geometry.notnull() & ~gdf.geometry.is_empty].copy()
-                return gdf
+            
+            gdf = gdf[gdf.geometry.notnull() & ~gdf.geometry.is_empty].copy()
+            return gdf
 
-        master_gdf = repair_geometries(master_gdf, "Master Layer Data")
-        grid_gdf = repair_geometries(grid_gdf, "Fishnet Grid Framework")
-
-        # -------------------------------------------------------------
-        # Spatial join
-        # -------------------------------------------------------------
-        logger.info("🗺 Executing bulk spatial join overlays to discover intersecting nodes...")
-        try:
-            joined_gdf = gpd.sjoin(master_gdf, grid_gdf, predicate="intersects")
-        except Exception as exc:
-            logger.warning(f"Spatial join failed ({exc}). Retrying with absolute buffer zeros standardizing steps...")
-            master_gdf["geometry"] = master_gdf.geometry.buffer(0)
-            grid_gdf["geometry"] = grid_gdf.geometry.buffer(0)
-            joined_gdf = gpd.sjoin(master_gdf, grid_gdf, predicate="intersects")
-
-        if joined_gdf.empty:
-            raise ValueError("Zero overlapping vector elements matched the supplied framework layout.")
+        master_gdf = repair_geometries(master_gdf, "Master Dataset")
+        grid_gdf = repair_geometries(grid_gdf, "Grid Framework")
 
         # -------------------------------------------------------------
-        # Detect grid field
+        # Core Spatial Overlay & Data Chunk Dispersal Engine
         # -------------------------------------------------------------
-        grid_candidates = ["grid_id", "grid_num", "GRID_ID", "GRID_NUM", "GRID_N", "GRID_NO"]
-        grid_id_col = None
-
-        for col in grid_candidates:
-            if col in joined_gdf.columns:
-                grid_id_col = col
-                break
-
-        if not grid_id_col:
-            raise ValueError(f"Could not locate an indexing column handle. Keys: {list(joined_gdf.columns)}")
-
-        unique_grids = joined_gdf[grid_id_col].dropna().unique()
-        logger.info(f"✅ Mapping intersections linked across {len(unique_grids)} unique grid bounding environments.")
-
         db = _get_db()
-        collection = db["grid_catalog"]
+        collection_name = "fcm_layers" if data_type == "FCM" else "ftm_layers"
+        col = db[collection_name]
 
-        # -------------------------------------------------------------
-        # Slice, compress check, and upload
-        # -------------------------------------------------------------
-        counter = 0
+        success_count = 0
+        logger.info(f"✂️ Spatial intersecting processes active. Target DB Collection: {collection_name}")
+        
+        # Grid loop iteration index parsing 
+        for idx, cell in grid_gdf.iterrows():
+            grid_id = cell.get("grid_id", f"cell_{idx}")
+            cell_geom = cell.geometry
 
-        for grid_id in unique_grids:
-            logger.info(f"👉 Slicing spatial matrix subset for Grid Cell ID: {grid_id}")
-            raw_chunk = joined_gdf[joined_gdf[grid_id_col] == grid_id].copy()
-            grid_poly = grid_gdf[grid_gdf[grid_id_col] == grid_id].copy()
-
-            try:
-                chunk = gpd.clip(raw_chunk, grid_poly)
-            except Exception as exc:
-                logger.warning(f"Clip operation failed on Cell {grid_id}: {exc}. Triggering topological geometry correction.")
-                raw_chunk["geometry"] = raw_chunk.geometry.buffer(0)
-                grid_poly["geometry"] = grid_poly.geometry.buffer(0)
-                chunk = gpd.clip(raw_chunk, grid_poly)
-
-            if chunk.empty:
-                logger.info(f"Cell ID {grid_id} returned zero shapes post clipping operations. Skipping loop entry.")
+            # Spatial boundary filtering via spatial vector intersection indexing mechanisms
+            clipped_gdf = master_gdf[master_gdf.geometry.intersects(cell_geom)].copy()
+            if clipped_gdf.empty:
                 continue
 
-            gpkg_filename = f"{data_type}@Grid_{grid_id}.gpkg"
-            chunk_out_path = tmp_dir / gpkg_filename
+            # Clip the intersecting geometries to the precise dimensions of the grid frame bounds
+            clipped_gdf["geometry"] = clipped_gdf.geometry.intersection(cell_geom)
+            clipped_gdf = clipped_gdf[~clipped_gdf.geometry.is_empty]
 
-            # Write individual file chunk to local disk
-            chunk.to_file(str(chunk_out_path), driver="GPKG")
-            raw_filesize = os.path.getsize(chunk_out_path)
-            logger.info(f"  └─ File written: {gpkg_filename} | Size: {raw_filesize / (1024*1024):.2f} MB")
+            if clipped_gdf.empty:
+                continue
 
-            # Setup defaults for routing evaluation
-            storage_mode = "telegram_raw"
-            final_upload_path = chunk_out_path
-            final_filename = gpkg_filename
+            # 🚀 FIXED INDENTATION BLOCK: Everything inside the loop tracking context is safely aligned
+            await status_msg.edit_text(
+                f"✂️ Slicing vector assets into matrix fields…\n"
+                f"Processing: Grid {grid_id} ({success_count + 1} variants found)",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            # Export individual slice package arrays out to temporary workspace tracks
+            chunk_filename = f"{data_type.lower()}_{grid_id}.geojson"
+            chunk_filepath = tmp_dir / chunk_filename
+            clipped_gdf.to_file(str(chunk_filepath), driver="GeoJSON")
+            
+            # MTProto Drive Pipe Upload Action Sequence Interface Dispatch
+            logger.info(f"📤 Uploading partition chunk: {chunk_filename} over to Channel ID: {CHANNEL_CHAT_ID}")
+            chan_msg = await client.send_document(
+                chat_id=CHANNEL_CHAT_ID,
+                document=str(chunk_filepath),
+                caption=f"📦 SDSS Production Master Part Asset\n• DataType: {data_type}\n• Partition Index: {grid_id}"
+            )
+            
+            # Map generated parameters into clean tracking indexing maps inside MongoDB Atlas
+            payload = {
+                "grid_id": grid_id,
+                "data_type": data_type,
+                "file_id": chan_msg.document.file_id,
+                "file_name": chunk_filename,
+                "feature_count": len(clipped_gdf),
+                "updated_at": pd.Timestamp.now().isoformat()
+            }
+            col.update_one({"grid_id": grid_id}, {"$set": payload}, upsert=True)
+            
+            success_count += 1
+            if chunk_filepath.exists():
+                chunk_filepath.unlink()
 
-            # 🚀 MTProto allows up to 2GB uploads natively, but we still compress heavy files 
-            # above 48MB into high-efficiency ZIP archives to save bandwidth.
-            if raw_filesize > 48 * 1024 * 1024:
-                logger.warning(f"  └─ ⚠️ File exceeds stable threshold size. Compressing to high-efficiency ZIP archive...")
-                zip_filename = f"{data_type}@Grid_{grid_id}.zip"
-                zip_out_path = tmp_dir / zip_filename
-
-                with zipfile.ZipFile(zip_out_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                    zf.write(chunk_out_path, arcname=gpkg_filename)
-                
-                zipped_filesize = os.path.getsize(zip_out_path)
-                logger.info(f"  └─ ZIP Done. Compressed size: {zipped_filesize / (1024*1024):.2f} MB")
-
-                if zipped_filesize < 49 * 1024 * 1024:
-                    storage_mode = "telegram_zipped"
-                    final_upload_path = zip_out_path
-                    final_filename = zip_filename
-                    chunk_out_path.unlink(missing_ok=True)
-                else:
-                    # 🚀 FIXED: Fallback safety net to capture strings if zip still breaches limits
-                    logger.error("  └─ 🚨 CRITICAL: Compressed file sizes still break upload metrics. Routing to MongoDB Text-Chunking pipeline...")
-                    storage_mode = "mongodb_geojson_chunks"
-
-            # ── 🚀 Pyrogram Send Matrix: Uploads heavy files seamlessly up to 2GB ──
-            if storage_mode in ("telegram_raw", "telegram_zipped"):
-                logger.info(f"  └─ Shipping {final_filename} to Telegram Channel Storage Drive via MTProto client link...")
-                channel_msg = await client.send_document(
-                    chat_id=CHANNEL_CHAT_ID,
-                    document=str(final_upload_path),
-                    caption=(
-                        f"📦 Grid Reference Asset Layout: {final_filename}\n"
-                        f"Type: #{data_type} #Grid_{grid_id} Mode: #{storage_mode}"
-                    )
-                )
-                
-                logger.info(f"  └─ Channel link accepted transmission. Registered Message ID: {channel_msg.id}")
-                
-                # Write tracking details to catalog index
-                collection.update_one(
-                    {"_id": f"{data_type}@Grid_{grid_id}"},
-                    {
-                        "$set": {
-                            "grid_id": str(grid_id),
-                            "data_type": data_type,
-                            "storage_mode": storage_mode,
-                            "channel_chat_id": CHANNEL_CHAT_ID,
-                            "channel_message_id": channel_msg.id, 
-                            "file_name": final_filename,
-                        }
-                    },
-                    upsert=True
-                )
-                final_upload_path.unlink(missing_ok=True)
-
-            elif storage_mode == "mongodb_geojson_chunks":
-                logger.info("  └─ Serializing polygon structures directly into string layouts...")
-                geojson_str = chunk.to_json()
-                
-                chunk_packet_size = 12 * 1024 * 1024 
-                string_text_arrays = [geojson_str[i:i+chunk_packet_size] for i in range(0, len(geojson_str), chunk_packet_size)]
-                logger.info(f"  └─ Vector string split across {len(string_text_arrays)} collection arrays fragments layout blocks.")
-
-                collection.update_one(
-                    {"_id": f"{data_type}@Grid_{grid_id}"},
-                    {
-                        "$set": {
-                            "grid_id": str(grid_id),
-                            "data_type": data_type,
-                            "storage_mode": storage_mode,
-                            "geojson_chunks": string_text_arrays,
-                            "chunk_count": len(string_text_arrays)
-                        }
-                    },
-                    upsert=True
-                )
-                logger.info(f"  └─ MongoDB Atlas index finalized for Grid_{grid_id}.")
-                chunk_out_path.unlink(missing_ok=True)
-                if 'zip_out_path' in locals():
-                    zip_out_path.unlink(missing_ok=True)
-
-            counter += 1
-            logger.info(f"📈 [SUCCESS] Grid chunk processing index loop locked in -> Count: {counter}")
-
-        logger.info(f"🏆 Ingestion Loop Finalized. Total processed output slices: {counter}")
-        await status_msg.edit_text(
-            f"✅ *Ingestion Completed Successfully!*\n\n"
-            f"📊 *Dataset:* `Master {data_type}`\n"
-            f"📡 *Storage Backend:* `Pyrogram MTProto Channel Drive`\n"
-            f"📦 *Slices Processed & Cataloged:* `{counter}` Grid Chunks.",
+        # Finalize success notifications paths cleanly
+        await status_msg.delete()
+        await message.reply_text(
+            f"✅ *Master Ingestion Pipeline Completed Successfully!*\n\n"
+            f"🏷 *Data Type Index:* `{data_type}`\n"
+            f"🧩 *Total Structural Part Segments Formed:* `{success_count}` chunks\n"
+            f"🗂 *Target Registry Store:* MongoDB Cluster `[{collection_name}]`",
             parse_mode=ParseMode.MARKDOWN
         )
 
-    except Exception as exc:
-        logger.error("💥 CRITICAL PROCESSING CRASH ENCOUNTERED INSIDE PIPELINE LOOP EXECUTION:", exc_info=True)
-        await status_msg.edit_text(f"❌ *Master channel-upload pipeline crashed:* {exc}")
-    finally:
-        logger.info("🧹 Disposing local scratch files and reclaiming container disk spaces...")
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        sys.stdout.flush()
-        logger.info("✨ Scratch environment fully restored to pristine state.")
+except Exception as pipeline_err:
+    logger.error("A critical execution error derailed data ingestion pipeline.", exc_info=True)
+    if 'status_msg' in locals():
+        await status_msg.edit_text(f"❌ Master Ingestion Pipeline Crashed: {pipeline_err}")
+finally:
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    sys.stdout.flush()
 
