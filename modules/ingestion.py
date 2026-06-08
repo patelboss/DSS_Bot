@@ -30,19 +30,20 @@ if not log.handlers:
     stdout_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     log.addHandler(stdout_handler)
 
+
 async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Admin Command: /upload_master [DATA_TYPE] (Sent as a REPLY to a spatial document)
-    Slices the replied-to file by grid, uploads to a channel, and indexes in MongoDB.
+    Slices by grid, uploads files to a channel, and indexes them in MongoDB.
     """
     message = update.message
     
-    # 1. 🚀 FIXED: Check if this command is a reply to an existing document file
+    # 1. Check if this command is a reply to an existing document file
     if not message.reply_to_message or not message.reply_to_message.document:
         await message.reply_text(
             "⚠️ *Usage Instruction:*\n\n"
             "1. Upload your master vector file to the chat first.\n"
-            "2. Right-click or long-press that file and click **Reply**.\n"
+            "2. Long-press or click that file and select **Reply**.\n"
             "3. Type `/upload_master FCM` (or FTM) and send it!",
             parse_mode=ParseMode.MARKDOWN
         )
@@ -55,9 +56,9 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    # Target the document from the replied message target framework
-    document = message.reply_to_message.document
+    # 🚀 FIXED: Extract index from context.args list before running string functions!
     data_type = context.args.upper()
+    document = message.reply_to_message.document
     suffix = Path(document.file_name or "").suffix.lower()
 
     if suffix not in {".geojson", ".gpkg", ".zip"}:
@@ -65,11 +66,12 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     # 🎯 CONFIG: Set your target Channel ID
-    CHANNEL_CHAT_ID = -100358841607  
+    # Make sure your bot is added as an Administrator to this channel!
+    CHANNEL_CHAT_ID = -100358841607  # 👈 Replace this with your private channel's actual Chat ID
     
     status_msg = await message.reply_text(f"⏳ *Initializing channel-drive pipeline for master {data_type} ingestion…*", parse_mode=ParseMode.MARKDOWN)
     sys.stdout.flush()
-    
+
     tmp_dir = Path(tempfile.mkdtemp())
     master_path = tmp_dir / document.file_name
     grid_path = tmp_dir / "state_fishnet_grid.gpkg"
@@ -122,11 +124,10 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # 6. Loop chunks, slice clean boundaries, upload to channel, map to MongoDB
         counter = 0
         for grid_id in unique_grids:
-            # Isolate raw intersecting rows
             raw_chunk = joined_gdf[joined_gdf[grid_id_col] == grid_id]
             grid_poly = grid_gdf[grid_gdf[grid_id_col] == grid_id]
             
-            # 🚀 GIS OPTIMIZATION: Clip features exactly at the boundary lines to avoid border duplication
+            # Clip features exactly at the boundary lines to avoid border duplication
             chunk = gpd.clip(raw_chunk, grid_poly)
             if chunk.empty:
                 continue
@@ -155,7 +156,7 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                         "grid_id": int(grid_id) if isinstance(grid_id, (int, float)) else str(grid_id),
                         "data_type": data_type,
                         "channel_chat_id": CHANNEL_CHAT_ID,
-                        "channel_message_id": channel_msg.message_id, # Target for direct down-streaming
+                        "channel_message_id": channel_msg.message_id, 
                         "file_name": filename
                     }
                 },
