@@ -2,7 +2,7 @@
 modules/ingestion.py — Admin data ingestion pipeline.
 Slices massive master vector datasets using a Supabase grid framework,
 uploads the chunk files to a private Telegram channel drive (with ZIP fallback),
-and logs the permanent mapping indices cleanly into MongoDB Atlas.
+and falls back cleanly to MongoDB chunking for files exceeding limits.
 """
 
 import logging
@@ -22,14 +22,8 @@ from config import cfg
 from modules.database import _get_db      # Dynamic helper targeting your active Atlas DB
 from modules.storage import _get_supabase # Supabase client handler
 
-# ── Force Stream / Unbuffered Stdout Logging Setup for Koyeb Console ─────────
-log = logging.getLogger(__name__)
-log.setLevel(logging.INFO)
-
-if not log.handlers:
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    stdout_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-    log.addHandler(stdout_handler)
+# ── Link directly to the main root orchestrator logging pipeline ──────────────
+log = logging.getLogger("main.ingestion")
 
 
 async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -40,8 +34,9 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """
     message = update.message
 
+    # 1. Verification Guardrails with Explicit Logging Traces
     if not message.reply_to_message or not message.reply_to_message.document:
-        log.warning("Ingestion rejected: Command sent without replying to a valid document.")
+        log.warning("❌ Ingestion Rejected: Command was executed without replying to a valid file document.")
         await message.reply_text(
             "⚠️ *Usage Instruction:*\n\n"
             "1. Upload your master vector file.\n"
@@ -52,7 +47,7 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     if not context.args:
-        log.warning("Ingestion rejected: Missing DATA_TYPE parameter arg.")
+        log.warning("❌ Ingestion Rejected: Missing DATA_TYPE parameter argument.")
         await message.reply_text(
             "⚠️ Missing data type variable.\n"
             "Usage: Reply with `/upload_master FCM` or `/upload_master FTM`",
@@ -64,10 +59,13 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     document = message.reply_to_message.document
     suffix = Path(document.file_name or "").suffix.lower()
 
-    log.info(f"🚀 Starting ingestion sequence for Data Type: {data_type} | File: {document.file_name}")
+    log.info("==========================================================================")
+    log.info(f"🚀 INGESTION TRIGGERED | Type: {data_type} | Target Asset Name: {document.file_name}")
+    log.info(f"📦 Telegram Document File ID Pointer: {document.file_id}")
+    log.info("==========================================================================")
 
     if suffix not in {".geojson", ".gpkg", ".zip"}:
-        log.warning(f"Ingestion rejected: Unsupported file format extension '{suffix}'")
+        log.warning(f"❌ Ingestion Rejected: File extension '{suffix}' is unsupported.")
         await message.reply_text(
             "⚠️ Unsupported master format. "
             "Use `.geojson`, `.gpkg`, or shapefile `.zip`.",
@@ -90,7 +88,7 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # -------------------------------------------------------------
         # Download uploaded file
         # -------------------------------------------------------------
-        log.info("Downloading master layer from Telegram server to container scratch space...")
+        log.info(f"📥 Downloading raw file asset '{document.file_name}' into ephemeral path node...")
         await status_msg.edit_text(
             "📥 *Downloading master vector layer from Telegram updates…*",
             parse_mode=ParseMode.MARKDOWN,
@@ -98,12 +96,12 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         tg_file = await context.bot.get_file(document.file_id)
         await tg_file.download_to_drive(str(master_path))
-        log.info(f"Master layer successfully saved locally. Size: {os.path.getsize(master_path)} bytes.")
+        log.info(f"💾 Local download locked in. Path: {master_path} | Size: {os.path.getsize(master_path) / (1024*1024):.2f} MB")
 
         # -------------------------------------------------------------
         # Download grid from Supabase
         # -------------------------------------------------------------
-        log.info("Requesting 'state_grid.gpkg' frame layout matrix out of Supabase bucket storage...")
+        log.info(f"🛰 Fetching structural grid 'state_grid.gpkg' from Supabase Bucket: '{cfg.SUPABASE_BUCKET}'...")
         await status_msg.edit_text(
             "🛰 *Streaming Master Fishnet Grid framework from Supabase Storage…*",
             parse_mode=ParseMode.MARKDOWN,
@@ -117,12 +115,12 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 .download("state_grid.gpkg")
             )
             f.write(res)
-        log.info("Master fishnet coordinate matrix safely downloaded and buffered.")
+        log.info(f"📐 Framework grid downloaded. Path: {grid_path} | Size: {os.path.getsize(grid_path) / (1024*1024):.2f} MB")
 
         # -------------------------------------------------------------
         # Read datasets
         # -------------------------------------------------------------
-        log.info("Parsing vector layers into spatial dataframes inside memory matrix...")
+        log.info("🔬 Parsing layers into GeoPandas DataFrames spatial memory engines...")
         await status_msg.edit_text(
             "🔬 *Executing spatial intersection matrix split…*\n"
             "(This might take a minute)",
@@ -131,7 +129,7 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         sys.stdout.flush()
 
         if suffix == ".zip":
-            log.info("Decompressing uploaded zip shapefile cluster archive file structural layouts...")
+            log.info("🗜 Expanding zipped shapefile archive contents...")
             with zipfile.ZipFile(master_path, "r") as zip_ref:
                 zip_ref.extractall(tmp_dir)
 
@@ -142,23 +140,23 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             ]
 
             if not shp_files:
-                log.error("Structural mapping file array check failed: Missing native inside zip wrapper.")
+                log.error("❌ Extraction Error: Could not locate a valid .shp tracking node inside file package.")
                 raise ValueError("No valid .shp file found inside uploaded archive package.")
 
             target_shp = shp_files[0]
-            log.info(f"Targeting active shapefile geometry path resource: {target_shp.name}")
+            log.info(f"🎯 Target shapefile found: {target_shp.name}")
             master_gdf = gpd.read_file(target_shp)
         else:
             master_gdf = gpd.read_file(str(master_path))
 
         grid_gdf = gpd.read_file(str(grid_path))
-        log.info(f"Vectors parsed into memory. Master Layer records: {len(master_gdf)} rows | Grid Framework records: {len(grid_gdf)} cells.")
+        log.info(f"📊 Vector arrays initialized. Master Records: {len(master_gdf)} geometries | Grid Records: {len(grid_gdf)} cells.")
 
         # -------------------------------------------------------------
         # CRS harmonization
         # -------------------------------------------------------------
         if master_gdf.crs != grid_gdf.crs:
-            log.info(f"CRS mismatch detected. Aligning CRS projections: From '{master_gdf.crs}' to target '{grid_gdf.crs}'...")
+            log.info(f"🔄 Projections disparity. Projecting Master from '{master_gdf.crs}' to match Grid '{grid_gdf.crs}'...")
             master_gdf = master_gdf.to_crs(grid_gdf.crs)
 
         # -------------------------------------------------------------
@@ -168,17 +166,17 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             try:
                 invalid_count = (~gdf.is_valid).sum()
                 if invalid_count:
-                    log.warning(f"Repairing {invalid_count} structurally invalid geometries detected inside {name}.")
+                    log.warning(f"⚠️ Found {invalid_count} topology-broken shapes inside {name}. Deploying correction tools...")
                     try:
                         gdf["geometry"] = gdf.geometry.make_valid()
                     except Exception as err:
-                        log.warning(f"make_valid failed ({err}). Falling back onto buffer zero scaling.")
+                        log.warning(f"make_valid crashed ({err}). Defaulting to buffer(0) scaling fallback.")
                         gdf["geometry"] = gdf.geometry.buffer(0)
 
                 gdf = gdf[gdf.geometry.notnull() & ~gdf.geometry.is_empty].copy()
                 return gdf
             except Exception as severe_err:
-                log.error(f"Critical issue in structural repair routine for {name}: {severe_err}")
+                log.error(f"❌ Severe crash in topology correction matrix for {name}: {severe_err}")
                 gdf["geometry"] = gdf.geometry.buffer(0)
                 gdf = gdf[gdf.geometry.notnull() & ~gdf.geometry.is_empty].copy()
                 return gdf
@@ -186,25 +184,23 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         master_gdf = repair_geometries(master_gdf, "Master Layer Data")
         grid_gdf = repair_geometries(grid_gdf, "Fishnet Grid Framework")
 
-        if master_gdf.empty:
-            raise ValueError("Master dataset contains no valid geometries after cleanup procedures.")
-        if grid_gdf.empty:
-            raise ValueError("Grid dataset contains no valid geometries after cleanup procedures.")
+        if master_gdf.empty or grid_gdf.empty:
+            raise ValueError("Dataframes are empty post matrix cleanup execution.")
 
         # -------------------------------------------------------------
         # Spatial join
         # -------------------------------------------------------------
-        log.info("Calculating comprehensive spatial join mapping overlap indexing array rows...")
+        log.info("🗺 Executing bulk spatial join overlays to discover intersecting nodes...")
         try:
             joined_gdf = gpd.sjoin(master_gdf, grid_gdf, predicate="intersects")
         except Exception as exc:
-            log.warning(f"Native spatial join loop failed. Executing fallback buffer resolution routine: {exc}")
+            log.warning(f"Spatial join failed ({exc}). Retrying with absolute buffer zeros standardizing steps...")
             master_gdf["geometry"] = master_gdf.geometry.buffer(0)
             grid_gdf["geometry"] = grid_gdf.geometry.buffer(0)
             joined_gdf = gpd.sjoin(master_gdf, grid_gdf, predicate="intersects")
 
         if joined_gdf.empty:
-            raise ValueError("No matching features intersect the loaded grid coordinate framework array.")
+            raise ValueError("Zero overlapping vector elements matched the supplied framework layout.")
 
         # -------------------------------------------------------------
         # Detect grid field
@@ -218,10 +214,10 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 break
 
         if not grid_id_col:
-            raise ValueError(f"Could not locate a grid identifier column. Structure keys found: {list(joined_gdf.columns)}")
+            raise ValueError(f"Could not locate an indexing column handle. Keys: {list(joined_gdf.columns)}")
 
         unique_grids = joined_gdf[grid_id_col].dropna().unique()
-        log.info(f"Targeting intersection matrix split processing across {len(unique_grids)} active unique grid spaces.")
+        log.info(f"✅ Mapping intersections linked across {len(unique_grids)} unique grid bounding environments.")
 
         db = _get_db()
         collection = db["grid_catalog"]
@@ -232,38 +228,38 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         counter = 0
 
         for grid_id in unique_grids:
-            log.info(f"⏱ Slicing chunk boundaries for Grid cell target coordinate ID: {grid_id}")
+            log.info(f"👉 Slicing spatial matrix subset for Grid Cell ID: {grid_id}")
             raw_chunk = joined_gdf[joined_gdf[grid_id_col] == grid_id].copy()
             grid_poly = grid_gdf[grid_gdf[grid_id_col] == grid_id].copy()
 
             try:
                 chunk = gpd.clip(raw_chunk, grid_poly)
             except Exception as exc:
-                log.warning(f"Clip operation execution exception running against grid target {grid_id}: {exc}. Triggering self repair geometry pipeline.")
+                log.warning(f"Clip operation failed on Cell {grid_id}: {exc}. Triggering topological geometry correction.")
                 raw_chunk["geometry"] = raw_chunk.geometry.buffer(0)
                 grid_poly["geometry"] = grid_poly.geometry.buffer(0)
                 chunk = gpd.clip(raw_chunk, grid_poly)
 
             if chunk.empty:
-                log.info(f"Grid reference {grid_id} returned empty matrix parameters post clipping step. Skipping step.")
+                log.info(f"Cell ID {grid_id} returned zero shapes post clipping operations. Skipping loop entry.")
                 continue
 
             gpkg_filename = f"{data_type}@Grid_{grid_id}.gpkg"
             chunk_out_path = tmp_dir / gpkg_filename
 
-            # Save the raw GeoPackage file
+            # Write individual file chunk to local disk
             chunk.to_file(str(chunk_out_path), driver="GPKG")
             raw_filesize = os.path.getsize(chunk_out_path)
-            log.info(f"Chunk saved. Raw file: {gpkg_filename} | Size: {raw_filesize / (1024*1024):.2f} MB")
+            log.info(f"  └─ File written: {gpkg_filename} | Size: {raw_filesize / (1024*1024):.2f} MB")
 
-            # Initialize variables for storage mode tracking
+            # Setup defaults for routing evaluation
             storage_mode = "telegram_raw"
             final_upload_path = chunk_out_path
             final_filename = gpkg_filename
 
-            # 🚀 TELEGRAM 50MB BOUNDARY COMPRESSION ENGINE RULE ROUTINE
+            # 🚀 CHECK TELEGRAM 50MB FILE LIMIT BOUNDARY LAWS
             if raw_filesize > 48 * 1024 * 1024:
-                log.warning(f"⚠️ Raw file limits exceed stable bot metrics threshold. Running fallback ZIP compression pipeline...")
+                log.warning(f"  └─ ⚠️ File exceeds stable bot thresholds. Passing to ZIP compression engine...")
                 zip_filename = f"{data_type}@Grid_{grid_id}.zip"
                 zip_out_path = tmp_dir / zip_filename
 
@@ -271,21 +267,21 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     zf.write(chunk_out_path, arcname=gpkg_filename)
                 
                 zipped_filesize = os.path.getsize(zip_out_path)
-                log.info(f"ZIP compression complete. Compressed Size: {zipped_filesize / (1024*1024):.2f} MB")
+                log.info(f"  └─ ZIP Done. Size: {zipped_filesize / (1024*1024):.2f} MB")
 
                 if zipped_filesize < 49 * 1024 * 1024:
                     storage_mode = "telegram_zipped"
                     final_upload_path = zip_out_path
                     final_filename = zip_filename
-                    chunk_out_path.unlink(missing_ok=True) # Clear out uncompressed file
+                    chunk_out_path.unlink(missing_ok=True)
                 else:
-                    # 🚀 DATABASE STRING SPLIT FALLBACK (IF FILE IS HUGE SAVED EVEN POST COMPRESSION EXTRACTIONS)
-                    log.error("🚨 CRITICAL: Compressed file sizes still break the 50MB bot upload limit! Routing directly onto MongoDB String Text Collection pipeline...")
+                    # 🚀 ROUTE FALLBACK ROUTINE TO MONGODB CHUNKS IF FILE IS ABSOLUTELY HUGE
+                    log.error(f"  └─ 🚨 CRITICAL: Zipped size ({zipped_filesize / (1024*1024):.2f} MB) STILL breaks Telegram limits. Routing straight onto MongoDB String-Chunking matrix...")
                     storage_mode = "mongodb_geojson_chunks"
 
-            # ── Execute Upload Route Dependent on Sizing Matrix Results ──
+            # ── 🚀 FIXED CRASH: Strictly route execution paths based on storage mode ──
             if storage_mode in ("telegram_raw", "telegram_zipped"):
-                log.info(f"Shipping asset file handle via send_document endpoint streams onto channel: {CHANNEL_CHAT_ID}...")
+                log.info(f"  └─ Shipping {final_filename} to Telegram Storage Channel Drive...")
                 with open(final_upload_path, "rb") as fp:
                     channel_msg = await context.bot.send_document(
                         chat_id=CHANNEL_CHAT_ID,
@@ -296,9 +292,9 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                         ),
                     )
                 
-                log.info(f"Telegram channel link accepted transmission. Document catalog registered at Message ID: {channel_msg.message_id}")
+                log.info(f"  └─ Channel response accepted. Uploaded message sequence registered at ID: {channel_msg.message_id}")
                 
-                # Index parameters update inside Cluster
+                # Write tracking details to catalog
                 collection.update_one(
                     {"_id": f"{data_type}@Grid_{grid_id}"},
                     {
@@ -316,13 +312,13 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 final_upload_path.unlink(missing_ok=True)
 
             elif storage_mode == "mongodb_geojson_chunks":
-                log.info("Serializing localized polygon matrices objects directly down into string elements mapping arrays...")
+                log.info("  └─ Serializing polygon structures directly into string layouts...")
                 geojson_str = chunk.to_json()
                 
-                # Split string payload text into stable 12MB segments to clear MongoDB's 16MB document cap limits safely
+                # Split payload string text into clean 12MB block arrays to clear MongoDB 16MB document cap limits safely
                 chunk_packet_size = 12 * 1024 * 1024 
                 string_text_arrays = [geojson_str[i:i+chunk_packet_size] for i in range(0, len(geojson_str), chunk_packet_size)]
-                log.info(f"Vector text successfully diced across {len(string_text_arrays)} linked data packets array blocks.")
+                log.info(f"  └─ Vector string split across {len(string_text_arrays)} collection arrays fragments layout blocks.")
 
                 collection.update_one(
                     {"_id": f"{data_type}@Grid_{grid_id}"},
@@ -337,15 +333,15 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     },
                     upsert=True
                 )
-                log.info("Database matrix records writing locked in cleanly.")
+                log.info(f"  └─ MongoDB Atlas transactional document tracking index finalized for Grid_{grid_id}.")
                 chunk_out_path.unlink(missing_ok=True)
                 if 'zip_out_path' in locals():
                     zip_out_path.unlink(missing_ok=True)
 
             counter += 1
-            log.info(f"✅ Target block successfully processed: Row item reference index sequential counter -> [{counter}]")
+            log.info(f"📈 [SUCCESS] Grid chunk processing index loop locked in -> Count: {counter}")
 
-        log.info(f"Pipeline complete. All {counter} unique overlapping tiles successfully split and parsed.")
+        log.info(f"🏆 Ingestion Loop Finalized. Total processed output slices: {counter}")
         await status_msg.edit_text(
             f"✅ *Ingestion Completed Successfully!*\n\n"
             f"📊 *Dataset:* `Master {data_type}`\n"
@@ -355,11 +351,11 @@ async def cmd_upload_master(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
 
     except Exception as exc:
-        log.error("💥 CRITICAL PROCESSING CRASH ENCOUNTERED: Pipeline loop interrupted.", exc_info=True)
+        log.error("💥 CRITICAL PROCESSING CRASH ENCOUNTERED INSIDE PIPELINE LOOP EXECUTION:", exc_info=True)
         await status_msg.edit_text(f"❌ *Master channel-upload pipeline crashed:* {exc}")
     finally:
-        log.info("Cleaning ephemeral cache path records and clearing local node scratch spaces...")
+        log.info("🧹 Disposing local scratch files and reclaiming container disk spaces...")
         shutil.rmtree(tmp_dir, ignore_errors=True)
         sys.stdout.flush()
-        log.info("🧹 Ephemeral container scratch workspace fully restored to pristine state.")
+        log.info("✨ Scratch environment fully restored to pristine state.")
         
