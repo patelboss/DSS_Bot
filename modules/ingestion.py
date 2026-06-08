@@ -317,55 +317,77 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
 # ── Manual Diagnostics & Broadcasting Interface ──────────────────────────────
 @Client.on_message(filters.command("post") & filters.private)
 async def cmd_manual_broadcast(client: Client, message: Message) -> None:
-    """
-    Diagnostic Command: /post [Message text or sent as a reply to media/text]
-    Validates text parameters extraction and forwards raw packets to channel targets.
-    """
     try:
+        logger.info(
+            f"🔍 Raw TELEGRAM_CHANNEL_ID={cfg.TELEGRAM_CHANNEL_ID!r} "
+            f"type={type(cfg.TELEGRAM_CHANNEL_ID)}"
+        )
+
         raw_channel_id = str(cfg.TELEGRAM_CHANNEL_ID).strip()
+
+        logger.info(
+            f"🔍 Normalized channel value={raw_channel_id!r} "
+            f"length={len(raw_channel_id)}"
+        )
+
         CHANNEL_CHAT_ID = int(raw_channel_id)
+
+        logger.info(
+            f"🔍 Parsed CHANNEL_CHAT_ID={CHANNEL_CHAT_ID} "
+            f"type={type(CHANNEL_CHAT_ID)}"
+        )
+
     except ValueError:
         CHANNEL_CHAT_ID = str(cfg.TELEGRAM_CHANNEL_ID)
 
-    logger.info(f"📣 Manual broadcast triggered. Destination target peer index: {CHANNEL_CHAT_ID}")
+        logger.warning(
+            f"⚠️ Channel ID could not be converted to int. "
+            f"Using string value={CHANNEL_CHAT_ID!r}"
+        )
 
-    # FIX 3 & 4: Safe message strings splitting evaluation schemas protecting against NoneType outputs
+    logger.info(
+        f"📣 Manual broadcast triggered. "
+        f"Destination target peer index: {CHANNEL_CHAT_ID}"
+    )
+
     message_text_raw = message.text or ""
     parts = message_text_raw.split(maxsplit=1)
-    text_content = parts if len(parts) > 1 else ""
+
+    logger.info(
+        f"🔍 Incoming command text={message_text_raw!r} "
+        f"parts={parts}"
+    )
+
+    text_content = parts[1] if len(parts) > 1 else ""
+
+    logger.info(
+        f"🔍 Extracted broadcast text={text_content!r}"
+    )
 
     try:
-        if message.reply_to_message:
-            replied = message.reply_to_message
-            caption_text = text_content or replied.caption or replied.text or ""
+        logger.info("🔍 Attempting chat resolution...")
 
-            if replied.photo:
-                await client.send_photo(chat_id=CHANNEL_CHAT_ID, photo=replied.photo.file_id, caption=caption_text)
-            elif replied.video:
-                await client.send_video(chat_id=CHANNEL_CHAT_ID, video=replied.video.file_id, caption=caption_text)
-            elif replied.document:
-                await client.send_document(chat_id=CHANNEL_CHAT_ID, document=replied.document.file_id, caption=caption_text)
-            elif replied.text:
-                await client.send_message(chat_id=CHANNEL_CHAT_ID, text=replied.text)
-            else:
-                await message.reply_text("⚠️ Manual forward failed: Unsupported media type detected.")
-                return
-        
-        elif text_content:
-            await client.send_message(chat_id=CHANNEL_CHAT_ID, text=text_content)
-        
-        else:
-            await message.reply_text(
-                "⚠️ *Usage Instruction:*\n\n"
-                "• Send `/post Your Message Here` to dispatch text directly.\n"
-                "• Reply to a photo, document, or video with `/post` to broadcast media.",
-                parse_mode=ParseMode.MARKDOWN
+        try:
+            chat = await client.get_chat(CHANNEL_CHAT_ID)
+            logger.info(
+                f"✅ Chat resolved successfully. "
+                f"id={chat.id} "
+                f"title={getattr(chat, 'title', None)!r} "
+                f"username={getattr(chat, 'username', None)!r}"
             )
-            return
+        except Exception:
+            logger.exception(
+                f"❌ Failed to resolve peer: {CHANNEL_CHAT_ID!r}"
+            )
 
-        await message.reply_text(f"🚀 *Broadcast dispatched safely to target chat peer:* `{CHANNEL_CHAT_ID}`", parse_mode=ParseMode.MARKDOWN)
+        # existing send logic here ...
 
     except Exception as broadcast_err:
-        logger.error("Diagnostic broadcast execution derailed.", exc_info=True)
-        await message.reply_text(f"❌ *Broadcast delivery failed:* `{broadcast_err}`", parse_mode=ParseMode.MARKDOWN)
-            
+        logger.error(
+            "Diagnostic broadcast execution derailed.",
+            exc_info=True
+        )
+        await message.reply_text(
+            f"❌ *Broadcast delivery failed:* `{broadcast_err}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
