@@ -272,13 +272,13 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             f"🗂 *Target Registry Store:* MongoDB Cluster `[{collection_name}]`",
             parse_mode=ParseMode.MARKDOWN
         )
-
-except Exception as pipeline_err:
-    logger.error("A critical execution error derailed data ingestion pipeline.", exc_info=True)
-    if 'status_msg' in locals():
-        await status_msg.edit_text(f"❌ Master Ingestion Pipeline Crashed: {pipeline_err}")
-finally:
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
-    sys.stdout.flush()
+#    try
+    except Exception as pipeline_err:
+        logger.error("A critical execution error derailed data ingestion pipeline.", exc_info=True)
+        if 'status_msg' in locals():
+            await status_msg.edit_text(f"❌ Master Ingestion Pipeline Crashed: {pipeline_err}")
+    finally:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        sys.stdout.flush()
 
