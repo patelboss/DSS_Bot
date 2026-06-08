@@ -48,12 +48,10 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     """Logs runtime exceptions with tracebacks and reports updates cleanly."""
     log.error("💥 Critical Unhandled Exception caught by SDSS Hooks:", exc_info=context.error)
     
-    # Extract traceback text to inspect inside server logs
     tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
     tb_string = "".join(tb_list)
     log.error(f"Full traceback summary:\n{tb_string}")
 
-    # Notify user if the crash happened during an active conversation update hook
     if isinstance(update, Update) and update.effective_message:
         await update.effective_message.reply_text(
             "❌ *A critical pipeline extraction error occurred.*\n\n"
@@ -70,20 +68,26 @@ def run_koyeb_health_server():
     """
     class HealthHandler(SimpleHTTPRequestHandler):
         def do_GET(self):
-            if self.path == '/health':
+            # 🚀 FIXED: Respond with 200 OK for both root (/) and /health 
+            # This ensures Koyeb's default check keeps the container active!
+            if self.path in ('/', '/health'):
                 self.send_response(200)
                 self.send_header("Content-type", "text/plain")
                 self.end_headers()
-                self.wfile.write(b"OK")
+                self.wfile.write(b"SDSS Core Engine Active")
             else:
                 self.send_response(404)
                 self.end_headers()
+
+        # Suppress spammy log entries for health pings inside the Koyeb console
+        def log_message(self, format, *args):
+            return
 
     port = 8080
     try:
         TCPServer.allow_reuse_address = True
         with TCPServer(("", port), HealthHandler) as httpd:
-            log.info("🌍 Koyeb Background Health Server active on port %d", port)
+            log.info("🌍 Koyeb Background Health Server permanently active on port %d", port)
             httpd.serve_forever()
     except Exception as e:
         log.error("❌ Failed to start health server: %s", e)
@@ -102,8 +106,6 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("help",    cmd_help))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("status",  cmd_status))
-    
-    # 🚀 FIXED: Registered the master ingestion command router explicitly
     app.add_handler(CommandHandler("upload_master", cmd_upload_master))
 
     # Inline Keyboard Interaction Query Route
@@ -127,7 +129,7 @@ def main() -> None:
     app = build_application()
     app.run_polling(
         drop_pending_updates=True,
-        allowed_updates=["message", "callback_query"], # Capture inline keyboard clicks
+        allowed_updates=["message", "callback_query"],
     )
 
 
