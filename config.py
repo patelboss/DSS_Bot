@@ -12,9 +12,18 @@ load_dotenv()
 
 @dataclass(frozen=True)
 class Config:
-    # ── Telegram ──────────────────────────────────────────────────────────────
+    # ── Telegram MTProto & Bot Credentials ────────────────────────────────────
     TELEGRAM_TOKEN: str = field(
-        default_factory=lambda: _require("TELEGRAM_BOT_TOKEN")
+        default_factory=lambda: _require("BOT_TOKEN")
+    )
+    API_ID: int = field(
+        default_factory=lambda: int(_require("API_ID"))
+    )
+    API_HASH: str = field(
+        default_factory=lambda: _require("API_HASH")
+    )
+    TELEGRAM_CHANNEL_ID: int = field(
+        default_factory=lambda: int(os.getenv("CHANNEL_ID", "-1003588416077"))
     )
 
     # ── MongoDB Atlas ─────────────────────────────────────────────────────────
