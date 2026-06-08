@@ -4,36 +4,39 @@ Separated from main.py to maintain deployment health stability.
 """
 
 import io
-import csv
 import logging
 import sys
 import asyncio
 import pandas as pd
 from pathlib import Path
 
-from telegram import Update, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode, ChatAction
-from telegram.ext import ContextTypes
+from pyrogram import Client, filters
+from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.enums import ParseMode, ChatAction
 
 from config import cfg
 from modules.database import upsert_user, log_analysis, get_user_history
 from modules.spatial_analysis import load_vector_file, run_analysis
 from modules.map_renderer import render_map
 
-# ── Force Stream / Unbuffered Stdout Logging Setup for Koyeb Console ─────────
-log = logging.getLogger(__name__)
-log.setLevel(logging.INFO)
+# ── Link directly to the main root orchestrator logging pipeline ──────────────
+logger = logging.getLogger("main.commands")
+logger.setLevel(logging.INFO)
 
-if not log.handlers:
+if not logger.handlers:
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-    log.addHandler(stdout_handler)
+    logger.addHandler(stdout_handler)
+
+# 🚀 SESSION RUNTIME CACHE: Replaces python-telegram-bot's context.user_data
+USER_SESSION_CACHE = {}
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    upsert_user(user.id, user.username, user.full_name)
+@Client.on_message(filters.command("start") & filters.private)
+async def cmd_start(client: Client, message: Message) -> None:
+    user = message.from_user
+    upsert_user(user.id, user.username, f"{user.first_name} {user.last_name or ''}".strip())
 
     text = (
         f"🌿 *Welcome to the SDSS Bot, {user.first_name}!*\n\n"
@@ -49,12 +52,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/status — Check system health\n\n"
         "_Upload your file to begin_ 👆"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     sys.stdout.flush()
 
 
 # ── /help ─────────────────────────────────────────────────────────────────────
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+@Client.on_message(filters.command("help") & filters.private)
+async def cmd_help(client: Client, message: Message) -> None:
     text = (
         "📖 *SDSS Bot — Usage Guide*\n\n"
         "*Supported Formats:*\n"
@@ -63,7 +67,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• GeoPackage `.gpkg` — QGIS multi-layer vectors\n"
         "• Shapefile Package `.zip` — Archive containing .shp, .shx, .dbf, .prj\n\n"
         "*Requirements:*\n"
-        "• File size must be under 20 MB\n"
         "• Geometry must be a Polygon or MultiPolygon\n"
         "• Any coordinate reference system is accepted (auto-converted)\n\n"
         "*Output Report options:*\n"
@@ -73,15 +76,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Export polygons from QGIS/ArcGIS as GeoJSON for best results\n"
         "• Ensure the polygon falls within the study area extent"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     sys.stdout.flush()
 
 
 # ── Vector File Document Catch Mechanism ──────────────────────────────────────
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.message
+@Client.on_message(filters.document & filters.private)
+async def handle_document(client: Client, message: Message) -> None:
     document = message.document
-    user = update.effective_user
+    user = message.from_user
 
     suffix = Path(document.file_name or "").suffix.lower()
     if suffix not in {".geojson", ".json", ".kml", ".gpkg", ".kmz", ".zip"}:
@@ -94,24 +97,28 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     status_msg = await message.reply_text("📥 *Processing vector layout properties…*", parse_mode=ParseMode.MARKDOWN)
     sys.stdout.flush()
     
-    tmp_path = Path(cfg.TEMP_DIR) / f"{user.id}_{document.file_name}"
+    tmp_path = Path(tempfile.gettempdir() if hasattr(cfg, 'TEMP_DIR') == False else cfg.TEMP_DIR) / f"{user.id}_{document.file_name}"
+    tmp_path.parent.mkdir(parents=True, exist_ok=True)
     
     try:
-        tg_file = await context.bot.get_file(document.file_id)
-        await tg_file.download_to_drive(str(tmp_path))
+        # Pyrogram native streaming download interface hook
+        await client.download_media(message, file_name=str(tmp_path))
 
         geojson_feature, gdf_attributes = load_vector_file(tmp_path)
 
-        context.user_data["current_feature"] = geojson_feature
-        context.user_data["filename"] = document.file_name
-        
         attr_df = gdf_attributes.drop(columns=["geometry"], errors="ignore")
-        context.user_data["cached_df_dict"] = attr_df.to_dict(orient="records")
+        
+        # 🚀 Buffer parsing metrics straight down into global module cache runtime lookup
+        USER_SESSION_CACHE[user.id] = {
+            "current_feature": geojson_feature,
+            "filename": document.file_name,
+            "cached_df_dict": attr_df.to_dict(orient="records")
+        }
 
-        keyboard = [
+        keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📋 View Attributes Table", callback_data="action_attributes")],
             [InlineKeyboardButton("🔬 Run Spatial DSS Analysis", callback_data="action_analysis")]
-        ]
+        ])
         
         await status_msg.delete()
         await message.reply_text(
@@ -120,12 +127,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"📦 *Total Features:* `{len(gdf_attributes)}` Polygons/Parts\n\n"
             f"Select processing task:",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=keyboard
         )
     except Exception as exc:
-        log.error("Failed to parse or ingest uploaded vector document.", exc_info=True)
+        logger.error("Failed to parse or ingest uploaded vector document.", exc_info=True)
         if status_msg:
-            await status_msg.edit_text(f"❌ *Vector ingestion failed:* {exc}")
+            await status_msg.edit_text(f"❌ *Vector ingestion failed:* {exc}", parse_mode=ParseMode.MARKDOWN)
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
@@ -133,24 +140,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ── Interactive Callback Menu Router ──────────────────────────────────────────
-async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
+@Client.on_callback_query()
+async def handle_button_click(client: Client, callback_query: CallbackQuery) -> None:
+    await callback_query.answer()
 
-    action = query.data
-    user = update.effective_user  
-    geojson_feature = context.user_data.get("current_feature")
-    cached_records = context.user_data.get("cached_df_dict")
-    filename = context.user_data.get("filename", "layer")
+    action = callback_query.data
+    user = callback_query.from_user  
+    
+    # Extract structural pointers out of global tracking map lookup securely
+    user_session = USER_SESSION_CACHE.get(user.id, {})
+    geojson_feature = user_session.get("current_feature")
+    cached_records = user_session.get("cached_df_dict")
+    filename = user_session.get("filename", "layer")
 
     if not geojson_feature or cached_records is None:
-        await query.edit_message_text("❌ Session expired. Please upload your vector file again.")
+        await callback_query.edit_message_text("❌ Session expired. Please upload your vector file again.")
         return
 
     base_name = Path(filename).stem
 
     if action == "action_attributes":
-        await query.message.reply_chat_action(ChatAction.UPLOAD_DOCUMENT)
+        await client.send_chat_action(chat_id=user.id, action=ChatAction.UPLOAD_DOCUMENT)
         df = pd.DataFrame(cached_records)
         
         text_preview = f"📊 *Attributes Table Preview for `{filename}`*\n"
@@ -174,17 +184,22 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         csv_bytes = csv_buffer.getvalue().encode('utf-8')
         csv_buffer.close()
 
-        await query.message.reply_text(text_preview, parse_mode=ParseMode.MARKDOWN)
-        await query.message.reply_document(
-            document=InputFile(io.BytesIO(csv_bytes), filename=f"{base_name}_attributes.csv"),
+        # Target response straight back to current message framework structures
+        await callback_query.message.reply_text(text_preview, parse_mode=ParseMode.MARKDOWN)
+        
+        # Stream raw byte packets directly back to Telegram without InputFile wrapper
+        bio = io.BytesIO(csv_bytes)
+        bio.name = f"{base_name}_attributes.csv"
+        await callback_query.message.reply_document(
+            document=bio,
             caption=f"📂 *Complete Attribute Table Spreadsheet* (`fid` index mapped).",
             parse_mode=ParseMode.MARKDOWN
         )
-        await query.delete_message()
+        await callback_query.message.delete()
         sys.stdout.flush()
 
     elif action == "action_analysis":
-        status_msg = await query.edit_message_text(
+        status_msg = await callback_query.edit_message_text(
             "🔬 *Running full spatial intersection algorithms…*\n"
             "_(Streaming raster tiles from cloud matrices)_",
             parse_mode=ParseMode.MARKDOWN
@@ -199,24 +214,30 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
             summary = _build_summary(results, filename)
             
             await status_msg.delete()
-            await query.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN)
-            await query.message.reply_photo(photo=InputFile(map_png, filename="sdss_report.png"), caption="📊 *SDSS Cartographic Report*")
+            await callback_query.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN)
+            
+            # Pack photo binary payload data structures cleanly
+            photo_bio = io.BytesIO(map_png)
+            photo_bio.name = "sdss_report.png"
+            await callback_query.message.reply_photo(photo=photo_bio, caption="📊 *SDSS Cartographic Report*")
         except Exception as err:
-            log.error("Analysis thread pipeline execution failed: %s", err, exc_info=True)
+            logger.error("Analysis thread pipeline execution failed: %s", err, exc_info=True)
             if status_msg:
-                await status_msg.edit_text(f"❌ *Analysis processing failed:* {err}")
+                await status_msg.edit_text(f"❌ *Analysis processing failed:* {err}", parse_mode=ParseMode.MARKDOWN)
         finally:
             sys.stdout.flush()
 
 
 # ── /history ──────────────────────────────────────────────────────────────────
-async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
+@Client.on_message(filters.command("history") & filters.private)
+async def cmd_history(client: Client, message: Message) -> None:
+    user = message.from_user
     logs = get_user_history(user.id, limit=5)
 
     if not logs:
-        await update.message.reply_text(
-            "📭 No analysis history found. Upload a file to get started!"
+        await message.reply_text(
+            "📭 No analysis history found. Upload a file to get started!",
+            parse_mode=ParseMode.MARKDOWN
         )
         return
 
@@ -233,13 +254,14 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"⛰ {r.get('dem', {}).get('elevation_mean_m', '—')} m\n"
         )
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     sys.stdout.flush()
 
 
 # ── /status ───────────────────────────────────────────────────────────────────
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_chat_action(ChatAction.TYPING)
+@Client.on_message(filters.command("status") & filters.private)
+async def cmd_status(client: Client, message: Message) -> None:
+    await client.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
     checks = {}
 
     try:
@@ -260,13 +282,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     for service, status in checks.items():
         lines.append(f"*{service}:* {status}")
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     sys.stdout.flush()
 
 
 # ── Unknown Message Fallbacks ─────────────────────────────────────────────────
-async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
+@Client.on_message(filters.text & filters.private & ~filters.command)
+async def handle_unknown(client: Client, message: Message) -> None:
+    await message.reply_text(
         "📂 Please upload a spatial vector file (`.geojson`, `.kml`, `.gpkg`, `.kmz`, or shapefile `.zip`) "
         "to start analysis, or use /help for instructions.",
         parse_mode=ParseMode.MARKDOWN,
@@ -299,4 +322,4 @@ def _build_summary(results: dict, filename: str) -> str:
         f"  • Mean: `{dem.get('slope_mean_deg', '—')}°`\n"
         f"  • Max: `{dem.get('slope_max_deg', '—')}°`\n"
     )
-  
+
