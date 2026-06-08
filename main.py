@@ -102,6 +102,9 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("help",    cmd_help))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("status",  cmd_status))
+    
+    # 🚀 FIXED: Registered the master ingestion command router explicitly
+    app.add_handler(CommandHandler("upload_master", cmd_upload_master))
 
     # Inline Keyboard Interaction Query Route
     app.add_handler(CallbackQueryHandler(handle_button_click))
