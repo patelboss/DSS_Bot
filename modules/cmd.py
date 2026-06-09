@@ -21,7 +21,9 @@ from pyrogram.enums import ParseMode, ChatAction
 
 from config import cfg
 from modules.database import _get_db, upsert_user, log_analysis  # Using uniform db helper
-from modules.spatial_analysis import load_vector_file, run_analysis
+#from modules.spatial_analysis import load_vector_file, run_analysis
+from modules.spatial_analysis import load_vector_file  # ✅ Clean, single import
+
 from modules.map_renderer import render_map
 
 logger = logging.getLogger("main.commands")
