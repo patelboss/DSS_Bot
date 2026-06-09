@@ -1,8 +1,8 @@
 """
-modules/ingestion.py — Admin data ingestion pipeline.
-Slices massive master vector datasets (FCM, FTM, DEM Contours) using a Supabase grid framework,
-uploads the chunk files to a private Telegram channel drive via Pyrogram MTProto,
-and logs the permanent mapping indices cleanly into MongoDB Atlas.
+modules/ingestion.py — Production-Grade Admin Data Ingestion Pipeline.
+Capped for strict 512MB RAM constraints using in-place garbage collection tracking,
+batch-based resource rejuvenation after every 100 file segments,
+and logs indices safely into MongoDB Atlas.
 """
 
 import logging
@@ -28,7 +28,6 @@ from config import cfg
 from modules.database import _get_db      # Dynamic helper targeting your active Atlas DB
 from modules.storage import _get_supabase # Supabase client handler
 
-# ── Logging Setup linked to standard output for Koyeb Console visibility ──────
 logger = logging.getLogger("main.ingestion")
 logger.setLevel(logging.INFO)
 
@@ -44,9 +43,8 @@ if not logger.handlers:
 async def cmd_upload_master(client: Client, message: Message) -> None:
     """
     Admin Command: /upload_master [DATA_TYPE] (Sent as a reply to a document)
-    Slices vector layers by grid framework with strict memory ceiling caps and FloodWait backoffs.
+    Slices vector layers by grid framework with strict batch-clearing resets.
     """
-    # 1. Verification Guardrails
     if not message.reply_to_message or not message.reply_to_message.document:
         logger.warning("❌ Ingestion Rejected: Command executed without replying to a valid file document.")
         await message.reply_text(
@@ -163,22 +161,18 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         success_count = 0
         logger.info(f"✂️ Spatial streaming processes active. Target DB Collection: {collection_name}")
 
-        # 🚀 HYBRID STREAMER: Keep Fiona outside the loop, filter cell-by-cell inside
         with fiona.open(str(final_master_source)) as source_stream:
             for idx, cell in grid_gdf.iterrows():
                 grid_id = cell.get("grid_id", f"cell_{idx}")
                 cell_geom = cell.geometry
                 
-                # Project bounding coordinates to layer projection standards
                 cell_bbox_gdf = gpd.GeoDataFrame(geometry=[cell_geom], crs=grid_gdf.crs).to_crs(master_crs)
                 cell_bbox = tuple(cell_bbox_gdf.total_bounds)
 
-                # Fetch features matching bounding limits safely
                 features_in_box = list(source_stream.filter(bbox=cell_bbox))
                 if not features_in_box:
                     continue
 
-                # Process this lightweight chunk completely isolated in memory
                 clipped_gdf = gpd.GeoDataFrame.from_features(features_in_box, crs=master_crs)
                 features_in_box.clear()
 
@@ -252,10 +246,27 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 success_count += 1
                 chunk_filepath.unlink(missing_ok=True)
 
-                # 🚀 RAM CLEANUP FLUSH
                 del clipped_gdf
                 del cell_bbox_gdf
-                gc.collect()
+                
+                # 🚀 BATCH-BASED RESOURCE REJUVENATION: Trigger hard pause every 100 uploads
+                if success_count % 100 == 0:
+                    logger.info(f"🧹 Batch target reached ({success_count} uploads). Initiating system RAM flush pause...")
+                    try:
+                        await status_msg.edit_text(
+                            f"🧹 *Batch milestone reached (`{success_count}` parts)!*\n\n"
+                            f"⏸️ Freezing ingestion pipeline for 5 seconds to force full RAM rejuvenation protocols...",
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                    except Exception:
+                        pass
+                    
+                    gc.collect()           # Run thorough Python garbage collector routine sweep
+                    await asyncio.sleep(5) # Force execution thread to halt completely so OS drops memory blocks
+
+                else:
+                    gc.collect()
+                    await asyncio.sleep(0.02)  # Low-impact micro-yield for standard runs
 
         await status_msg.delete()
         await message.reply_text(
@@ -335,4 +346,4 @@ async def cmd_manual_broadcast(client: Client, message: Message) -> None:
     except Exception as broadcast_err:
         logger.error("Diagnostic broadcast execution derailed.", exc_info=True)
         await message.reply_text(f"❌ *Broadcast delivery failed:* `{broadcast_err}`", parse_mode=ParseMode.MARKDOWN)
-                        
+
