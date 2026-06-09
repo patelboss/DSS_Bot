@@ -1,8 +1,8 @@
 """
-modules/ingestion.py — Production-Grade Admin Data Ingestion Pipeline.
-Capped for strict 512MB RAM constraints using in-place garbage collection tracking,
-uploads partition chunks over MTProto channel drive with FloodWait backoff controls,
-and logs indices safely into MongoDB Atlas.
+modules/ingestion.py — Admin data ingestion pipeline.
+Slices massive master vector datasets (FCM, FTM, DEM Contours) using a Supabase grid framework,
+uploads the chunk files to a private Telegram channel drive via Pyrogram MTProto,
+and logs the permanent mapping indices cleanly into MongoDB Atlas.
 """
 
 import logging
@@ -18,6 +18,7 @@ from pathlib import Path
 import geopandas as gpd
 import pandas as pd
 import fiona
+
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.enums import ParseMode
@@ -27,6 +28,7 @@ from config import cfg
 from modules.database import _get_db      # Dynamic helper targeting your active Atlas DB
 from modules.storage import _get_supabase # Supabase client handler
 
+# ── Logging Setup linked to standard output for Koyeb Console visibility ──────
 logger = logging.getLogger("main.ingestion")
 logger.setLevel(logging.INFO)
 
@@ -42,15 +44,16 @@ if not logger.handlers:
 async def cmd_upload_master(client: Client, message: Message) -> None:
     """
     Admin Command: /upload_master [DATA_TYPE] (Sent as a reply to a document)
-    Slices by grid framework with strict memory ceiling caps and FloodWait backoffs.
+    Slices vector layers by grid framework with strict memory ceiling caps and FloodWait backoffs.
     """
+    # 1. Verification Guardrails
     if not message.reply_to_message or not message.reply_to_message.document:
         logger.warning("❌ Ingestion Rejected: Command executed without replying to a valid file document.")
         await message.reply_text(
             "⚠️ *Usage Instruction:*\n\n"
             "1. Upload your master vector file.\n"
             "2. Reply to that file.\n"
-            "3. Send `/upload_master FCM` (or FTM).",
+            "3. Send `/upload_master FCM` (or FTM, DEM).",
             parse_mode=ParseMode.MARKDOWN
         )
         return
@@ -61,15 +64,15 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         logger.warning("❌ Ingestion Rejected: Missing DATA_TYPE parameter argument.")
         await message.reply_text(
             "⚠️ Missing data type variable.\n"
-            "Usage: Reply with `/upload_master FCM` or `/upload_master FTM`",
+            "Usage: Reply with `/upload_master FCM`, `FTM`, or `DEM`",
             parse_mode=ParseMode.MARKDOWN
         )
         return
 
     data_type = args[1].strip().upper()
-    if data_type not in {"FCM", "FTM"}:
+    if data_type not in {"FCM", "FTM", "DEM"}:
         await message.reply_text(
-            "⚠️ Invalid DATA_TYPE.\nUsage: `/upload_master FCM` or `/upload_master FTM`",
+            "⚠️ Invalid DATA_TYPE.\nUsage: `/upload_master FCM`, `FTM`, or `DEM`",
             parse_mode=ParseMode.MARKDOWN
         )
         return
@@ -113,7 +116,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         # Download Master Vector Dataset
         logger.info(f"📥 Downloading raw file asset '{safe_filename}' via Pyrogram client...")
         await status_msg.edit_text(
-            "📥 *Downloading master vector layer from Telegram updates…*",
+            f"📥 *Downloading master {data_type} vector layer from Telegram updates…*",
             parse_mode=ParseMode.MARKDOWN
         )
         await client.download_media(message.reply_to_message, file_name=str(master_path))
@@ -153,14 +156,14 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             raise ValueError("Master dataset does not contain a valid CRS definition.")
 
         db = _get_db()
-        collection_map = {"FCM": "fcm_layers", "FTM": "ftm_layers"}
+        collection_map = {"FCM": "fcm_layers", "FTM": "ftm_layers", "DEM": "dem_layers"}
         collection_name = collection_map[data_type]
         col = db[collection_name]
 
         success_count = 0
         logger.info(f"✂️ Spatial streaming processes active. Target DB Collection: {collection_name}")
 
-        # 🚀 HARDENED HYBRID STREAMER WITH AUTOMATED RAM FLUSHING
+        # 🚀 HYBRID STREAMER: Keep Fiona outside the loop, filter cell-by-cell inside
         with fiona.open(str(final_master_source)) as source_stream:
             for idx, cell in grid_gdf.iterrows():
                 grid_id = cell.get("grid_id", f"cell_{idx}")
@@ -170,7 +173,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 cell_bbox_gdf = gpd.GeoDataFrame(geometry=[cell_geom], crs=grid_gdf.crs).to_crs(master_crs)
                 cell_bbox = tuple(cell_bbox_gdf.total_bounds)
 
-                # Fetch features matching bounding limits safely as a light block generator
+                # Fetch features matching bounding limits safely
                 features_in_box = list(source_stream.filter(bbox=cell_bbox))
                 if not features_in_box:
                     continue
@@ -202,7 +205,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 if success_count and success_count % 5 == 0:
                     try:
                         await status_msg.edit_text(
-                            f"✂️ *Slicing vector assets safely (Hybrid Stream)…*\n\n"
+                            f"✂️ *Slicing {data_type} vector assets safely…*\n\n"
                             f"📍 Active Segment: `Grid_{grid_id}`\n"
                             f"📦 Total Cached Parts: `{success_count}` chunks",
                             parse_mode=ParseMode.MARKDOWN
@@ -249,7 +252,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 success_count += 1
                 chunk_filepath.unlink(missing_ok=True)
 
-                # 🚀 AGGRESSIVE GC FLUSH: Instantly wipe variables and force memory reclamation
+                # 🚀 RAM CLEANUP FLUSH
                 del clipped_gdf
                 del cell_bbox_gdf
                 gc.collect()
@@ -263,17 +266,17 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             parse_mode=ParseMode.MARKDOWN
         )
 
-    except Exception as pipeline_err:
-        logger.error("A critical execution error derailed data ingestion pipeline.", exc_info=True)
-        if 'status_msg' in locals():
-            await status_msg.edit_text(f"❌ Master Ingestion Pipeline Crashed: {pipeline_err}")
-    finally:
-        try:
-            if tmp_dir and tmp_dir.exists():
-                shutil.rmtree(tmp_dir)
-        except Exception:
-            logger.exception("Failed to remove temporary directory workspace structures.")
-        sys.stdout.flush()
+except Exception as pipeline_err:
+    logger.error("A critical execution error derailed data ingestion pipeline.", exc_info=True)
+    if 'status_msg' in locals():
+        await status_msg.edit_text(f"❌ Master Ingestion Pipeline Crashed: {pipeline_err}")
+finally:
+    try:
+        if tmp_dir and tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+    except Exception:
+        logger.exception("Failed to remove temporary directory workspace structures.")
+    sys.stdout.flush()
 
 
 # ── Manual Diagnostics & Broadcasting Interface ──────────────────────────────
@@ -332,3 +335,4 @@ async def cmd_manual_broadcast(client: Client, message: Message) -> None:
     except Exception as broadcast_err:
         logger.error("Diagnostic broadcast execution derailed.", exc_info=True)
         await message.reply_text(f"❌ *Broadcast delivery failed:* `{broadcast_err}`", parse_mode=ParseMode.MARKDOWN)
+                        
