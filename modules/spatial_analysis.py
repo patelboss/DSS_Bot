@@ -21,7 +21,7 @@ from config import cfg
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
-if not logger.handlers:
+if not log.handlers:
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     log.addHandler(stdout_handler)
