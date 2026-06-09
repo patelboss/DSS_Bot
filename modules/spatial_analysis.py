@@ -1,13 +1,7 @@
 """
-modules/spatial_analysis.py — Core geospatial computation pipeline.
-
-Runs three analyses in parallel over the user's polygon / multi-polygon structure:
-  1. Forest Cover Map  (FCM) — canopy class breakdown
-  2. Digital Elevation Model (DEM) — elevation + slope statistics
-  3. Area calculation — accurate geodesic area in hectares
-
-Everything is structured to work within the 512 MB Koyeb free-tier RAM
-budget by using windowed / masked array operations, never loading full rasters.
+modules/spatial_analysis.py — Foundational Vector Ingestion Engine.
+Unpacks, decompresses, repairs, and sanitizes incoming user spatial files 
+(.geojson, .kml, .kmz, .gpkg, or shapefile .zip archives) under tight RAM limits.
 """
 
 import logging
@@ -15,158 +9,28 @@ import sys
 import zipfile
 import tempfile
 import shutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 import geopandas as gpd
-import numpy as np
-from pyproj import Transformer
 from shapely.geometry import shape, mapping
-from shapely.ops import transform as shapely_transform
 
-from config import cfg, FCM_CLASSES
-from modules.storage import extract_masked_array
+from config import cfg
 
 # ── Force Stream / Unbuffered Stdout Logging Setup for Koyeb Console ─────────
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
-if not log.handlers:
+if not logger.handlers:
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     log.addHandler(stdout_handler)
 
 
-# ── Public entry point ────────────────────────────────────────────────────────
-
-def run_analysis(geojson_feature: Any) -> dict[str, Any]:
-    """
-    Accepts a GeoJSON Feature (Polygon or MultiPolygon) and returns 
-    a unified results dictionary with all computed spatial metrics.
-    """
-    log.info("Starting spatial analysis pipeline …")
-    sys.stdout.flush()
-
-    # 🚀 FIXED: Safely unpack the first element if an array list is received
-    if isinstance(geojson_feature, list):
-        log.warning("Pipeline received a list instead of a dict. Unpacking first feature entry automatically.")
-        if len(geojson_feature) > 0:
-            geojson_feature = geojson_feature
-        else:
-            raise ValueError("The provided geojson feature collection list is empty.")
-
-    if "geometry" not in geojson_feature and "type" in geojson_feature:
-        geojson_feature = {
-            "type": "Feature",
-            "properties": {},
-            "geometry": geojson_feature
-        }
-
-    results: dict[str, Any] = {}
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        future_fcm = pool.submit(_analyse_forest_cover, geojson_feature)
-        future_dem = pool.submit(_analyse_elevation,    geojson_feature)
-
-        for future in as_completed([future_fcm, future_dem]):
-            try:
-                key, value = future.result()
-                results[key] = value
-            except Exception as exc:
-                log.error("Analysis sub-task failed: %s", exc, exc_info=True)
-                sys.stdout.flush()
-                raise
-
-    results["area_ha"] = _calculate_area_ha(geojson_feature)
-    results["centroid"] = _get_centroid(geojson_feature)
-
-    log.info("Analysis complete → area=%.2f ha", results["area_ha"])
-    sys.stdout.flush()
-    return results
-
-
-# ── Sub-analysis functions ────────────────────────────────────────────────────
-
-def _analyse_forest_cover(geojson_feature: dict) -> tuple[str, dict]:
-    """Returns pixel-count breakdown of FSI Forest Cover classes as percentages."""
-    masked, _ = extract_masked_array(cfg.COG_FCM, geojson_feature, band=1, nodata=255)
-
-    total_valid = masked.count()
-    if total_valid == 0:
-        return "fcm", {"error": "No valid pixels in extent", "classes": {}}
-
-    class_stats: dict[str, dict] = {}
-    flat = masked.compressed()
-
-    for class_val, class_name in FCM_CLASSES.items():
-        count = int(np.sum(flat == class_val))
-        pct   = round((count / total_valid) * 100, 2) if total_valid > 0 else 0.0
-        if count > 0:
-            class_stats[class_name] = {
-                "pixel_count":   count,
-                "percentage":    pct,
-                "class_id":      class_val,
-            }
-
-    forest_classes = {k: v for k, v in class_stats.items() if "Water" not in k}
-    dominant = max(forest_classes, key=lambda k: forest_classes[k]["pixel_count"]) \
-               if forest_classes else "Non-Forest"
-
-    return "fcm", {
-        "classes":  class_stats,
-        "dominant": dominant,
-        "total_valid_pixels": total_valid,
-    }
-
-
-def _analyse_elevation(geojson_feature: dict) -> tuple[str, dict]:
-    """Computes min / max / mean elevation and mean slope inside boundaries."""
-    masked, meta = extract_masked_array(cfg.COG_DEM, geojson_feature, band=1, nodata=-9999)
-
-    if masked.count() == 0:
-        return "dem", {"error": "No valid pixels in extent"}
-
-    valid = masked.compressed().astype(np.float32)
-    res_x = abs(meta["transform"].a)
-    res_y = abs(meta["transform"].e)
-
-    data_2d = masked.filled(np.nan).astype(np.float32)
-    dy, dx = np.gradient(data_2d, res_y, res_x)
-    slope_rad = np.arctan(np.sqrt(dx**2 + dy**2))
-    slope_deg = np.degrees(slope_rad)
-    
-    slope_valid = slope_deg[~masked.mask] if masked.mask is not np.ma.nomask else slope_deg.ravel()
-
-    return "dem", {
-        "elevation_min_m":  round(float(valid.min()),  1),
-        "elevation_max_m":  round(float(valid.max()),  1),
-        "elevation_mean_m": round(float(valid.mean()), 1),
-        "slope_mean_deg":   round(float(slope_valid.mean()), 1) if len(slope_valid) else 0.0,
-        "slope_max_deg":    round(float(slope_valid.max()),  1) if len(slope_valid) else 0.0,
-    }
-
-
-def _calculate_area_ha(geojson_feature: dict) -> float:
-    """Accurate geodesic area calculation in hectares using UTM zone mapping."""
-    geom_wgs84 = shape(geojson_feature["geometry"])
-    transformer = Transformer.from_crs(cfg.TARGET_CRS, cfg.AREA_CRS, always_xy=True)
-    geom_utm = shapely_transform(transformer.transform, geom_wgs84)
-    return round(geom_utm.area / 10000, 4)
-
-
-def _get_centroid(geojson_feature: dict) -> tuple[float, float]:
-    """Returns (longitude, latitude) of the overall geometric center."""
-    geom = shape(geojson_feature["geometry"])
-    c = geom.centroid
-    return (round(c.x, 6), round(c.y, 6))
-
-
-# ── File Ingestion Helpers (Handles Unpacking Archives) ──────────────────────
-
 def load_vector_file(file_path: str | Path) -> tuple[dict, gpd.GeoDataFrame]:
     """
-    Reads any supported vector format (.geojson, .kml, .gpkg, .kmz, or shapefile .zip).
+    Reads and extracts any supported vector format archive.
+    Returns a unified geometry dictionary footprint and a cleaned GeoDataFrame tracking layer.
     """
     import fiona
     fiona.drvsupport.supported_drivers['KML'] = 'r'
@@ -211,7 +75,6 @@ def load_vector_file(file_path: str | Path) -> tuple[dict, gpd.GeoDataFrame]:
                     "Invalid Shapefile ZIP: Could not find any valid, underlying .shp file data inside the archive."
                 )
             
-            # 🚀 FIXED: Extract index correctly to pull path string instead of raw list collection
             target_shp = shp_files[0]
             log.info(f"Targeting extracted shapefile: {target_shp.name}")
             sys.stdout.flush()
@@ -232,6 +95,7 @@ def load_vector_file(file_path: str | Path) -> tuple[dict, gpd.GeoDataFrame]:
 
     gdf = gpd.read_file(str(path), **kwargs)
     return _process_and_sanitize_gdf(gdf)
+
 
 def _process_and_sanitize_gdf(gdf: gpd.GeoDataFrame) -> tuple[dict, gpd.GeoDataFrame]:
     """Cleans up attribute structures, repairs geometries, handles CRS, and extracts geometry summaries."""
@@ -259,61 +123,35 @@ def _process_and_sanitize_gdf(gdf: gpd.GeoDataFrame) -> tuple[dict, gpd.GeoDataF
         if col in gdf.columns:
             gdf = gdf.drop(columns=[col], errors="ignore")
 
-    # ------------------------------------------------------------------
-    # CRS handling
-    # ------------------------------------------------------------------
-
+    # CRS Normalization Alignment
     if gdf.crs is None:
         gdf = gdf.set_crs(cfg.TARGET_CRS)
     elif gdf.crs.to_string() != cfg.TARGET_CRS:
         gdf = gdf.to_crs(cfg.TARGET_CRS)
 
-    # ------------------------------------------------------------------
-    # Geometry repair
-    # ------------------------------------------------------------------
-
+    # Geometry validation and automatic repair sweeps
     invalid_count = (~gdf.is_valid).sum()
-
     if invalid_count:
-        log.warning(
-            f"Detected {invalid_count} invalid geometries. "
-            "Attempting automatic repair."
-        )
+        log.warning(f"Detected {invalid_count} invalid geometries. Attempting automatic repair.")
         sys.stdout.flush()
-
         try:
             gdf["geometry"] = gdf.geometry.make_valid()
         except Exception:
-            # Fallback for older shapely/geopandas versions
             gdf["geometry"] = gdf.geometry.buffer(0)
 
-    # Remove null / empty geometries
-    gdf = gdf[
-        gdf.geometry.notnull() &
-        ~gdf.geometry.is_empty
-    ].copy()
+    # Clean out tracking noise features elements rows
+    gdf = gdf[gdf.geometry.notnull() & ~gdf.geometry.is_empty].copy()
 
     if gdf.empty:
-        raise ValueError(
-            "All geometries became invalid after repair."
-        )
+        raise ValueError("All geometries became invalid after repair.")
 
-    # ------------------------------------------------------------------
-    # Merge all polygons safely
-    # ------------------------------------------------------------------
-
+    # Compress layout elements into unified unary footprints bounds profiles
     try:
         combined_geometry = gdf.geometry.unary_union
-
     except Exception as exc:
-        log.warning(
-            f"Unary union failed ({exc}). "
-            "Applying secondary repair."
-        )
+        log.warning(f"Unary union failed ({exc}). Applying secondary buffer validation repair pass.")
         sys.stdout.flush()
-
         gdf["geometry"] = gdf.geometry.buffer(0)
-
         combined_geometry = gdf.geometry.unary_union
 
     geojson_feature = {
@@ -324,9 +162,8 @@ def _process_and_sanitize_gdf(gdf: gpd.GeoDataFrame) -> tuple[dict, gpd.GeoDataF
         "geometry": mapping(combined_geometry)
     }
 
-    log.info(
-        f"Successfully processed {len(gdf)} discrete spatial layout features."
-    )
+    log.info(f"Successfully processed {len(gdf)} discrete spatial layout features.")
     sys.stdout.flush()
 
     return geojson_feature, gdf
+
