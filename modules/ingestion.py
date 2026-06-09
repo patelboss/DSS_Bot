@@ -266,17 +266,17 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             parse_mode=ParseMode.MARKDOWN
         )
 
-except Exception as pipeline_err:
-    logger.error("A critical execution error derailed data ingestion pipeline.", exc_info=True)
-    if 'status_msg' in locals():
-        await status_msg.edit_text(f"❌ Master Ingestion Pipeline Crashed: {pipeline_err}")
-finally:
-    try:
-        if tmp_dir and tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
-    except Exception:
-        logger.exception("Failed to remove temporary directory workspace structures.")
-    sys.stdout.flush()
+    except Exception as pipeline_err:
+        logger.error("A critical execution error derailed data ingestion pipeline.", exc_info=True)
+        if 'status_msg' in locals():
+            await status_msg.edit_text(f"❌ Master Ingestion Pipeline Crashed: {pipeline_err}")
+    finally:
+        try:
+            if tmp_dir and tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
+        except Exception:
+            logger.exception("Failed to remove temporary directory workspace structures.")
+        sys.stdout.flush()
 
 
 # ── Manual Diagnostics & Broadcasting Interface ──────────────────────────────
