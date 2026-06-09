@@ -34,7 +34,7 @@ class Bot(Client):
             api_id=cfg.API_ID,
             api_hash=cfg.API_HASH,
             bot_token=cfg.TELEGRAM_TOKEN,
-            workers=50,
+            workers=5,
             plugins={"root": "modules"}, # 🚀 AUTOMATION: Auto-registers all files in modules/
             sleep_threshold=10,
         )
