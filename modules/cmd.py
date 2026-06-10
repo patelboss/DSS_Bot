@@ -14,7 +14,7 @@ import pandas as pd
 import geopandas as gpd
 from pathlib import Path
 from datetime import datetime
-
+import shutil 
 from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.enums import ParseMode, ChatAction
@@ -212,6 +212,9 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
             if not user_gdf.crs:
                 user_gdf.set_crs("EPSG:4326", inplace=True)
 
+            # ✅ Robust Multi-Polygon Compaction Mask (Safe fallback across GeoPandas versions)
+            user_geom = user_gdf.unary_union
+
             # 2. Extract spatial mesh grid framework files from Supabase Storage
             await status_msg.edit_text("🛰 *Aligning layout against Spatial Mesh Framework Grid…*")
             from modules.storage import _get_supabase
@@ -224,8 +227,8 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
             if grid_gdf.crs != user_gdf.crs:
                 grid_gdf = grid_gdf.to_crs(user_gdf.crs)
 
-            # 3. Intersect user polygon against grid indices to locate target parts cells
-            intersecting_cells = grid_gdf[grid_gdf.geometry.intersects(user_gdf.geometry.iloc)]
+            # 3. ✅ FIXED: Intersect user unified polygon footprint against framework grid safely
+            intersecting_cells = grid_gdf[grid_gdf.geometry.intersects(user_geom)]
             target_grid_ids = intersecting_cells["grid_id"].dropna().unique().tolist()
 
             del grid_gdf
@@ -250,7 +253,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                     fcm_local = tmp_workspace / f"fcm_{grid_id}.geojson"
                     await client.download_media(fcm_doc["file_id"], file_name=str(fcm_local))
                     part_gdf = gpd.read_file(str(fcm_local))
-                    clip_part = part_gdf[part_gdf.geometry.intersects(user_gdf.geometry.iloc)].copy()
+                    clip_part = part_gdf[part_gdf.geometry.intersects(user_geom)].copy()
                     if not clip_part.empty:
                         fcm_intersected_gdfs.append(clip_part)
                     fcm_local.unlink(missing_ok=True)
@@ -261,7 +264,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                     ftm_local = tmp_workspace / f"ftm_{grid_id}.geojson"
                     await client.download_media(ftm_doc["file_id"], file_name=str(ftm_local))
                     part_gdf = gpd.read_file(str(ftm_local))
-                    clip_part = part_gdf[part_gdf.geometry.intersects(user_gdf.geometry.iloc)].copy()
+                    clip_part = part_gdf[part_gdf.geometry.intersects(user_geom)].copy()
                     if not clip_part.empty:
                         ftm_intersected_gdfs.append(clip_part)
                     ftm_local.unlink(missing_ok=True)
@@ -272,7 +275,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                     dem_local = tmp_workspace / f"dem_{grid_id}.geojson"
                     await client.download_media(dem_doc["file_id"], file_name=str(dem_local))
                     part_gdf = gpd.read_file(str(dem_local))
-                    clip_part = part_gdf[part_gdf.geometry.intersects(user_gdf.geometry.iloc)].copy()
+                    clip_part = part_gdf[part_gdf.geometry.intersects(user_geom)].copy()
                     if not clip_part.empty:
                         dem_intersected_gdfs.append(clip_part)
                     dem_local.unlink(missing_ok=True)
@@ -286,8 +289,8 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
             # Dynamic Eval Profile A: FCM Canopy Canopy Analysis Mapping
             if fcm_intersected_gdfs:
                 fcm_compiled = pd.concat(fcm_intersected_gdfs, ignore_index=True)
-                # Apply tight shape mask intersection constraints
-                fcm_compiled["geometry"] = fcm_compiled.geometry.intersection(user_gdf.geometry.iloc)
+                # ✅ FIXED: Apply tight shape mask intersection constraints using unified geometric node
+                fcm_compiled["geometry"] = fcm_compiled.geometry.intersection(user_geom)
                 fcm_compiled = fcm_compiled[~fcm_compiled.geometry.is_empty].copy()
                 
                 # Dynamic area calculations re-projected natively to regional meters (UTM Zone 44N)
@@ -304,7 +307,8 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
             # Dynamic Eval Profile B: FTM Boundaries Tracking Mapping
             if ftm_intersected_gdfs:
                 ftm_compiled = pd.concat(ftm_intersected_gdfs, ignore_index=True)
-                ftm_compiled["geometry"] = ftm_compiled.geometry.intersection(user_gdf.geometry.iloc)
+                # ✅ FIXED: Geometric masking
+                ftm_compiled["geometry"] = ftm_compiled.geometry.intersection(user_geom)
                 ftm_compiled = ftm_compiled[~ftm_compiled.geometry.is_empty].copy()
                 
                 ftm_utm = ftm_compiled.to_crs(epsg=32644)
