@@ -229,7 +229,8 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
 
             # 3. ✅ FIXED: Intersect user unified polygon footprint against framework grid safely
             intersecting_cells = grid_gdf[grid_gdf.geometry.intersects(user_geom)]
-            target_grid_ids = intersecting_cells["grid_id"].dropna().unique().tolist()
+            target_grid_ids = (intersecting_cells["TopoSheet_No"].astype(str).dropna().unique().tolist())
+            #target_grid_ids = intersecting_cells["grid_id"].dropna().unique().tolist()
 
             del grid_gdf
             gc.collect()
