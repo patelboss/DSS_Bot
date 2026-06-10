@@ -1,8 +1,7 @@
 """
 modules/ingestion.py — Production-Grade Admin Data Ingestion Pipeline.
-Capped for strict 512MB RAM constraints using in-place garbage collection tracking,
-batch-based resource rejuvenation after every 100 file segments,
-and logs indices safely into MongoDB Atlas.
+Capped for strict 512MB RAM constraints using pre-projected spatial arrays,
+libc malloc_trim memory reclamation, and compressed GeoPackage batching.
 """
 
 import logging
@@ -13,6 +12,7 @@ import shutil
 import zipfile
 import asyncio
 import gc
+import ctypes
 from datetime import datetime, timezone
 from pathlib import Path
 import geopandas as gpd
@@ -27,7 +27,20 @@ from pyrogram.errors import FloodWait
 from config import cfg
 from modules.database import _get_db      # Dynamic helper targeting your active Atlas DB
 from modules.storage import _get_supabase # Supabase client handler
+import resource
 
+def mem_mb() -> float:
+    """
+    Current process RSS memory in MB.
+    Works on Linux containers.
+    """
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+
+
+def log_mem(stage: str) -> None:
+    logger.info(
+        f"🧠 MEMORY [{stage}] RSS={mem_mb():.1f} MB"
+    )
 logger = logging.getLogger("main.ingestion")
 logger.setLevel(logging.INFO)
 
@@ -37,6 +50,22 @@ if not logger.handlers:
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     stdout_handler.setFormatter(formatter)
     logger.addHandler(stdout_handler)
+
+
+# ── OPTIMIZATION 1: Native Memory Trim Handler ────────────────────────────────
+def release_memory() -> None:
+    """Forces Python garbage collection and clears glibc memory arenas."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+        
+    after = mem_mb()
+
+    logger.info(
+        f"🧹 MEMORY RECLAIM | before={before:.1f} MB | after={after:.1f} MB"
+    )
 
 
 @Client.on_message(filters.command("upload_master") & filters.private)
@@ -118,6 +147,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             parse_mode=ParseMode.MARKDOWN
         )
         await client.download_media(message.reply_to_message, file_name=str(master_path))
+        log_mem("MASTER FILE DOWNLOADED")
         logger.info(f"💾 Local download locked in. Path: {master_path} | Size: {os.path.getsize(master_path) / (1024*1024):.2f} MB")
 
         # Download Framework Grid
@@ -132,7 +162,10 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             f.write(res)
         logger.info(f"📐 Framework grid downloaded. Path: {grid_path} | Size: {os.path.getsize(grid_path) / (1024*1024):.2f} MB")
 
+        # ── OPTIMIZATION 2: Load Only Required Grid Columns ──────────────────
         grid_gdf = gpd.read_file(str(grid_path))
+        required_cols = ["TopoSheet_No", "geometry"]
+        grid_gdf = grid_gdf[required_cols].copy()
         logger.info(f"📊 Grid Records initialized: {len(grid_gdf)} mapping cells available.")
 
         final_master_source = master_path
@@ -145,13 +178,17 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 raise ValueError("No valid .shp file found inside uploaded archive package.")
             if len(shp_files) > 1:
                 logger.warning(f"Multiple shapefiles found in archive. Using first: {shp_files}")
-            final_master_source = shp_files[0]
+            final_master_source = shp_files
 
         with fiona.open(str(final_master_source)) as src:
             master_crs = src.crs_wkt or src.crs
 
         if not master_crs:
             raise ValueError("Master dataset does not contain a valid CRS definition.")
+
+        # ── OPTIMIZATION 3: Pre-project the full grid frame ONCE ──────────────
+        logger.info("📐 Computing uniform matrix coordinate transformations...")
+        grid_master_crs = grid_gdf.to_crs(master_crs)
 
         db = _get_db()
         collection_map = {"FCM": "fcm_layers", "FTM": "ftm_layers", "DEM": "dem_layers"}
@@ -164,11 +201,10 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         with fiona.open(str(final_master_source)) as source_stream:
             for idx, cell in grid_gdf.iterrows():
                 grid_id = str(cell["TopoSheet_No"])
-                #grid_id = cell.get("grid_id", f"cell_{idx}")
                 cell_geom = cell.geometry
                 
-                cell_bbox_gdf = gpd.GeoDataFrame(geometry=[cell_geom], crs=grid_gdf.crs).to_crs(master_crs)
-                cell_bbox = tuple(cell_bbox_gdf.total_bounds)
+                # Retrieve bounding tuples directly from pre-projected index coordinates
+                cell_bbox = tuple(grid_master_crs.iloc[idx].geometry.bounds)
 
                 features_in_box = list(source_stream.filter(bbox=cell_bbox))
                 if not features_in_box:
@@ -208,12 +244,16 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                     except Exception:
                         pass
 
-                chunk_filename = f"{data_type.lower()}_{grid_id}.geojson"
+                # ── OPTIMIZATION 4: Switch Chunk Storage to GeoPackage ────────
+                chunk_filename = f"{data_type.lower()}_{grid_id}.gpkg"
                 chunk_filepath = tmp_dir / chunk_filename
-                clipped_gdf.to_file(str(chunk_filepath), driver="GeoJSON")
+                clipped_gdf.to_file(str(chunk_filepath), driver="GPKG")
                 
+                # ── OPTIMIZATION 7: Prevent Dangerous Upload Configurations ──
                 file_bytes_size = chunk_filepath.stat().st_size
-                if (file_bytes_size / (1024 * 1024)) > 1900:
+                if (file_bytes_size / (1024 * 1024)) > 250:
+                    logger.warning(f"⚠️ Chunk skipped: Segment `{grid_id}` ({file_bytes_size / (1024*1024):.1f} MB) exceeds safety threshold.")
+                    chunk_filepath.unlink(missing_ok=True)
                     continue
                 
                 chan_msg = None
@@ -247,27 +287,34 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 success_count += 1
                 chunk_filepath.unlink(missing_ok=True)
 
+                # ── OPTIMIZATION 5: Aggressive RAM Cleanup ────────────────────
                 del clipped_gdf
-                del cell_bbox_gdf
-                
-                # 🚀 BATCH-BASED RESOURCE REJUVENATION: Trigger hard pause every 100 uploads
-                if success_count % 100 == 0:
-                    logger.info(f"🧹 Batch target reached ({success_count} uploads). Initiating system RAM flush pause...")
+                del features_in_box
+                del cell_geom
+                release_memory()
+
+                # ── OPTIMIZATION 6: Reduce Batch Rejuvenation Size to 25 ──────
+                if success_count % 25 == 0:
+                    logger.info(f"🧹 Batch target reached ({success_count} uploads). Pausing for glibc memory stabilization...")
                     try:
                         await status_msg.edit_text(
                             f"🧹 *Batch milestone reached (`{success_count}` parts)!*\n\n"
-                            f"⏸️ Freezing ingestion pipeline for 5 seconds to force full RAM rejuvenation protocols...",
+                            f"⏸️ Freezing ingestion pipeline to stabilize system allocation maps...",
                             parse_mode=ParseMode.MARKDOWN
                         )
                     except Exception:
                         pass
                     
-                    gc.collect()           # Run thorough Python garbage collector routine sweep
-                    await asyncio.sleep(5) # Force execution thread to halt completely so OS drops memory blocks
+                    release_memory()
+                    await asyncio.sleep(1)
 
                 else:
-                    gc.collect()
-                    await asyncio.sleep(0.02)  # Low-impact micro-yield for standard runs
+                    await asyncio.sleep(0.01)
+
+        # ── OPTIMIZATION 8: Release Grid Reprojections on Completion ─────────
+        del grid_gdf
+        del grid_master_crs
+        release_memory()
 
         await status_msg.delete()
         await message.reply_text(
@@ -288,6 +335,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 shutil.rmtree(tmp_dir)
         except Exception:
             logger.exception("Failed to remove temporary directory workspace structures.")
+        release_memory()
         sys.stdout.flush()
 
 
