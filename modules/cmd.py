@@ -343,7 +343,10 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                 report_text += f"• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
 
             # Save metrics indices trail safely down into MongoDB collection logs
-            log_analysis(user.id, filename, geojson_feature, {"status": "completed"}, ["0", "0"])
+            # Extract actual numeric coordinates from the center of the user's uploaded polygon
+            true_centroid = [round(user_geom.centroid.x, 6), round(user_geom.centroid.y, 6]
+            log_analysis(user.id, filename, geojson_feature, {"status": "completed"}, true_centroid)
+
 
             # 6. Render localized map plots using standard fallback modules
             try:
