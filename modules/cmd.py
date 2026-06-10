@@ -344,7 +344,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
 
             # Save metrics indices trail safely down into MongoDB collection logs
             # Extract actual numeric coordinates from the center of the user's uploaded polygon
-            true_centroid = [round(user_geom.centroid.x, 6), round(user_geom.centroid.y, 6]
+            true_centroid = [round(user_geom.centroid.x, 6), round(user_geom.centroid.y, 6)]
             log_analysis(user.id, filename, geojson_feature, {"status": "completed"}, true_centroid)
 
 
