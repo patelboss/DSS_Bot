@@ -21,7 +21,6 @@ from pyrogram.enums import ParseMode, ChatAction
 
 from config import cfg
 from modules.database import _get_db, upsert_user, log_analysis  # Using uniform db helper
-#from modules.spatial_analysis import load_vector_file, run_analysis
 from modules.spatial_analysis import load_vector_file  # ✅ Clean, single import
 
 from modules.map_renderer import render_map
@@ -212,8 +211,12 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
             if not user_gdf.crs:
                 user_gdf.set_crs("EPSG:4326", inplace=True)
 
-            # ✅ Robust Multi-Polygon Compaction Mask (Safe fallback across GeoPandas versions)
+            # ✅ Robust Multi-Polygon Compaction Mask
             user_geom = user_gdf.unary_union
+
+            # ✅ FIXED: Calculate total area in hectares BEFORE building results payload
+            user_utm = user_gdf.to_crs(epsg=32644)
+            calculated_area_ha = float(user_utm.geometry.area.sum() / 10000.0)
 
             # 2. Extract spatial mesh grid framework files from Supabase Storage
             await status_msg.edit_text("🛰 *Aligning layout against Spatial Mesh Framework Grid…*")
@@ -227,10 +230,9 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
             if grid_gdf.crs != user_gdf.crs:
                 grid_gdf = grid_gdf.to_crs(user_gdf.crs)
 
-            # 3. ✅ FIXED: Intersect user unified polygon footprint against framework grid safely
+            # 3. Intersect user unified polygon footprint against framework grid safely
             intersecting_cells = grid_gdf[grid_gdf.geometry.intersects(user_geom)]
             target_grid_ids = (intersecting_cells["TopoSheet_No"].astype(str).dropna().unique().tolist())
-            #target_grid_ids = intersecting_cells["grid_id"].dropna().unique().tolist()
 
             del grid_gdf
             gc.collect()
@@ -248,10 +250,10 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
 
             # 4. Stream & intersect matching dataset blocks dynamically based on what's available
             for grid_id in target_grid_ids:
-                # ── TASK LAYER 1: FCM ──
+                # ── TASK LAYER 1: FCM (GeoPackage Core Tiles) ──
                 fcm_doc = db.fcm_layers.find_one({"grid_id": grid_id, "data_type": "FCM"})
                 if fcm_doc:
-                    fcm_local = tmp_workspace / f"fcm_{grid_id}.geojson"
+                    fcm_local = tmp_workspace / f"fcm_{grid_id}.gpkg"  # ✅ FIXED: Read optimized .gpkg
                     await client.download_media(fcm_doc["file_id"], file_name=str(fcm_local))
                     part_gdf = gpd.read_file(str(fcm_local))
                     clip_part = part_gdf[part_gdf.geometry.intersects(user_geom)].copy()
@@ -259,10 +261,10 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                         fcm_intersected_gdfs.append(clip_part)
                     fcm_local.unlink(missing_ok=True)
 
-                # ── TASK LAYER 2: FTM ──
+                # ── TASK LAYER 2: FTM (GeoPackage Core Tiles) ──
                 ftm_doc = db.ftm_layers.find_one({"grid_id": grid_id, "data_type": "FTM"})
                 if ftm_doc:
-                    ftm_local = tmp_workspace / f"ftm_{grid_id}.geojson"
+                    ftm_local = tmp_workspace / f"ftm_{grid_id}.gpkg"  # ✅ FIXED: Read optimized .gpkg
                     await client.download_media(ftm_doc["file_id"], file_name=str(ftm_local))
                     part_gdf = gpd.read_file(str(ftm_local))
                     clip_part = part_gdf[part_gdf.geometry.intersects(user_geom)].copy()
@@ -270,10 +272,10 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                         ftm_intersected_gdfs.append(clip_part)
                     ftm_local.unlink(missing_ok=True)
 
-                # ── TASK LAYER 3: DEM ──
+                # ── TASK LAYER 3: DEM (GeoPackage Core Tiles) ──
                 dem_doc = db.dem_layers.find_one({"grid_id": grid_id, "data_type": "DEM"})
                 if dem_doc:
-                    dem_local = tmp_workspace / f"dem_{grid_id}.geojson"
+                    dem_local = tmp_workspace / f"dem_{grid_id}.gpkg"  # ✅ FIXED: Read optimized .gpkg
                     await client.download_media(dem_doc["file_id"], file_name=str(dem_local))
                     part_gdf = gpd.read_file(str(dem_local))
                     clip_part = part_gdf[part_gdf.geometry.intersects(user_geom)].copy()
@@ -283,26 +285,28 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
 
                 gc.collect()
 
+            # ✅ FIXED: Safely initialized dictionary payload with ready numeric values
             results = {
                 "area_ha": calculated_area_ha,
-                "centroid": [round(user_geom.centroid.x, 6), round(user_geom.centroid.y, 6)],
+                "centroid": [round(float(user_geom.centroid.x), 6), round(float(user_geom.centroid.y), 6)],
                 "fcm": {"dominant": "Non-Forest", "classes": {}},
                 "dem": {}
             }
+
             # 5. Compile conditional analysis summary sections blocks layout outputs
             report_text = f"🔬 *Conditional Spatial Analysis Report for `{filename}`*\n"
             report_text += f"📅 *Generated on:* `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
+            report_text += f"📊 *Total Boundary Area:* `{calculated_area_ha:.2f} ha`\n\n"
 
-            # Dynamic Eval Profile A: FCM Canopy Canopy Analysis Mapping
+            # Dynamic Eval Profile A: FCM Canopy Analysis Mapping
             if fcm_intersected_gdfs:
                 fcm_compiled = pd.concat(fcm_intersected_gdfs, ignore_index=True)
-                # ✅ FIXED: Apply tight shape mask intersection constraints using unified geometric node
                 fcm_compiled["geometry"] = fcm_compiled.geometry.intersection(user_geom)
                 fcm_compiled = fcm_compiled[~fcm_compiled.geometry.is_empty].copy()
                 
-                # Dynamic area calculations re-projected natively to regional meters (UTM Zone 44N)
                 fcm_utm = fcm_compiled.to_crs(epsg=32644)
                 total_fcm_area_ha = fcm_utm.geometry.area.sum() / 10000.0
+                results["fcm"]["dominant"] = "Forest Cover"
                 
                 report_text += f"🌲 *Forest Canopy Cover (FCM):*\n"
                 report_text += f"• Active Intersecting Shapes Area: `{total_fcm_area_ha:.2f} ha`\n"
@@ -314,7 +318,6 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
             # Dynamic Eval Profile B: FTM Boundaries Tracking Mapping
             if ftm_intersected_gdfs:
                 ftm_compiled = pd.concat(ftm_intersected_gdfs, ignore_index=True)
-                # ✅ FIXED: Geometric masking
                 ftm_compiled["geometry"] = ftm_compiled.geometry.intersection(user_geom)
                 ftm_compiled = ftm_compiled[~ftm_compiled.geometry.is_empty].copy()
                 
@@ -331,12 +334,20 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
             # Dynamic Eval Profile C: DEM Contours Elevation Matrix Tracking
             if dem_intersected_gdfs:
                 dem_compiled = pd.concat(dem_intersected_gdfs, ignore_index=True)
-                
-                # Check for elevation attribute naming columns inside standard frames fields
                 elev_col = next((c for c in dem_compiled.columns if c.lower() in {"elevation", "elev", "contour", "z"}), None)
                 if elev_col:
                     mean_val = pd.to_numeric(dem_compiled[elev_col], errors='coerce').mean()
                     max_val = pd.to_numeric(dem_compiled[elev_col], errors='coerce').max()
+                    min_val = pd.to_numeric(dem_compiled[elev_col], errors='coerce').min()
+                    
+                    results["dem"] = {
+                        "elevation_min_m": round(float(min_val), 1),
+                        "elevation_max_m": round(float(max_val), 1),
+                        "elevation_mean_m": round(float(mean_val), 1),
+                        "slope_mean_deg": "—",
+                        "slope_max_deg": "—"
+                    }
+                    
                     report_text += f"⛰️ *Topographic Elevation Profiles (DEM):*\n"
                     report_text += f"• Intersecting Mean Elevation: `{mean_val:.1f} m`\n"
                     report_text += f"• Maximum Vertex Elevation Peak: `{max_val:.1f} m`\n"
@@ -349,10 +360,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                 report_text += f"• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
 
             # Save metrics indices trail safely down into MongoDB collection logs
-            # Extract actual numeric coordinates from the center of the user's uploaded polygon
-            true_centroid = [round(user_geom.centroid.x, 6), round(user_geom.centroid.y, 6)]
-            log_analysis(user.id, filename, geojson_feature, {"status": "completed"}, true_centroid)
-
+            log_analysis(user.id, filename, geojson_feature, {"status": "completed"}, results["centroid"])
 
             # 6. Render localized map plots using standard fallback modules
             try:
@@ -366,7 +374,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                 else:
                     await callback_query.message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN)
             except Exception as map_err:
-                logger.error(f"Map rendering module encountered non-fatal dropout error: {map_err}")
+                logger.error(f"Map rendering module encountered non-fatal dropout error: {map_err}", exc_info=True)
                 await callback_query.message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN)
 
             await status_msg.delete()
