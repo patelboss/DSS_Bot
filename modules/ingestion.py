@@ -51,7 +51,7 @@ if not logger.handlers:
     stdout_handler.setFormatter(formatter)
     logger.addHandler(stdout_handler)
 
-
+"""
 # ── OPTIMIZATION 1: Native Memory Trim Handler ────────────────────────────────
 def release_memory() -> None:
     """Forces Python garbage collection and clears glibc memory arenas."""
@@ -66,7 +66,30 @@ def release_memory() -> None:
     logger.info(
         f"🧹 MEMORY RECLAIM | before={before:.1f} MB | after={after:.1f} MB"
     )
+"""
+# ── OPTIMIZATION 1: Native Memory Trim Handler ────────────────────────────────
+def release_memory() -> None:
+    """Forces Python garbage collection and clears glibc memory arenas."""
+    try:
+        before = mem_mb()
+    except Exception:
+        before = 0.0
 
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+        
+    try:
+        after = mem_mb()
+    except Exception:
+        after = 0.0
+
+    logger.info(
+        f"🧹 MEMORY RECLAIM | before={before:.1f} MB | after={after:.1f} MB"
+    )
+    
 
 @Client.on_message(filters.command("upload_master") & filters.private)
 async def cmd_upload_master(client: Client, message: Message) -> None:
