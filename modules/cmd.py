@@ -350,7 +350,8 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
 
             # 6. Render localized map plots using standard fallback modules
             try:
-                map_path = render_map(geojson_feature, {}, filename)
+                map_path = render_map(geojson_feature, results, filename)
+            
                 if map_path and (isinstance(map_path, io.BytesIO) or Path(map_path).exists()):
                     await client.send_chat_action(chat_id=user.id, action=ChatAction.UPLOAD_PHOTO)
                     await callback_query.message.reply_photo(photo=map_path, caption=report_text, parse_mode=ParseMode.MARKDOWN)
