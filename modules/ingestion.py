@@ -163,7 +163,8 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
 
         with fiona.open(str(final_master_source)) as source_stream:
             for idx, cell in grid_gdf.iterrows():
-                grid_id = cell.get("grid_id", f"cell_{idx}")
+                grid_id = str(cell["TopoSheet_No"])
+                #grid_id = cell.get("grid_id", f"cell_{idx}")
                 cell_geom = cell.geometry
                 
                 cell_bbox_gdf = gpd.GeoDataFrame(geometry=[cell_geom], crs=grid_gdf.crs).to_crs(master_crs)
