@@ -54,7 +54,7 @@ if not logger.handlers:
 """
 # ── OPTIMIZATION 1: Native Memory Trim Handler ────────────────────────────────
 def release_memory() -> None:
-    """Forces Python garbage collection and clears glibc memory arenas."""
+    #Forces Python garbage collection and clears glibc memory arenas.
     gc.collect()
     try:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
