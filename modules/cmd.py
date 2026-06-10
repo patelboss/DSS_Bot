@@ -283,6 +283,12 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
 
                 gc.collect()
 
+            results = {
+                "area_ha": calculated_area_ha,
+                "centroid": [round(user_geom.centroid.x, 6), round(user_geom.centroid.y, 6)],
+                "fcm": {"dominant": "Non-Forest", "classes": {}},
+                "dem": {}
+            }
             # 5. Compile conditional analysis summary sections blocks layout outputs
             report_text = f"🔬 *Conditional Spatial Analysis Report for `{filename}`*\n"
             report_text += f"📅 *Generated on:* `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
