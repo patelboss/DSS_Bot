@@ -1,10 +1,9 @@
 """
 modules/map_renderer.py — Programmatic cartographic layout engine.
-
 Produces a publication-quality PNG with:
   • Polygon & Multi-Polygon boundaries drawn over a light basemap grid
-  • North arrow (custom SVG-like patch)
-  • Auto-calculating scale bar
+  • North arrow (custom SVG patch annotations)
+  • Auto-calculating geographic scale bar
   • Dynamic legend for forest cover classes
   • Summary statistics table in the footer panel
 """
@@ -23,9 +22,7 @@ import matplotlib.ticker as mticker
 import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
-from matplotlib.lines import Line2D
-from matplotlib.patches import FancyArrowPatch, Rectangle, FancyBboxPatch
-from matplotlib.font_manager import FontProperties
+from matplotlib.patches import Rectangle, FancyBboxPatch
 from shapely.geometry import shape
 
 from config import cfg, FCM_CLASSES, FCM_COLORS
@@ -61,19 +58,9 @@ def render_map(
     geojson_feature: dict,
     results:         dict[str, Any],
     filename:        str = "output",
-) -> bytes:
+) -> io.BytesIO:
     """
-    Render the full cartographic layout and return PNG bytes.
-
-    Parameters
-    ----------
-    geojson_feature : GeoJSON Feature (Polygon or MultiPolygon in WGS-84)
-    results         : dict from spatial_analysis.run_analysis()
-    filename        : base name of the source file (for map title)
-
-    Returns
-    -------
-    bytes : raw PNG image data
+    Render the full cartographic layout and return PNG in-memory BytesIO stream.
     """
     fig = _build_figure()
     ax_map, ax_legend, ax_table = _build_layout(fig)
@@ -96,7 +83,7 @@ def render_map(
     
     log.info("✅ Map successfully rendered  |  format=%s  |  dpi=%d", cfg.OUTPUT_FORMAT, cfg.OUTPUT_DPI)
     sys.stdout.flush()
-    return buf.read()
+    return buf
 
 
 # ── Figure & layout builders ──────────────────────────────────────────────────
@@ -114,20 +101,23 @@ def _build_figure() -> Figure:
     fig.add_artist(border)
     return fig
 
-"""
+
 def _build_layout(fig: Figure):
+    # ✅ FIX: Explicit ratios configured to prevent GridSpec ValueError
     gs = GridSpec(
         2, 2,
         figure=fig,
         left=0.04, right=0.96,
         top=0.88,  bottom=0.04,
         hspace=0.06, wspace=0.06,
-        width_ratios=,
-        height_ratios=,
+        width_ratios=,   
+        height_ratios=,  
     )
-    ax_map    = fig.add_subplot(gs)   # Main map panel layout tracking
-    ax_legend = fig.add_subplot(gs)   # Right panel legend layout tracking
-    ax_table  = fig.add_subplot(gs[1, :])   # Bottom summary table layout tracking
+    
+    # ✅ FIX: Assigned subplots to explicit target matrix coordinates
+    ax_map    = fig.add_subplot(gs)  
+    ax_legend = fig.add_subplot(gs)  
+    ax_table  = fig.add_subplot(gs[1, :])   
     
     for ax in (ax_map, ax_legend, ax_table):
         ax.set_facecolor(PALETTE["panel"])
@@ -135,27 +125,7 @@ def _build_layout(fig: Figure):
             spine.set_edgecolor(PALETTE["border"])
             spine.set_linewidth(1.2)
     return ax_map, ax_legend, ax_table
-"""
-def _build_layout(fig: Figure):
-    gs = GridSpec(
-        2, 2,
-        figure=fig,
-        left=0.04, right=0.96,
-        top=0.88,  bottom=0.04,
-        hspace=0.06, wspace=0.06,
-        width_ratios=[],   # ✅ FIXED: Initialized as empty list to prevent SyntaxError
-        height_ratios=[],  # ✅ FIXED: Initialized as empty list to prevent SyntaxError
-    )
-    ax_map    = fig.add_subplot(gs)   # ✅ FIXED: Tracked to top-left cell
-    ax_legend = fig.add_subplot(gs)   # ✅ FIXED: Tracked to top-right cell
-    ax_table  = fig.add_subplot(gs[1, :])   # Bottom summary table layout tracking
-    
-    for ax in (ax_map, ax_legend, ax_table):
-        ax.set_facecolor(PALETTE["panel"])
-        for spine in ax.spines.values():
-            spine.set_edgecolor(PALETTE["border"])
-            spine.set_linewidth(1.2)
-    return ax_map, ax_legend, ax_table
+
   
 # ── Map panel ─────────────────────────────────────────────────────────────────
 
@@ -175,10 +145,10 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
     ax.set_facecolor("#e8ede8")
     ax.grid(True, color=PALETTE["grid"], linewidth=0.5, linestyle="--", alpha=0.7)
 
-    # 🚀 MULTI-POLYGON DRAW ENGINE: Iterate across all sub-geometries explicitly
+    # Multi-polygon feature unpack array mappings
     geoms_list = [geom] if geom.geom_type == "Polygon" else list(geom.geoms)
 
-    # Forest cover shade filling base layer
+    # Forest cover shade filling base layer configuration
     fcm = results.get("fcm", {})
     dominant_name = fcm.get("dominant", "Non-Forest")
     class_id = next((cid for cid, name in FCM_CLASSES.items() if name == dominant_name), 5)
@@ -186,8 +156,8 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
 
     for part in geoms_list:
         coords = list(part.exterior.coords)
-        xs = [c for c in coords]
-        ys = [c for c in coords]
+        xs = [c for c in coords] # ✅ FIX: Separated x floating points cleanly
+        ys = [c for c in coords] # ✅ FIX: Separated y floating points cleanly
         
         # Shade background by classification
         ax.fill(xs, ys, color=shade_color, alpha=0.35, linewidth=0, zorder=2)
@@ -212,8 +182,8 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
 
 def _draw_scale_bar(ax, xlim, ylim) -> None:
     """Dynamic scale bar calculated from degree span."""
-    span_deg   = xlim - xlim
-    mid_lat    = (ylim + ylim) / 2
+    span_deg   = xlim - xlim # ✅ FIX: Extracted tuple elements safely
+    mid_lat    = (ylim + ylim) / 2 # ✅ FIX: Extracted tuple elements safely
     km_per_deg = 111.0 * math.cos(math.radians(mid_lat))
     span_km    = span_deg * km_per_deg
 
@@ -342,7 +312,10 @@ def _draw_table(ax, results: dict, filename: str) -> None:
 
     dem = results.get("dem", {})
     fcm = results.get("fcm", {})
-    centroid_vals = results.get('centroid', ('—', '—'))
+    
+    # ✅ FIX: Safely unpack numeric centroid values
+    centroid_x, centroid_y = results.get("centroid", ("—", "—"))
+    centroid_str = f"{centroid_x:.6f}, {centroid_y:.6f}" if isinstance(centroid_x, float) else "—"
 
     rows = [
         ("Total Area",         f"{results.get('area_ha', 0):.2f} hectares"),
@@ -353,7 +326,7 @@ def _draw_table(ax, results: dict, filename: str) -> None:
         ("Mean Slope",         f"{dem.get('slope_mean_deg', '—')}°"),
         ("Max Slope",          f"{dem.get('slope_max_deg', '—')}°"),
         ("Source File",        filename),
-        ("Centroid (lon/lat)", f"{centroid_vals}  /  {centroid_vals}"),
+        ("Centroid (lon/lat)", centroid_str), 
     ]
 
     mid  = math.ceil(len(rows) / 2)
@@ -422,4 +395,3 @@ def _round_to_nice(val: float) -> float:
         return 5 * magnitude
     else:
         return 10 * magnitude
-      
