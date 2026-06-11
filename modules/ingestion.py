@@ -139,7 +139,8 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
     or: /upload_master [DATA_TYPE] --limit N --offset M
 
     Slices vector layers by grid framework with strict batch-clearing resets.
-    LIMIT and OFFSET let you resume/backup ingestion from a selected grid window.
+    LIMIT and OFFSET are applied as a processing window, while skipped grids are
+    still logged so you can trace what was bypassed.
     """
     if not message.reply_to_message or not message.reply_to_message.document:
         logger.warning("❌ Ingestion Rejected: Command executed without replying to a valid file document.")
@@ -254,6 +255,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         required_cols = ["TopoSheet_No", "geometry"]
         grid_gdf = grid_gdf[required_cols].copy()
         logger.info("📊 Grid Records initialized: %d mapping cells available.", len(grid_gdf))
+        logger.info("📊 Grid Columns = %s", grid_gdf.columns.tolist())
 
         final_master_source = master_path
         if suffix == ".zip":
@@ -282,7 +284,6 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         logger.info("📐 Computing uniform matrix coordinate transformations...")
         grid_master_crs = grid_gdf.to_crs(master_crs)
 
-        # Apply backup/resume window here
         total_grid_cells = len(grid_gdf)
         start_idx = min(offset, total_grid_cells)
         end_idx = total_grid_cells if limit is None else min(start_idx + limit, total_grid_cells)
@@ -292,15 +293,12 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 f"Offset {offset} is beyond available grid cells ({total_grid_cells})."
             )
 
-        grid_gdf = grid_gdf.iloc[start_idx:end_idx].reset_index(drop=True)
-        grid_master_crs = grid_master_crs.iloc[start_idx:end_idx].reset_index(drop=True)
-
         logger.info(
             "🧭 Processing window applied | total=%d | start=%d | end=%d | selected=%d",
             total_grid_cells,
             start_idx,
             end_idx,
-            len(grid_gdf),
+            end_idx - start_idx,
         )
 
         db = _get_db()
@@ -309,17 +307,64 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         col = db[collection_name]
 
         success_count = 0
+        processed_window = 0
+        skipped_window = 0
+
         logger.info("✂️ Spatial streaming processes active. Target DB Collection: %s", collection_name)
 
         with fiona.open(str(final_master_source)) as source_stream:
-            for idx, cell in grid_gdf.iterrows():
-                grid_id = str(cell["TopoSheet_No"])
-                cell_geom = cell.geometry
+            for pos, cell in enumerate(grid_gdf.itertuples(index=False), start=0):
+                grid_id = str(getattr(cell, "TopoSheet_No"))
+                cell_geom = getattr(cell, "geometry")
 
-                cell_bbox = tuple(grid_master_crs.iloc[idx].geometry.bounds)
+                if pos < start_idx:
+                    skipped_window += 1
+                    if pos < 3 or (start_idx and pos % 100 == 0):
+                        logger.info(
+                            "OFFSET_SKIP | pos=%d | grid_id=%s | phase=offset | skipped=%d/%d",
+                            pos,
+                            grid_id,
+                            skipped_window,
+                            start_idx,
+                        )
+                    continue
+
+                if pos >= end_idx:
+                    logger.info(
+                        "WINDOW_END | pos=%d | end=%d | processed=%d | skipped=%d",
+                        pos,
+                        end_idx,
+                        processed_window,
+                        skipped_window,
+                    )
+                    break
+
+                processed_window += 1
+
+                cell_bounds = grid_master_crs.iloc[pos].geometry.bounds
+                cell_bbox = tuple(cell_bounds)
+
+                logger.info(
+                    "GRID_BEGIN | pos=%d | grid_id=%s | bbox=(%.6f, %.6f, %.6f, %.6f) | rss=%.1f MB",
+                    pos,
+                    grid_id,
+                    cell_bbox[0],
+                    cell_bbox[1],
+                    cell_bbox[2],
+                    cell_bbox[3],
+                    mem_mb(),
+                )
 
                 features_in_box = list(source_stream.filter(bbox=cell_bbox))
+                logger.info(
+                    "GRID_QUERY | grid_id=%s | candidates=%d | bbox=%s",
+                    grid_id,
+                    len(features_in_box),
+                    cell_bbox,
+                )
+
                 if not features_in_box:
+                    logger.info("GRID_EMPTY | grid_id=%s | no source features in bbox", grid_id)
                     continue
 
                 clipped_gdf = gpd.GeoDataFrame.from_features(features_in_box, crs=master_crs)
@@ -338,7 +383,18 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 clipped_gdf = clipped_gdf[clipped_gdf.geometry.notnull()].copy()
                 clipped_gdf = clipped_gdf[~clipped_gdf.geometry.is_empty].copy()
 
+                logger.info(
+                    "GRID_CLIP | grid_id=%s | clipped_rows=%d | mem=%.1f MB",
+                    grid_id,
+                    len(clipped_gdf),
+                    mem_mb(),
+                )
+
                 if clipped_gdf.empty:
+                    logger.info("GRID_SKIP | grid_id=%s | empty after clip", grid_id)
+                    del clipped_gdf
+                    del cell_geom
+                    release_memory()
                     continue
 
                 for col_name in clipped_gdf.columns:
@@ -350,7 +406,8 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                         await status_msg.edit_text(
                             f"✂️ *Slicing {data_type} vector assets safely…*\n\n"
                             f"📍 Active Segment: `Grid_{grid_id}`\n"
-                            f"📦 Total Cached Parts: `{success_count}` chunks",
+                            f"📦 Total Cached Parts: `{success_count}` chunks\n"
+                            f"🧭 Window: `offset={offset}` `limit={limit if limit is not None else 'ALL'}`",
                             parse_mode=ParseMode.MARKDOWN,
                         )
                     except Exception:
@@ -359,10 +416,17 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 # Switch Chunk Storage to GeoPackage
                 chunk_filename = f"{data_type.lower()}_{grid_id}.gpkg"
                 chunk_filepath = tmp_dir / chunk_filename
+
                 clipped_gdf.to_file(str(chunk_filepath), driver="GPKG")
+                file_bytes_size = chunk_filepath.stat().st_size
+                logger.info(
+                    "GRID_WRITE | grid_id=%s | chunk=%s | size=%.2f MB",
+                    grid_id,
+                    chunk_filename,
+                    file_bytes_size / (1024 * 1024),
+                )
 
                 # Prevent dangerous upload configurations
-                file_bytes_size = chunk_filepath.stat().st_size
                 if (file_bytes_size / (1024 * 1024)) > 250:
                     logger.warning(
                         "⚠️ Chunk skipped: Segment `%s` (%.1f MB) exceeds safety threshold.",
@@ -370,19 +434,28 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                         file_bytes_size / (1024 * 1024),
                     )
                     chunk_filepath.unlink(missing_ok=True)
+                    del clipped_gdf
+                    del cell_geom
+                    release_memory()
                     continue
 
                 chan_msg = None
                 while not chan_msg:
                     try:
-                        logger.info("📤 Uploading partition chunk: %s over to Channel ID: %s", chunk_filename, CHANNEL_CHAT_ID)
+                        logger.info(
+                            "📤 Uploading partition chunk: %s over to Channel ID: %s",
+                            chunk_filename,
+                            CHANNEL_CHAT_ID,
+                        )
                         chan_msg = await client.send_document(
                             chat_id=CHANNEL_CHAT_ID,
                             document=str(chunk_filepath),
                             caption=(
                                 f"📦 SDSS Production Master Part Asset\n"
                                 f"• DataType: {data_type}\n"
-                                f"• Partition Index: {grid_id}"
+                                f"• Partition Index: {grid_id}\n"
+                                f"• Window Offset: {offset}\n"
+                                f"• Window Limit: {limit if limit is not None else 'ALL'}"
                             ),
                         )
                     except FloodWait as flood_exception:
@@ -411,6 +484,14 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                     upsert=True,
                 )
 
+                logger.info(
+                    "GRID_INDEX_SAVED | grid_id=%s | file_id=%s | message_id=%s | features=%d",
+                    grid_id,
+                    chan_msg.document.file_id,
+                    chan_msg.id,
+                    len(clipped_gdf),
+                )
+
                 success_count += 1
                 chunk_filepath.unlink(missing_ok=True)
 
@@ -420,7 +501,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 del cell_geom
                 release_memory()
 
-                # Reduce batch rejuvenation size
+                # Progress marker
                 if success_count % 25 == 0:
                     logger.info(
                         "🧹 Batch target reached (%d uploads). Pausing for glibc memory stabilization...",
@@ -429,7 +510,8 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                     try:
                         await status_msg.edit_text(
                             f"🧹 *Batch milestone reached (`{success_count}` parts)!*\n\n"
-                            f"⏸️ Freezing ingestion pipeline to stabilize system allocation maps...",
+                            f"⏸️ Freezing ingestion pipeline to stabilize system allocation maps...\n"
+                            f"🧭 Window: `offset={offset}` `limit={limit if limit is not None else 'ALL'}`",
                             parse_mode=ParseMode.MARKDOWN,
                         )
                     except Exception:
