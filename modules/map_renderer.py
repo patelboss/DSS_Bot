@@ -190,17 +190,17 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
                 class_attr = str(row.get("class_name", "")).strip().upper()
 
                 if "VDF" in class_attr or "VERY DENSE" in class_attr:
-                    poly_color = FCM_COLORS.get(1, "#004d1a")
+                    poly_color = FCM_COLORS.get(1, "#07380e")
                 elif "MDF" in class_attr or "MODERATELY DENSE" in class_attr:
-                    poly_color = FCM_COLORS.get(2, "#009933")
+                    poly_color = FCM_COLORS.get(2, "#17d133")
                 elif "OPEN FOREST" in class_attr or "OF" in class_attr:
-                    poly_color = FCM_COLORS.get(3, "#66ff66")
-                elif "NOM FOREST" in class_attr or "OF" in class_attr:
-                    poly_color = FCM_COLORS.get(3, "#66ff66")
+                    poly_color = FCM_COLORS.get(3, "#c1c70e")
+                elif "NON FOREST" in class_attr or "NF" in class_attr:
+                    poly_color = FCM_COLORS.get(3, "#8c8c88")
                 elif "SCRUB" in class_attr:
-                    poly_color = FCM_COLORS.get(4, "#cc9966")
+                    poly_color = FCM_COLORS.get(4, "#ab180e")
                 elif "WATER" in class_attr:
-                    poly_color = "#3399ff"
+                    poly_color = "#5064fa"
                 else:
                     poly_color = "#a3c2c2"
 
