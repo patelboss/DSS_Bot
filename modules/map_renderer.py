@@ -134,7 +134,7 @@ def _build_layout(fig: Figure):
 
     return ax_map, ax_legend, ax_table
 
-
+"""
 # ── Map panel ─────────────────────────────────────────────────────────────────
 def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
     geom = shape(geojson_feature["geometry"])
@@ -206,7 +206,88 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
     ax.set_aspect("equal")
     ax.set_xlabel("Longitude", fontsize=8, color=PALETTE["text_mid"])
     ax.set_ylabel("Latitude", fontsize=8, color=PALETTE["text_mid"])
+  """
+def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
+    geom = shape(geojson_feature["geometry"])
+    minx, miny, maxx, maxy = geom.bounds
 
+    # Add 15% padding around the geometry bounding context box
+    pad_x = (maxx - minx) * 0.15 if (maxx - minx) > 0 else 0.01
+    pad_y = (maxy - miny) * 0.15 if (maxy - miny) > 0 else 0.01
+    xlim  = (minx - pad_x, maxx + pad_x)
+    ylim  = (miny - pad_y, maxy + pad_y)
+
+    # Light grey background grid setup
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+    ax.set_facecolor("#e8ede8")
+    ax.grid(True, color=PALETTE["grid"], linewidth=0.5, linestyle="--", alpha=0.7)
+
+    # ── 1. DYNAMICALLY DRAW INTERSECTED FOREST CANOPY CLASSES ──
+    # Retrieve the live intersected canopy pieces we collected during the analysis phase
+    fcm_gdfs = results.get("_raw_fcm_gdfs", [])
+    
+    if fcm_gdfs:
+        for gdf in fcm_gdfs:
+            if gdf.empty:
+                continue
+            # Ensure the layer coordinates match WGS84 mapping coordinates
+            if gdf.crs and gdf.crs.to_string() != "EPSG:4326":
+                gdf = gdf.to_crs("EPSG:4326")
+                
+            for _, row in gdf.iterrows():
+                fcm_geom = row.geometry
+                if not fcm_geom or fcm_geom.is_empty:
+                    continue
+                    
+                # Extract the class name string (e.g., "VDF", "MDF", "OF", "Scrub")
+                class_attr = str(row.get("class_name", "")).strip().upper()
+                
+                # Dynamic Color Matcher based on your existing setup rules
+                if "VERY DENSE" in class_attr or "VDF" in class_attr:
+                    poly_color = FCM_COLORS.get(1, "#004d1a")  # Deep Dark Green
+                elif "MODERATELY DENSE" in class_attr or "MDF" in class_attr:
+                    poly_color = FCM_COLORS.get(2, "#009933")  # Medium Green
+                elif "OPEN" in class_attr or "OF" in class_attr:
+                    poly_color = FCM_COLORS.get(3, "#66ff66")  # Light Lime Green
+                elif "SCRUB" in class_attr:
+                    poly_color = FCM_COLORS.get(4, "#cc9966")  # Bush Brown
+                else:
+                    poly_color = "#a3c2c2" # Non-forest fallback tint
+
+                # Plot the individual forest cover sub-polygon chunks
+                fcm_parts = [fcm_geom] if fcm_geom.geom_type == "Polygon" else list(fcm_geom.geoms)
+                for f_part in fcm_parts:
+                    f_coords = list(f_part.exterior.coords)
+                    f_xs = [c for c in f_coords]
+                    f_ys = [c for c in f_coords]
+                    ax.fill(f_xs, f_ys, color=poly_color, alpha=0.6, linewidth=0, zorder=2)
+
+    # ── 2. DRAW THE RED STUDY AREA BOUNDARY LINE OVER THE CANOPY ──
+    geoms_list = [geom] if geom.geom_type == "Polygon" else list(geom.geoms)
+    for part in geoms_list:
+        coords = list(part.exterior.coords)
+        xs = [c for c in coords] 
+        ys = [c for c in coords] 
+        
+        # Translucent white mask to separate user focus boundary from outside grid blocks
+        ax.fill(xs, ys, color=PALETTE["poly_fill"], linewidth=0, alpha=0.2, zorder=3)
+        # Vector crisp perimeter red outer line plot
+        ax.plot(xs, ys, color=PALETTE["poly_edge"], linewidth=2.5, solid_capstyle="round", zorder=4)
+
+    # Coordinate grid labels
+    ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.4f°E"))
+    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.4f°N"))
+    ax.tick_params(axis="both", labelsize=7, color=PALETTE["text_mid"])
+
+    # Scale bar & North arrow assets
+    _draw_scale_bar(ax, xlim, ylim)
+    _draw_north_arrow(ax, xlim, ylim)
+
+    ax.set_aspect("equal")
+    ax.set_xlabel("Longitude", fontsize=8, color=PALETTE["text_mid"])
+    ax.set_ylabel("Latitude",  fontsize=8, color=PALETTE["text_mid"])
+  
 
 def _draw_scale_bar(ax, xlim, ylim) -> None:
     """Dynamic scale bar calculated from degree span."""
