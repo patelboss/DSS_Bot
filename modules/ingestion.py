@@ -313,7 +313,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
 
                 if not features_in_box:
                     skipped_empty += 1
-                    logger.info("GRID_EMPTY | grid_id=%s | no source features in bbox", grid_id)
+                    #logger.info("GRID_EMPTY | grid_id=%s | no source features in bbox", grid_id)
                     continue
 
                 clipped_gdf = gpd.GeoDataFrame.from_features(features_in_box, crs=master_crs)
