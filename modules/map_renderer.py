@@ -397,11 +397,11 @@ def _draw_legend(ax, results: dict) -> None:
     label_bridge = {
         1: "VDF",
         2: "MDF",
-        3: "OPEN Forest",
-        4: "NON Forest",
+        3: "OPEN FOREST",
+        4: "NON FOREST",
         5: "SCRUB",
-        6: "Water",
-        0: "No Data"
+        6: "WATER",
+        0: "NO-DATA"
     }
 
     # Iterate through standard configuration elements cleanly
