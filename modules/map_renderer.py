@@ -196,13 +196,13 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
                 elif "OPEN FOREST" in class_attr or "OF" in class_attr:
                     poly_color = FCM_COLORS.get(3, "#c1c70e")
                 elif "NON FOREST" in class_attr or "NF" in class_attr:
-                    poly_color = FCM_COLORS.get(3, "#8c8c88")
+                    poly_color = FCM_COLORS.get(4, "#8c8c88")
                 elif "SCRUB" in class_attr:
-                    poly_color = FCM_COLORS.get(4, "#ab180e")
+                    poly_color = FCM_COLORS.get(5, "#ab180e")
                 elif "WATER" in class_attr:
-                    poly_color = "#5064fa"
+                    poly_color = FCM_COLORS.get(6, "#5064fa")
                 else:
-                    poly_color = "#a3c2c2"
+                    poly_color = FCM_COLORS.get(0, "#25a8a8")
 
                 for f_part in fcm_parts:
                     f_coords = list(f_part.exterior.coords)
