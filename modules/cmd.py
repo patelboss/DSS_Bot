@@ -198,7 +198,6 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
             parse_mode=ParseMode.MARKDOWN
         )
         
-        # Aligned working paths and session indicators pointers
         tmp_workspace = Path(tempfile.mkdtemp())
         grid_local_path = tmp_workspace / "state_fishnet_grid.gpkg"
         
@@ -206,19 +205,15 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
             await client.send_chat_action(chat_id=user.id, action=ChatAction.TYPING)
             db = _get_db()
 
-            # 1. Load User Polygon Area into a local GeoDataFrame profile
             user_gdf = gpd.GeoDataFrame.from_features([geojson_feature])
             if not user_gdf.crs:
                 user_gdf.set_crs("EPSG:4326", inplace=True)
 
-            # Robust Multi-Polygon Compaction Mask
             user_geom = user_gdf.unary_union
 
-            # Calculate total area in hectares BEFORE building results payload
             user_utm = user_gdf.to_crs(epsg=32644)
             calculated_area_ha = float(user_utm.geometry.area.sum() / 10000.0)
 
-            # 2. Extract spatial mesh grid framework files from Supabase Storage
             await status_msg.edit_text("🛰 *Aligning layout against Spatial Mesh Framework Grid…*")
             from modules.storage import _get_supabase
             supabase = _get_supabase()
@@ -230,7 +225,6 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
             if grid_gdf.crs != user_gdf.crs:
                 grid_gdf = grid_gdf.to_crs(user_gdf.crs)
 
-            # 3. Intersect user unified polygon footprint against framework grid safely
             intersecting_cells = grid_gdf[grid_gdf.geometry.intersects(user_geom)]
             target_grid_ids = (intersecting_cells["TopoSheet_No"].astype(str).dropna().unique().tolist())
 
@@ -243,15 +237,12 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
 
             await status_msg.edit_text(f"📍 *Footprint maps across `{len(target_grid_ids)}` framework grid indices. Intersecting files updates…*")
 
-            # Initialize cumulative metrics stores
             fcm_intersected_gdfs = []
             ftm_intersected_gdfs = []
             dem_intersected_gdfs = []
 
-            # 4. Stream & intersect matching dataset blocks dynamically based on what's available
             for grid_id in target_grid_ids:
-                # ── TASK LAYER 1: FCM (GeoPackage Core Tiles) ──
-                # ✅ FIXED: Querying MongoDB with the true active 'grid_id' variable
+                # ── TASK LAYER 1: FCM ──
                 fcm_doc = db.fcm_layers.find_one({"grid_id": grid_id, "data_type": "FCM"})
                 if fcm_doc:
                     fcm_local = tmp_workspace / f"fcm_{grid_id}.gpkg"
@@ -262,7 +253,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                         fcm_intersected_gdfs.append(clip_part)
                     fcm_local.unlink(missing_ok=True)
 
-                # ── TASK LAYER 2: FTM (GeoPackage Core Tiles) ──
+                # ── TASK LAYER 2: FTM ──
                 ftm_doc = db.ftm_layers.find_one({"grid_id": grid_id, "data_type": "FTM"})
                 if ftm_doc:
                     ftm_local = tmp_workspace / f"ftm_{grid_id}.gpkg"
@@ -273,7 +264,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                         ftm_intersected_gdfs.append(clip_part)
                     ftm_local.unlink(missing_ok=True)
 
-                # ── TASK LAYER 3: DEM (GeoPackage Core Tiles) ──
+                # ── TASK LAYER 3: DEM ──
                 dem_doc = db.dem_layers.find_one({"grid_id": grid_id, "data_type": "DEM"})
                 if dem_doc:
                     dem_local = tmp_workspace / f"dem_{grid_id}.gpkg"
@@ -286,63 +277,89 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
 
                 gc.collect()
 
-            # 5. Compile conditional analysis summary sections blocks layout outputs
+            # Dynamic Eval Profile B & C Pre-allocations
             report_text = f"🔬 *Conditional Spatial Analysis Report for `{filename}`*\n"
             report_text += f"📅 *Generated on:* `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
             report_text += f"📊 *Total Boundary Area:* `{calculated_area_ha:.2f} ha`\n\n"
 
+            # ── 🎯 PATCHED: FCM ANALYSIS BLOCK ──
             fcm_class_summary = {}
             dominant_cover_type = "Non-Forest"
+            passed_fcm_list = []
 
             if fcm_intersected_gdfs:
                 fcm_compiled = pd.concat(fcm_intersected_gdfs, ignore_index=True)
-                logger.info("FCM Columns = %s", fcm_compiled.columns.tolist))
-                logger.info("FCM Sample = %s", fcm_compiled.head(3).to_dict("records") )
-                # ✅ FIXED: Apply strict geometric overlay intersections to clip lines cleanly
+
+                logger.info("FCM Columns = %s", fcm_compiled.columns.tolist())
+                logger.info("FCM Sample = %s", fcm_compiled.head(3).to_dict("records"))
+
                 fcm_compiled["geometry"] = fcm_compiled.geometry.intersection(user_geom)
                 fcm_compiled = fcm_compiled[~fcm_compiled.geometry.is_empty].copy()
-                
+
                 fcm_utm = fcm_compiled.to_crs(epsg=32644)
-                
-                if not fcm_utm.empty and "class_name" in fcm_utm.columns:
+
+                class_col = next(
+                    (c for c in fcm_utm.columns if c.lower() == "class_name"),
+                    None
+                )
+
+                if class_col and not fcm_utm.empty:
                     fcm_utm["part_area_ha"] = fcm_utm.geometry.area / 10000.0
-                    grouped = fcm_utm.groupby("class_name")["part_area_ha"].sum()
-                    
+                    grouped = fcm_utm.groupby(class_col)["part_area_ha"].sum()
+
                     max_area = 0.0
+
                     for raw_class, class_ha in grouped.items():
                         c_str = str(raw_class).strip().upper()
-                        
-                        # ✅ FIXED: Perfect mapping matching your exact database values
+
                         if "VDF" in c_str or "VERY DENSE" in c_str:
                             standard_label = "Very Dense Forest"
                         elif "MDF" in c_str or "MODERATELY DENSE" in c_str:
                             standard_label = "Moderately Dense Forest"
-                        elif "OPEN" in c_str:
+                        elif "OPEN" in c_str or "OF" in c_str:
                             standard_label = "Open Forest"
                         elif "SCRUB" in c_str:
                             standard_label = "Scrub"
                         elif "WATER" in c_str:
-                            standard_label = "Water Body"
+                            standard_label = "Water / No Data"
                         else:
                             standard_label = "Non-Forest"
 
-                        c_pct = (class_ha / calculated_area_ha) * 100.0
-                        fcm_class_summary[standard_label] = {"hectares": class_ha, "percentage": c_pct}
-                        
-                        if class_ha > max_area and standard_label != "Water Body":
+                        c_pct = (class_ha / calculated_area_ha) * 100.0 if calculated_area_ha else 0.0
+                        fcm_class_summary[standard_label] = {
+                            "hectares": float(class_ha),
+                            "percentage": float(c_pct),
+                        }
+
+                        if standard_label not in {"Water / No Data", "Non-Forest"} and class_ha > max_area:
                             max_area = class_ha
                             dominant_cover_type = standard_label
 
                 report_text += f"🌲 *Forest Canopy Cover (FCM):*\n"
                 for label, metrics in fcm_class_summary.items():
-                    report_text += f" • {label}: `{metrics['hectares']:.2f} ha` ({metrics['percentage']:.1f}%)\n"
+                    report_text += f"• {label}: `{metrics['hectares']:.2f} ha` ({metrics['percentage']:.1f}%)\n"
                 report_text += f"• Processing Status: `[Natively Evaluated]` ✅\n\n"
-                
+
                 passed_fcm_list = [fcm_compiled]
             else:
                 report_text += f"🌲 *Forest Canopy Cover (FCM):*\n"
                 report_text += f"• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
-                passed_fcm_list = []
+
+            # Dynamic Eval Profile B: FTM Boundaries Tracking Mapping
+            if ftm_intersected_gdfs:
+                ftm_compiled = pd.concat(ftm_intersected_gdfs, ignore_index=True)
+                ftm_compiled["geometry"] = ftm_compiled.geometry.intersection(user_geom)
+                ftm_compiled = ftm_compiled[~ftm_compiled.geometry.is_empty].copy()
+                
+                ftm_utm = ftm_compiled.to_crs(epsg=32644)
+                total_ftm_area_ha = ftm_utm.geometry.area.sum() / 10000.0
+
+                report_text += f"🌿 *Forest Type Mapping (FTM):*\n"
+                report_text += f"• Active Intersecting Canopy Area: `{total_ftm_area_ha:.2f} ha`\n"
+                report_text += f"• Processing Status: `[Natively Evaluated]` ✅\n\n"
+            else:
+                report_text += f"🌿 *Forest Type Mapping (FTM):*\n"
+                report_text += f"• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
 
             # Dynamic Eval Profile C: DEM Contours Elevation Matrix Tracking
             if dem_intersected_gdfs:
@@ -374,17 +391,20 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                 report_text += f"⛰️ *Topographic Elevation Profiles (DEM):*\n"
                 report_text += f"• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
 
-            # ✅ FIXED: Populating the full layout metadata payloads cleanly
+            # ── 🎯 PATCHED: RESULTS METADATA DICTIONARY ──
             results = {
                 "area_ha": calculated_area_ha,
-                "centroid": [round(float(user_geom.centroid.x), 6), round(float(user_geom.centroid.y), 6)],
+                "centroid": [
+                    round(float(user_geom.centroid.x), 6),
+                    round(float(user_geom.centroid.y), 6),
+                ],
                 "fcm": {
-                    "dominant": dominant_cover_type, 
-                    "classes": fcm_class_summary
+                    "dominant": dominant_cover_type,
+                    "classes": fcm_class_summary,
                 },
                 "dem": dem_metrics,
                 "_raw_fcm_gdfs": passed_fcm_list,
-                "_has_water": "Water Body" in fcm_class_summary
+                "_has_water": "Water / No Data" in fcm_class_summary,
             }
 
             # Save metrics indices trail safely down into MongoDB collection logs
