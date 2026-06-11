@@ -153,7 +153,11 @@ def _iter_polygons(geom):
 
 
 # ── Map panel ─────────────────────────────────────────────────────────────────
+
 def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
+  
+    log.info("MAP_TRACE | raw_gdfs=%d | rows=%s",len(fcm_gdfs),[len(gdf) for gdf in fcm_gdfs])
+  
     geom = shape(geojson_feature["geometry"])
     minx, miny, maxx, maxy = geom.bounds
 
