@@ -31,9 +31,20 @@ import resource
 
 def mem_mb() -> float:
     """
-    Current process RSS memory in MB.
-    Works on Linux containers.
+    Returns the TRUE, real-time Resident Set Size (RSS) memory 
+    of the active Linux container process in Megabytes.
     """
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    # Extract the numeric kilobyte value from lines like: VmRSS:   265412 kB
+                    kb_val = float(line.split())
+                    return kb_val / 1024.0
+    except Exception:
+        pass
+    # Fallback to high-water mark if /proc is unavailable
+    import resource
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
 
 
@@ -51,22 +62,6 @@ if not logger.handlers:
     stdout_handler.setFormatter(formatter)
     logger.addHandler(stdout_handler)
 
-"""
-# ── OPTIMIZATION 1: Native Memory Trim Handler ────────────────────────────────
-def release_memory() -> None:
-    #Forces Python garbage collection and clears glibc memory arenas.
-    gc.collect()
-    try:
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception:
-        pass
-        
-    after = mem_mb()
-
-    logger.info(
-        f"🧹 MEMORY RECLAIM | before={before:.1f} MB | after={after:.1f} MB"
-    )
-"""
 # ── OPTIMIZATION 1: Native Memory Trim Handler ────────────────────────────────
 def release_memory() -> None:
     """Forces Python garbage collection and clears glibc memory arenas."""
