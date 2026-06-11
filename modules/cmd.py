@@ -414,6 +414,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
 
             # 6. Render localized map plots using standard fallback modules
             try:
+                logger.info("RENDER_TRACE | file=%s | area=%.2f | fcm_classes=%s | raw_gdfs=%d | rows=%s | class_names=%s",filename,  results.get("area_ha", 0),    list(results.get("fcm", {}).get("classes", {}).keys()),    len(results.get("_raw_fcm_gdfs", [])),    [len(gdf) for gdf in results.get("_raw_fcm_gdfs", [])],    [        gdf["class_name"].dropna().unique().tolist()        if "class_name" in gdf.columns        else "NO_CLASS_FIELD"       for gdf in results.get("_raw_fcm_gdfs", [])   ])
                 map_path = render_map(geojson_feature, results, filename)
             
                 if map_path and (isinstance(map_path, io.BytesIO) or Path(map_path).exists()):
