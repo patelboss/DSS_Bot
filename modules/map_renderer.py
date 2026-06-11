@@ -134,7 +134,24 @@ def _build_layout(fig: Figure):
 
     return ax_map, ax_legend, ax_table
 
-"""
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _geom_to_xy(coords):
+    xs = [c[0] for c in coords]
+    ys = [c[1] for c in coords]
+    return xs, ys
+
+
+def _iter_polygons(geom):
+    if geom is None or geom.is_empty:
+        return []
+    if geom.geom_type == "Polygon":
+        return [geom]
+    if geom.geom_type == "MultiPolygon":
+        return list(geom.geoms)
+    return []
+
+
 # ── Map panel ─────────────────────────────────────────────────────────────────
 def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
     geom = shape(geojson_feature["geometry"])
@@ -142,7 +159,6 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
 
     pad_x = (maxx - minx) * 0.15 if (maxx - minx) > 0 else 0.01
     pad_y = (maxy - miny) * 0.15 if (maxy - miny) > 0 else 0.01
-
     xlim = (minx - pad_x, maxx + pad_x)
     ylim = (miny - pad_y, maxy + pad_y)
 
@@ -152,49 +168,97 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
     ax.set_axisbelow(True)
     ax.grid(True, color=PALETTE["grid"], linewidth=0.5, linestyle="--", alpha=0.7)
 
-    if geom.geom_type == "Polygon":
-        geoms_list = [geom]
-    elif geom.geom_type == "MultiPolygon":
-        geoms_list = list(geom.geoms)
-    else:
-        geoms_list = []
+    # ── 1. DYNAMICALLY PLOT INTERSECTED CANOPY POLYGONS ──
+    fcm_gdfs = results.get("_raw_fcm_gdfs", [])
+    if fcm_gdfs:
+        for gdf in fcm_gdfs:
+            if gdf is None or gdf.empty:
+                continue
 
-    fcm = results.get("fcm", {})
-    dominant_name = fcm.get("dominant", "Non-Forest")
-    class_id = next(
-        (cid for cid, name in FCM_CLASSES.items() if name == dominant_name),
-        5,
-    )
-    shade_color = FCM_COLORS.get(class_id, "#e8e8e8")
+            if getattr(gdf, "crs", None) and gdf.crs.to_string() != "EPSG:4326":
+                gdf = gdf.to_crs("EPSG:4326")
+
+            for _, row in gdf.iterrows():
+                fcm_geom = row.geometry
+                if fcm_geom is None or fcm_geom.is_empty:
+                    continue
+
+                fcm_parts = _iter_polygons(fcm_geom)
+                if not fcm_parts:
+                    continue
+
+                class_attr = str(row.get("class_name", "")).strip().upper()
+
+                if "VDF" in class_attr or "VERY DENSE" in class_attr:
+                    poly_color = FCM_COLORS.get(1, "#004d1a")
+                elif "MDF" in class_attr or "MODERATELY DENSE" in class_attr:
+                    poly_color = FCM_COLORS.get(2, "#009933")
+                elif "OPEN" in class_attr or "OF" in class_attr:
+                    poly_color = FCM_COLORS.get(3, "#66ff66")
+                elif "SCRUB" in class_attr:
+                    poly_color = FCM_COLORS.get(4, "#cc9966")
+                elif "WATER" in class_attr:
+                    poly_color = "#3399ff"
+                else:
+                    poly_color = "#a3c2c2"
+
+                for f_part in fcm_parts:
+                    f_coords = list(f_part.exterior.coords)
+                    f_xs, f_ys = _geom_to_xy(f_coords)
+                    ax.fill(
+                        f_xs,
+                        f_ys,
+                        color=poly_color,
+                        alpha=0.65,
+                        linewidth=0,
+                        zorder=2,
+                    )
+
+                    for ring in f_part.interiors:
+                        hole_coords = list(ring.coords)
+                        hole_xs, hole_ys = _geom_to_xy(hole_coords)
+                        ax.fill(
+                            hole_xs,
+                            hole_ys,
+                            color=ax.get_facecolor(),
+                            linewidth=0,
+                            zorder=2.5,
+                        )
+
+    # ── 2. PLOT RED VECTOR STUDY BOUNDARY OVER THE TOP ──
+    geoms_list = _iter_polygons(geom)
 
     for part in geoms_list:
-        exterior = list(part.exterior.coords)
-        xs = [c[0] for c in exterior]
-        ys = [c[1] for c in exterior]
+        coords = list(part.exterior.coords)
+        xs, ys = _geom_to_xy(coords)
 
-        ax.fill(xs, ys, color=shade_color, alpha=0.35, linewidth=0, zorder=2)
-        ax.fill(xs, ys, color=PALETTE["poly_fill"], linewidth=0, alpha=0.6, zorder=3)
-
-        for ring in part.interiors:
-            ring_coords = list(ring.coords)
-            hole_x = [c[0] for c in ring_coords]
-            hole_y = [c[1] for c in ring_coords]
-            ax.fill(
-                hole_x,
-                hole_y,
-                color=ax.get_facecolor(),
-                linewidth=0,
-                zorder=3.5,
-            )
-
+        ax.fill(
+            xs,
+            ys,
+            color=PALETTE["poly_fill"],
+            linewidth=0,
+            alpha=0.15,
+            zorder=3,
+        )
         ax.plot(
             xs,
             ys,
             color=PALETTE["poly_edge"],
-            linewidth=2.0,
+            linewidth=2.5,
             solid_capstyle="round",
             zorder=4,
         )
+
+        for ring in part.interiors:
+            hole_coords = list(ring.coords)
+            hole_xs, hole_ys = _geom_to_xy(hole_coords)
+            ax.fill(
+                hole_xs,
+                hole_ys,
+                color=ax.get_facecolor(),
+                linewidth=0,
+                zorder=3.5,
+            )
 
     ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.4f°E"))
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.4f°N"))
@@ -206,91 +270,9 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
     ax.set_aspect("equal")
     ax.set_xlabel("Longitude", fontsize=8, color=PALETTE["text_mid"])
     ax.set_ylabel("Latitude", fontsize=8, color=PALETTE["text_mid"])
-  """
-def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
-    geom = shape(geojson_feature["geometry"])
-    minx, miny, maxx, maxy = geom.bounds
 
-    # Add 15% padding around the geometry bounding context box
-    pad_x = (maxx - minx) * 0.15 if (maxx - minx) > 0 else 0.01
-    pad_y = (maxy - miny) * 0.15 if (maxy - miny) > 0 else 0.01
-    xlim  = (minx - pad_x, maxx + pad_x)
-    ylim  = (miny - pad_y, maxy + pad_y)
-
-    # Light grey background grid setup
-    ax.set_xlim(*xlim)
-    ax.set_ylim(*ylim)
-    ax.set_facecolor("#e8ede8")
-    ax.grid(True, color=PALETTE["grid"], linewidth=0.5, linestyle="--", alpha=0.7)
-
-    # ── 1. DYNAMICALLY DRAW INTERSECTED FOREST CANOPY CLASSES ──
-    # Retrieve the live intersected canopy pieces we collected during the analysis phase
-    fcm_gdfs = results.get("_raw_fcm_gdfs", [])
-    
-    if fcm_gdfs:
-        for gdf in fcm_gdfs:
-            if gdf.empty:
-                continue
-            # Ensure the layer coordinates match WGS84 mapping coordinates
-            if gdf.crs and gdf.crs.to_string() != "EPSG:4326":
-                gdf = gdf.to_crs("EPSG:4326")
-                
-            for _, row in gdf.iterrows():
-                fcm_geom = row.geometry
-                if not fcm_geom or fcm_geom.is_empty:
-                    continue
-                    
-                # Extract the class name string (e.g., "VDF", "MDF", "OF", "Scrub")
-                class_attr = str(row.get("class_name", "")).strip().upper()
-                
-                # Dynamic Color Matcher based on your existing setup rules
-                if "VERY DENSE" in class_attr or "VDF" in class_attr:
-                    poly_color = FCM_COLORS.get(1, "#004d1a")  # Deep Dark Green
-                elif "MODERATELY DENSE" in class_attr or "MDF" in class_attr:
-                    poly_color = FCM_COLORS.get(2, "#009933")  # Medium Green
-                elif "OPEN" in class_attr or "OF" in class_attr:
-                    poly_color = FCM_COLORS.get(3, "#66ff66")  # Light Lime Green
-                elif "SCRUB" in class_attr:
-                    poly_color = FCM_COLORS.get(4, "#cc9966")  # Bush Brown
-                else:
-                    poly_color = "#a3c2c2" # Non-forest fallback tint
-
-                # Plot the individual forest cover sub-polygon chunks
-                fcm_parts = [fcm_geom] if fcm_geom.geom_type == "Polygon" else list(fcm_geom.geoms)
-                for f_part in fcm_parts:
-                    f_coords = list(f_part.exterior.coords)
-                    f_xs = [c for c in f_coords]
-                    f_ys = [c for c in f_coords]
-                    ax.fill(f_xs, f_ys, color=poly_color, alpha=0.6, linewidth=0, zorder=2)
-
-    # ── 2. DRAW THE RED STUDY AREA BOUNDARY LINE OVER THE CANOPY ──
-    geoms_list = [geom] if geom.geom_type == "Polygon" else list(geom.geoms)
-    for part in geoms_list:
-        coords = list(part.exterior.coords)
-        xs = [c for c in coords] 
-        ys = [c for c in coords] 
-        
-        # Translucent white mask to separate user focus boundary from outside grid blocks
-        ax.fill(xs, ys, color=PALETTE["poly_fill"], linewidth=0, alpha=0.2, zorder=3)
-        # Vector crisp perimeter red outer line plot
-        ax.plot(xs, ys, color=PALETTE["poly_edge"], linewidth=2.5, solid_capstyle="round", zorder=4)
-
-    # Coordinate grid labels
-    ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.4f°E"))
-    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.4f°N"))
-    ax.tick_params(axis="both", labelsize=7, color=PALETTE["text_mid"])
-
-    # Scale bar & North arrow assets
-    _draw_scale_bar(ax, xlim, ylim)
-    _draw_north_arrow(ax, xlim, ylim)
-
-    ax.set_aspect("equal")
-    ax.set_xlabel("Longitude", fontsize=8, color=PALETTE["text_mid"])
-    ax.set_ylabel("Latitude",  fontsize=8, color=PALETTE["text_mid"])
-  
 
 def _draw_scale_bar(ax, xlim, ylim) -> None:
-    """Dynamic scale bar calculated from degree span."""
     span_deg = xlim[1] - xlim[0]
     y_span = ylim[1] - ylim[0]
     mid_lat = (ylim[0] + ylim[1]) / 2
@@ -340,7 +322,6 @@ def _draw_scale_bar(ax, xlim, ylim) -> None:
 
 
 def _draw_north_arrow(ax, xlim, ylim) -> None:
-    """Simple north arrow in the top-right corner of the map."""
     x_span = xlim[1] - xlim[0]
     y_span = ylim[1] - ylim[0]
 
@@ -386,7 +367,7 @@ def _draw_legend(ax, results: dict) -> None:
     )
 
     y = 0.92
-    dy = 0.09
+    dy = 0.08
 
     ax.text(
         0.05,
@@ -401,16 +382,16 @@ def _draw_legend(ax, results: dict) -> None:
     y -= dy * 0.7
 
     fcm_classes = results.get("fcm", {}).get("classes", {})
-    for class_name, color in FCM_COLORS.items():
-        label = FCM_CLASSES[class_name]
+
+    for class_id in sorted(FCM_COLORS):
+        color = FCM_COLORS[class_id]
+        label = FCM_CLASSES.get(class_id, str(class_id))
         pct = fcm_classes.get(label, {}).get("percentage", 0.0)
-        if pct == 0.0 and label not in fcm_classes:
-            continue
 
         patch = mpatches.Rectangle(
-            (0.05, y - 0.025),
+            (0.05, y - 0.022),
             0.10,
-            0.048,
+            0.044,
             transform=ax.transAxes,
             facecolor=color,
             edgecolor="#555",
@@ -428,7 +409,30 @@ def _draw_legend(ax, results: dict) -> None:
         )
         y -= dy
 
-    y -= dy * 0.4
+    if "Water Body" in fcm_classes or results.get("_has_water"):
+        water_pct = fcm_classes.get("Water Body", {}).get("percentage", 0.0)
+        patch = mpatches.Rectangle(
+            (0.05, y - 0.022),
+            0.10,
+            0.044,
+            transform=ax.transAxes,
+            facecolor="#3399ff",
+            edgecolor="#555",
+            linewidth=0.5,
+        )
+        ax.add_patch(patch)
+        ax.text(
+            0.20,
+            y,
+            f"Water Body ({water_pct:.1f}%)",
+            fontsize=7,
+            color=PALETTE["text_dark"],
+            transform=ax.transAxes,
+            va="center",
+        )
+        y -= dy
+
+    y -= dy * 0.2
     ax.plot(
         [0.05, 0.15],
         [y, y],
@@ -446,7 +450,7 @@ def _draw_legend(ax, results: dict) -> None:
         va="center",
     )
 
-    y -= dy * 1.4
+    y -= dy * 1.1
     ax.text(
         0.05,
         y,
@@ -457,7 +461,7 @@ def _draw_legend(ax, results: dict) -> None:
         transform=ax.transAxes,
         va="top",
     )
-    y -= dy * 0.7
+    y -= dy * 0.6
 
     for source in ["FSI Forest Cover Map", "SRTM DEM (30m)", "User-provided boundary"]:
         ax.text(
@@ -469,7 +473,7 @@ def _draw_legend(ax, results: dict) -> None:
             transform=ax.transAxes,
             va="top",
         )
-        y -= dy * 0.65
+        y -= dy * 0.55
 
     y -= dy * 0.3
     ax.text(
@@ -595,13 +599,10 @@ def _draw_title(fig: Figure, filename: str) -> None:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def _round_to_nice(val: float) -> float:
-    """Round a value to a 'nice' number (1, 2, 5, 10, 20, 50 …)."""
     if val <= 0:
         return 1.0
-
     magnitude = 10 ** math.floor(math.log10(val))
     residual = val / magnitude
-
     if residual < 1.5:
         return 1 * magnitude
     elif residual < 3.5:
