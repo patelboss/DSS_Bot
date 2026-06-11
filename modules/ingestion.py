@@ -15,6 +15,7 @@ import gc
 import ctypes
 from datetime import datetime, timezone
 from pathlib import Path
+
 import geopandas as gpd
 import pandas as pd
 import fiona
@@ -25,30 +26,10 @@ from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 
 from config import cfg
-from modules.database import _get_db      # Dynamic helper targeting your active Atlas DB
-from modules.storage import _get_supabase # Supabase client handler
-import resource
+from modules.database import _get_db
+from modules.storage import _get_supabase
 
-def mem_mb():
-    try:
-        with open("/proc/self/status") as f:
-           # logger.info(open("/proc/self/status").read())
-            for line in f:
-                if line.startswith("VmRSS:"):
-                    kb_val = int(line.split()[1])
-                    logger.info(line.strip())
-                    return kb_val / 1024.0
-    except Exception as e:
-        logger.exception("mem_mb code exception")
-        pass
 
-    import resource
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
-
-def log_mem(stage: str) -> None:
-    logger.info(
-        f"🧠 MEMORY [{stage}] RSS={mem_mb():.1f} MB"
-    )
 logger = logging.getLogger("main.ingestion")
 logger.setLevel(logging.INFO)
 
@@ -58,6 +39,30 @@ if not logger.handlers:
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     stdout_handler.setFormatter(formatter)
     logger.addHandler(stdout_handler)
+
+
+def mem_mb() -> float:
+    """
+    Returns the current Resident Set Size (RSS) memory
+    of the active Linux container process in MB.
+    """
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    kb_val = int(line.split()[1])
+                    logger.info(line.strip())
+                    return kb_val / 1024.0
+    except Exception as e:
+        logger.exception("mem_mb code exception: %s", e)
+
+    import resource
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+
+
+def log_mem(stage: str) -> None:
+    logger.info("🧠 MEMORY [%s] RSS=%.1f MB", stage, mem_mb())
+
 
 # ── OPTIMIZATION 1: Native Memory Trim Handler ────────────────────────────────
 def release_memory() -> None:
@@ -72,22 +77,69 @@ def release_memory() -> None:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         pass
-        
+
     try:
         after = mem_mb()
     except Exception:
         after = 0.0
 
-    logger.info(
-        f"🧹 MEMORY RECLAIM | before={before:.1f} MB | after={after:.1f} MB"
-    )
-    
+    logger.info("🧹 MEMORY RECLAIM | before=%.1f MB | after=%.1f MB", before, after)
+
+
+def _parse_limit_offset(args: list[str]) -> tuple[int | None, int]:
+    """
+    Supports:
+      /upload_master FCM
+      /upload_master FCM 50 100
+      /upload_master FCM --limit 50 --offset 100
+      /upload_master FCM --offset 100 --limit 50
+    """
+    limit = None
+    offset = 0
+
+    tokens = args[2:]
+    positional: list[str] = []
+
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i].strip()
+        if tok in {"--limit", "-l"}:
+            if i + 1 >= len(tokens):
+                raise ValueError("Missing value after --limit.")
+            limit = int(tokens[i + 1])
+            i += 2
+            continue
+        if tok in {"--offset", "-o"}:
+            if i + 1 >= len(tokens):
+                raise ValueError("Missing value after --offset.")
+            offset = int(tokens[i + 1])
+            i += 2
+            continue
+        positional.append(tok)
+        i += 1
+
+    if positional:
+        if limit is None and len(positional) >= 1:
+            limit = int(positional[0])
+        if len(positional) >= 2:
+            offset = int(positional[1])
+
+    if limit is not None and limit <= 0:
+        raise ValueError("limit must be greater than 0.")
+    if offset < 0:
+        raise ValueError("offset must be 0 or greater.")
+
+    return limit, offset
+
 
 @Client.on_message(filters.command("upload_master") & filters.private)
 async def cmd_upload_master(client: Client, message: Message) -> None:
     """
-    Admin Command: /upload_master [DATA_TYPE] (Sent as a reply to a document)
+    Admin Command: /upload_master [DATA_TYPE] [LIMIT] [OFFSET]
+    or: /upload_master [DATA_TYPE] --limit N --offset M
+
     Slices vector layers by grid framework with strict batch-clearing resets.
+    LIMIT and OFFSET let you resume/backup ingestion from a selected grid window.
     """
     if not message.reply_to_message or not message.reply_to_message.document:
         logger.warning("❌ Ingestion Rejected: Command executed without replying to a valid file document.")
@@ -95,8 +147,10 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             "⚠️ *Usage Instruction:*\n\n"
             "1. Upload your master vector file.\n"
             "2. Reply to that file.\n"
-            "3. Send `/upload_master FCM` (or FTM, DEM).",
-            parse_mode=ParseMode.MARKDOWN
+            "3. Send `/upload_master FCM` (or FTM, DEM).\n\n"
+            "Optional backup/resume window:\n"
+            "`/upload_master FCM --limit 50 --offset 100`",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
@@ -107,7 +161,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         await message.reply_text(
             "⚠️ Missing data type variable.\n"
             "Usage: Reply with `/upload_master FCM`, `FTM`, or `DEM`",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
@@ -115,7 +169,16 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
     if data_type not in {"FCM", "FTM", "DEM"}:
         await message.reply_text(
             "⚠️ Invalid DATA_TYPE.\nUsage: `/upload_master FCM`, `FTM`, or `DEM`",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    try:
+        limit, offset = _parse_limit_offset(args)
+    except Exception as parse_err:
+        await message.reply_text(
+            f"⚠️ Invalid limit/offset values.\n\n`{parse_err}`",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
@@ -124,15 +187,16 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
     suffix = Path(safe_filename).suffix.lower()
 
     logger.info("==========================================================================")
-    logger.info(f"🚀 INGESTION TRIGGERED | Type: {data_type} | Target Asset Name: {safe_filename}")
-    logger.info(f"📦 Pyrogram Document File ID Pointer: {document.file_id}")
+    logger.info("🚀 INGESTION TRIGGERED | Type: %s | Target Asset Name: %s", data_type, safe_filename)
+    logger.info("📦 Pyrogram Document File ID Pointer: %s", document.file_id)
+    logger.info("🧭 Window Settings | limit=%s | offset=%s", str(limit), offset)
     logger.info("==========================================================================")
 
     if suffix not in {".geojson", ".gpkg", ".zip"}:
-        logger.warning(f"❌ Ingestion Rejected: File extension '{suffix}' is unsupported.")
+        logger.warning("❌ Ingestion Rejected: File extension '%s' is unsupported.", suffix)
         await message.reply_text(
             "⚠️ Unsupported master format. Use `.geojson`, `.gpkg`, or shapefile `.zip`.",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
@@ -144,7 +208,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
 
     status_msg = await message.reply_text(
         f"⏳ *Initializing MTProto channel-drive pipeline for master {data_type} ingestion…*",
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode=ParseMode.MARKDOWN,
     )
     sys.stdout.flush()
 
@@ -156,44 +220,57 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         grid_path = tmp_dir / "state_fishnet_grid.gpkg"
 
         # Download Master Vector Dataset
-        logger.info(f"📥 Downloading raw file asset '{safe_filename}' via Pyrogram client...")
+        logger.info("📥 Downloading raw file asset '%s' via Pyrogram client...", safe_filename)
         await status_msg.edit_text(
             f"📥 *Downloading master {data_type} vector layer from Telegram updates…*",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
         )
         await client.download_media(message.reply_to_message, file_name=str(master_path))
         log_mem("MASTER FILE DOWNLOADED")
-        logger.info(f"💾 Local download locked in. Path: {master_path} | Size: {os.path.getsize(master_path) / (1024*1024):.2f} MB")
+        logger.info(
+            "💾 Local download locked in. Path: %s | Size: %.2f MB",
+            master_path,
+            os.path.getsize(master_path) / (1024 * 1024),
+        )
 
         # Download Framework Grid
-        logger.info(f"🛰 Fetching structural grid 'state_grid.gpkg' from Supabase Bucket...")
+        logger.info("🛰 Fetching structural grid 'state_grid.gpkg' from Supabase Bucket...")
         await status_msg.edit_text(
             "🛰 *Streaming Master Fishnet Grid framework from Supabase Storage…*",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
         )
         supabase = _get_supabase()
         with open(grid_path, "wb") as f:
             res = supabase.storage.from_(cfg.SUPABASE_BUCKET).download("state_grid.gpkg")
             f.write(res)
-        logger.info(f"📐 Framework grid downloaded. Path: {grid_path} | Size: {os.path.getsize(grid_path) / (1024*1024):.2f} MB")
+        logger.info(
+            "📐 Framework grid downloaded. Path: %s | Size: %.2f MB",
+            grid_path,
+            os.path.getsize(grid_path) / (1024 * 1024),
+        )
 
-        # ── OPTIMIZATION 2: Load Only Required Grid Columns ──────────────────
+        # Load only required grid columns
         grid_gdf = gpd.read_file(str(grid_path))
         required_cols = ["TopoSheet_No", "geometry"]
         grid_gdf = grid_gdf[required_cols].copy()
-        logger.info(f"📊 Grid Records initialized: {len(grid_gdf)} mapping cells available.")
+        logger.info("📊 Grid Records initialized: %d mapping cells available.", len(grid_gdf))
 
         final_master_source = master_path
         if suffix == ".zip":
             logger.info("🗜 Expanding zipped shapefile archive contents...")
             with zipfile.ZipFile(master_path, "r") as zip_ref:
                 zip_ref.extractall(tmp_dir)
-            shp_files = [s for s in tmp_dir.glob("**/*.shp") if s.is_file() and not s.name.startswith("._")]
+
+            shp_files = [
+                s for s in tmp_dir.glob("**/*.shp")
+                if s.is_file() and not s.name.startswith("._")
+            ]
             if not shp_files:
                 raise ValueError("No valid .shp file found inside uploaded archive package.")
             if len(shp_files) > 1:
-                logger.warning(f"Multiple shapefiles found in archive. Using first: {shp_files}")
-            final_master_source = shp_files
+                logger.warning("Multiple shapefiles found in archive. Using first: %s", shp_files)
+
+            final_master_source = shp_files[0]
 
         with fiona.open(str(final_master_source)) as src:
             master_crs = src.crs_wkt or src.crs
@@ -201,9 +278,30 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         if not master_crs:
             raise ValueError("Master dataset does not contain a valid CRS definition.")
 
-        # ── OPTIMIZATION 3: Pre-project the full grid frame ONCE ──────────────
+        # Pre-project the full grid frame ONCE
         logger.info("📐 Computing uniform matrix coordinate transformations...")
         grid_master_crs = grid_gdf.to_crs(master_crs)
+
+        # Apply backup/resume window here
+        total_grid_cells = len(grid_gdf)
+        start_idx = min(offset, total_grid_cells)
+        end_idx = total_grid_cells if limit is None else min(start_idx + limit, total_grid_cells)
+
+        if start_idx >= total_grid_cells:
+            raise ValueError(
+                f"Offset {offset} is beyond available grid cells ({total_grid_cells})."
+            )
+
+        grid_gdf = grid_gdf.iloc[start_idx:end_idx].reset_index(drop=True)
+        grid_master_crs = grid_master_crs.iloc[start_idx:end_idx].reset_index(drop=True)
+
+        logger.info(
+            "🧭 Processing window applied | total=%d | start=%d | end=%d | selected=%d",
+            total_grid_cells,
+            start_idx,
+            end_idx,
+            len(grid_gdf),
+        )
 
         db = _get_db()
         collection_map = {"FCM": "fcm_layers", "FTM": "ftm_layers", "DEM": "dem_layers"}
@@ -211,14 +309,13 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         col = db[collection_name]
 
         success_count = 0
-        logger.info(f"✂️ Spatial streaming processes active. Target DB Collection: {collection_name}")
+        logger.info("✂️ Spatial streaming processes active. Target DB Collection: %s", collection_name)
 
         with fiona.open(str(final_master_source)) as source_stream:
             for idx, cell in grid_gdf.iterrows():
                 grid_id = str(cell["TopoSheet_No"])
                 cell_geom = cell.geometry
-                
-                # Retrieve bounding tuples directly from pre-projected index coordinates
+
                 cell_bbox = tuple(grid_master_crs.iloc[idx].geometry.bounds)
 
                 features_in_box = list(source_stream.filter(bbox=cell_bbox))
@@ -236,7 +333,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                     clipped_gdf["geometry"] = clipped_gdf.geometry.apply(make_valid)
                 except Exception:
                     clipped_gdf["geometry"] = clipped_gdf.geometry.buffer(0)
-                
+
                 clipped_gdf["geometry"] = clipped_gdf.geometry.intersection(cell_geom)
                 clipped_gdf = clipped_gdf[clipped_gdf.geometry.notnull()].copy()
                 clipped_gdf = clipped_gdf[~clipped_gdf.geometry.is_empty].copy()
@@ -254,37 +351,48 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                             f"✂️ *Slicing {data_type} vector assets safely…*\n\n"
                             f"📍 Active Segment: `Grid_{grid_id}`\n"
                             f"📦 Total Cached Parts: `{success_count}` chunks",
-                            parse_mode=ParseMode.MARKDOWN
+                            parse_mode=ParseMode.MARKDOWN,
                         )
                     except Exception:
                         pass
 
-                # ── OPTIMIZATION 4: Switch Chunk Storage to GeoPackage ────────
+                # Switch Chunk Storage to GeoPackage
                 chunk_filename = f"{data_type.lower()}_{grid_id}.gpkg"
                 chunk_filepath = tmp_dir / chunk_filename
                 clipped_gdf.to_file(str(chunk_filepath), driver="GPKG")
-                
-                # ── OPTIMIZATION 7: Prevent Dangerous Upload Configurations ──
+
+                # Prevent dangerous upload configurations
                 file_bytes_size = chunk_filepath.stat().st_size
                 if (file_bytes_size / (1024 * 1024)) > 250:
-                    logger.warning(f"⚠️ Chunk skipped: Segment `{grid_id}` ({file_bytes_size / (1024*1024):.1f} MB) exceeds safety threshold.")
+                    logger.warning(
+                        "⚠️ Chunk skipped: Segment `%s` (%.1f MB) exceeds safety threshold.",
+                        grid_id,
+                        file_bytes_size / (1024 * 1024),
+                    )
                     chunk_filepath.unlink(missing_ok=True)
                     continue
-                
+
                 chan_msg = None
                 while not chan_msg:
                     try:
-                        logger.info(f"📤 Uploading partition chunk: {chunk_filename} over to Channel ID: {CHANNEL_CHAT_ID}")
+                        logger.info("📤 Uploading partition chunk: %s over to Channel ID: %s", chunk_filename, CHANNEL_CHAT_ID)
                         chan_msg = await client.send_document(
                             chat_id=CHANNEL_CHAT_ID,
                             document=str(chunk_filepath),
-                            caption=f"📦 SDSS Production Master Part Asset\n• DataType: {data_type}\n• Partition Index: {grid_id}"
+                            caption=(
+                                f"📦 SDSS Production Master Part Asset\n"
+                                f"• DataType: {data_type}\n"
+                                f"• Partition Index: {grid_id}"
+                            ),
                         )
                     except FloodWait as flood_exception:
-                        logger.warning(f"⚠️ Telegram FloodWait triggered! Cooling down processing loops for {flood_exception.value} seconds.")
+                        logger.warning(
+                            "⚠️ Telegram FloodWait triggered! Cooling down processing loops for %s seconds.",
+                            flood_exception.value,
+                        )
                         await asyncio.sleep(flood_exception.value)
                     except Exception as upload_err:
-                        logger.error(f"❌ Aborting channel pipe send action sequence: {upload_err}")
+                        logger.error("❌ Aborting channel pipe send action sequence: %s", upload_err)
                         raise upload_err
 
                 payload = {
@@ -295,38 +403,44 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                     "file_id": chan_msg.document.file_id,
                     "file_name": chunk_filename,
                     "feature_count": len(clipped_gdf),
-                    "updated_at": datetime.now(timezone.utc)
+                    "updated_at": datetime.now(timezone.utc),
                 }
-                col.update_one({"grid_id": grid_id, "data_type": data_type}, {"$set": payload}, upsert=True)
-                
+                col.update_one(
+                    {"grid_id": grid_id, "data_type": data_type},
+                    {"$set": payload},
+                    upsert=True,
+                )
+
                 success_count += 1
                 chunk_filepath.unlink(missing_ok=True)
 
-                # ── OPTIMIZATION 5: Aggressive RAM Cleanup ────────────────────
+                # Aggressive RAM Cleanup
                 del clipped_gdf
                 del features_in_box
                 del cell_geom
                 release_memory()
 
-                # ── OPTIMIZATION 6: Reduce Batch Rejuvenation Size to 25 ──────
+                # Reduce batch rejuvenation size
                 if success_count % 25 == 0:
-                    logger.info(f"🧹 Batch target reached ({success_count} uploads). Pausing for glibc memory stabilization...")
+                    logger.info(
+                        "🧹 Batch target reached (%d uploads). Pausing for glibc memory stabilization...",
+                        success_count,
+                    )
                     try:
                         await status_msg.edit_text(
                             f"🧹 *Batch milestone reached (`{success_count}` parts)!*\n\n"
                             f"⏸️ Freezing ingestion pipeline to stabilize system allocation maps...",
-                            parse_mode=ParseMode.MARKDOWN
+                            parse_mode=ParseMode.MARKDOWN,
                         )
                     except Exception:
                         pass
-                    
+
                     release_memory()
                     await asyncio.sleep(1)
-
                 else:
                     await asyncio.sleep(0.01)
 
-        # ── OPTIMIZATION 8: Release Grid Reprojections on Completion ─────────
+        # Release Grid Reprojections on Completion
         del grid_gdf
         del grid_master_crs
         release_memory()
@@ -336,13 +450,14 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             f"✅ *Master Ingestion Pipeline Completed Successfully!*\n\n"
             f"🏷 *Data Type Index:* `{data_type}`\n"
             f"🧩 *Total Structural Part Segments Formed:* `{success_count}` chunks\n"
+            f"🧭 *Window:* `offset={offset}` `limit={limit if limit is not None else 'ALL'}`\n"
             f"🗂 *Target Registry Store:* MongoDB Cluster `[{collection_name}]`",
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
         )
 
     except Exception as pipeline_err:
         logger.error("A critical execution error derailed data ingestion pipeline.", exc_info=True)
-        if 'status_msg' in locals():
+        if "status_msg" in locals():
             await status_msg.edit_text(f"❌ Master Ingestion Pipeline Crashed: {pipeline_err}")
     finally:
         try:
@@ -370,11 +485,11 @@ async def cmd_manual_broadcast(client: Client, message: Message) -> None:
     else:
         CHANNEL_CHAT_ID = raw_channel_id
 
-    logger.info(f"📣 Manual broadcast triggered. Destination target peer index: {CHANNEL_CHAT_ID}")
+    logger.info("📣 Manual broadcast triggered. Destination target peer index: %s", CHANNEL_CHAT_ID)
 
     message_text_raw = message.text or ""
     parts = message_text_raw.split(maxsplit=1)
-    text_content = parts if len(parts) > 1 else ""
+    text_content = parts[1] if len(parts) > 1 else ""
 
     try:
         if message.reply_to_message:
@@ -392,22 +507,24 @@ async def cmd_manual_broadcast(client: Client, message: Message) -> None:
             else:
                 await message.reply_text("⚠️ Manual forward failed: Unsupported media type detected.")
                 return
-        
+
         elif text_content:
             await client.send_message(chat_id=CHANNEL_CHAT_ID, text=text_content)
-        
+
         else:
             await message.reply_text(
                 "⚠️ *Usage Instruction:*\n\n"
                 "• Send `/post Your Message Here` to dispatch text directly.\n"
                 "• Reply to a photo, document, or video with `/post` to broadcast media.",
-                parse_mode=ParseMode.MARKDOWN
+                parse_mode=ParseMode.MARKDOWN,
             )
             return
 
-        await message.reply_text(f"🚀 *Broadcast dispatched safely to target chat peer:* `{CHANNEL_CHAT_ID}`", parse_mode=ParseMode.MARKDOWN)
+        await message.reply_text(
+            f"🚀 *Broadcast dispatched safely to target chat peer:* `{CHANNEL_CHAT_ID}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
     except Exception as broadcast_err:
         logger.error("Diagnostic broadcast execution derailed.", exc_info=True)
         await message.reply_text(f"❌ *Broadcast delivery failed:* `{broadcast_err}`", parse_mode=ParseMode.MARKDOWN)
-
