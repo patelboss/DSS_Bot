@@ -64,7 +64,6 @@ def log_mem(stage: str) -> None:
     logger.info("🧠 MEMORY [%s] RSS=%.1f MB", stage, mem_mb())
 
 
-# ── OPTIMIZATION 1: Native Memory Trim Handler ────────────────────────────────
 def release_memory() -> None:
     """Forces Python garbage collection and clears glibc memory arenas."""
     try:
@@ -93,6 +92,9 @@ def _parse_limit_offset(args: list[str]) -> tuple[int | None, int]:
       /upload_master FCM 50 100
       /upload_master FCM --limit 50 --offset 100
       /upload_master FCM --offset 100 --limit 50
+
+    limit = number of valid chunks to upload after offset.
+    offset = number of valid chunks to skip before starting uploads.
     """
     limit = None
     offset = 0
@@ -138,9 +140,10 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
     Admin Command: /upload_master [DATA_TYPE] [LIMIT] [OFFSET]
     or: /upload_master [DATA_TYPE] --limit N --offset M
 
-    Slices vector layers by grid framework with strict batch-clearing resets.
-    LIMIT and OFFSET are applied as a processing window, while skipped grids are
-    still logged so you can trace what was bypassed.
+    LIMIT/OFFSET are applied on VALID CHUNKS, not grid cells.
+    That means:
+      offset=150 -> skip first 150 non-empty clipped chunks
+      limit=50    -> upload next 50 non-empty clipped chunks
     """
     if not message.reply_to_message or not message.reply_to_message.document:
         logger.warning("❌ Ingestion Rejected: Command executed without replying to a valid file document.")
@@ -220,7 +223,6 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         master_path = tmp_dir / safe_filename
         grid_path = tmp_dir / "state_fishnet_grid.gpkg"
 
-        # Download Master Vector Dataset
         logger.info("📥 Downloading raw file asset '%s' via Pyrogram client...", safe_filename)
         await status_msg.edit_text(
             f"📥 *Downloading master {data_type} vector layer from Telegram updates…*",
@@ -234,7 +236,6 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             os.path.getsize(master_path) / (1024 * 1024),
         )
 
-        # Download Framework Grid
         logger.info("🛰 Fetching structural grid 'state_grid.gpkg' from Supabase Bucket...")
         await status_msg.edit_text(
             "🛰 *Streaming Master Fishnet Grid framework from Supabase Storage…*",
@@ -250,7 +251,6 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             os.path.getsize(grid_path) / (1024 * 1024),
         )
 
-        # Load only required grid columns
         grid_gdf = gpd.read_file(str(grid_path))
         required_cols = ["TopoSheet_No", "geometry"]
         grid_gdf = grid_gdf[required_cols].copy()
@@ -280,35 +280,25 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         if not master_crs:
             raise ValueError("Master dataset does not contain a valid CRS definition.")
 
-        # Pre-project the full grid frame ONCE
         logger.info("📐 Computing uniform matrix coordinate transformations...")
         grid_master_crs = grid_gdf.to_crs(master_crs)
-
-        total_grid_cells = len(grid_gdf)
-        start_idx = min(offset, total_grid_cells)
-        end_idx = total_grid_cells if limit is None else min(start_idx + limit, total_grid_cells)
-
-        if start_idx >= total_grid_cells:
-            raise ValueError(
-                f"Offset {offset} is beyond available grid cells ({total_grid_cells})."
-            )
-
-        logger.info(
-            "🧭 Processing window applied | total=%d | start=%d | end=%d | selected=%d",
-            total_grid_cells,
-            start_idx,
-            end_idx,
-            end_idx - start_idx,
-        )
 
         db = _get_db()
         collection_map = {"FCM": "fcm_layers", "FTM": "ftm_layers", "DEM": "dem_layers"}
         collection_name = collection_map[data_type]
         col = db[collection_name]
 
-        success_count = 0
-        processed_window = 0
-        skipped_window = 0
+        total_grid_cells = len(grid_gdf)
+        logger.info("🧭 Grid scan prepared | total_cells=%d | chunk_offset=%s | chunk_limit=%s",
+                    total_grid_cells,
+                    offset,
+                    limit if limit is not None else "ALL")
+
+        success_count = 0              # uploaded chunks after offset
+        candidate_chunks = 0          # non-empty clipped chunks encountered
+        skipped_by_offset = 0
+        skipped_empty = 0
+        skipped_existing = 0
 
         logger.info("✂️ Spatial streaming processes active. Target DB Collection: %s", collection_name)
 
@@ -317,32 +307,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 grid_id = str(getattr(cell, "TopoSheet_No"))
                 cell_geom = getattr(cell, "geometry")
 
-                if pos < start_idx:
-                    skipped_window += 1
-                    if pos < 3 or (start_idx and pos % 100 == 0):
-                        logger.info(
-                            "OFFSET_SKIP | pos=%d | grid_id=%s | phase=offset | skipped=%d/%d",
-                            pos,
-                            grid_id,
-                            skipped_window,
-                            start_idx,
-                        )
-                    continue
-
-                if pos >= end_idx:
-                    logger.info(
-                        "WINDOW_END | pos=%d | end=%d | processed=%d | skipped=%d",
-                        pos,
-                        end_idx,
-                        processed_window,
-                        skipped_window,
-                    )
-                    break
-
-                processed_window += 1
-
-                cell_bounds = grid_master_crs.iloc[pos].geometry.bounds
-                cell_bbox = tuple(cell_bounds)
+                cell_bbox = tuple(grid_master_crs.iloc[pos].geometry.bounds)
 
                 logger.info(
                     "GRID_BEGIN | pos=%d | grid_id=%s | bbox=(%.6f, %.6f, %.6f, %.6f) | rss=%.1f MB",
@@ -364,6 +329,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 )
 
                 if not features_in_box:
+                    skipped_empty += 1
                     logger.info("GRID_EMPTY | grid_id=%s | no source features in bbox", grid_id)
                     continue
 
@@ -391,11 +357,42 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 )
 
                 if clipped_gdf.empty:
+                    skipped_empty += 1
                     logger.info("GRID_SKIP | grid_id=%s | empty after clip", grid_id)
                     del clipped_gdf
                     del cell_geom
                     release_memory()
                     continue
+
+                candidate_chunks += 1
+
+                if candidate_chunks <= offset:
+                    skipped_by_offset += 1
+                    logger.info(
+                        "CHUNK_OFFSET_SKIP | chunk_no=%d | offset=%d | grid_id=%s | rows=%d",
+                        candidate_chunks,
+                        offset,
+                        grid_id,
+                        len(clipped_gdf),
+                    )
+                    del clipped_gdf
+                    del cell_geom
+                    release_memory()
+                    continue
+
+                if limit is not None and success_count >= limit:
+                    logger.info(
+                        "LIMIT_REACHED | uploaded=%d | limit=%d | stopping scan",
+                        success_count,
+                        limit,
+                    )
+                    del clipped_gdf
+                    del cell_geom
+                    release_memory()
+                    break
+
+                chunk_no = candidate_chunks
+                upload_no = success_count + 1
 
                 for col_name in clipped_gdf.columns:
                     if isinstance(clipped_gdf[col_name].dtype, pd.StringDtype):
@@ -406,16 +403,25 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                         await status_msg.edit_text(
                             f"✂️ *Slicing {data_type} vector assets safely…*\n\n"
                             f"📍 Active Segment: `Grid_{grid_id}`\n"
-                            f"📦 Total Cached Parts: `{success_count}` chunks\n"
+                            f"📦 Uploaded Chunks: `{success_count}`\n"
+                            f"🧩 Valid Chunks Seen: `{candidate_chunks}`\n"
                             f"🧭 Window: `offset={offset}` `limit={limit if limit is not None else 'ALL'}`",
                             parse_mode=ParseMode.MARKDOWN,
                         )
                     except Exception:
                         pass
 
-                # Switch Chunk Storage to GeoPackage
                 chunk_filename = f"{data_type.lower()}_{grid_id}.gpkg"
                 chunk_filepath = tmp_dir / chunk_filename
+
+                logger.info(
+                    "CHUNK_READY | chunk_no=%d | upload_no=%d | grid_id=%s | rows=%d | rss=%.1f MB",
+                    chunk_no,
+                    upload_no,
+                    grid_id,
+                    len(clipped_gdf),
+                    mem_mb(),
+                )
 
                 clipped_gdf.to_file(str(chunk_filepath), driver="GPKG")
                 file_bytes_size = chunk_filepath.stat().st_size
@@ -426,7 +432,6 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                     file_bytes_size / (1024 * 1024),
                 )
 
-                # Prevent dangerous upload configurations
                 if (file_bytes_size / (1024 * 1024)) > 250:
                     logger.warning(
                         "⚠️ Chunk skipped: Segment `%s` (%.1f MB) exceeds safety threshold.",
@@ -454,6 +459,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                                 f"📦 SDSS Production Master Part Asset\n"
                                 f"• DataType: {data_type}\n"
                                 f"• Partition Index: {grid_id}\n"
+                                f"• Chunk No: {chunk_no}\n"
                                 f"• Window Offset: {offset}\n"
                                 f"• Window Limit: {limit if limit is not None else 'ALL'}"
                             ),
@@ -477,6 +483,9 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                     "file_name": chunk_filename,
                     "feature_count": len(clipped_gdf),
                     "updated_at": datetime.now(timezone.utc),
+                    "chunk_no": chunk_no,
+                    "offset": offset,
+                    "limit": limit,
                 }
                 col.update_one(
                     {"grid_id": grid_id, "data_type": data_type},
@@ -485,23 +494,21 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 )
 
                 logger.info(
-                    "GRID_INDEX_SAVED | grid_id=%s | file_id=%s | message_id=%s | features=%d",
+                    "GRID_INDEX_SAVED | grid_id=%s | file_id=%s | message_id=%s | features=%d | chunk_no=%d",
                     grid_id,
                     chan_msg.document.file_id,
                     chan_msg.id,
                     len(clipped_gdf),
+                    chunk_no,
                 )
 
                 success_count += 1
                 chunk_filepath.unlink(missing_ok=True)
 
-                # Aggressive RAM Cleanup
                 del clipped_gdf
-                del features_in_box
                 del cell_geom
                 release_memory()
 
-                # Progress marker
                 if success_count % 25 == 0:
                     logger.info(
                         "🧹 Batch target reached (%d uploads). Pausing for glibc memory stabilization...",
@@ -522,16 +529,34 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 else:
                     await asyncio.sleep(0.01)
 
-        # Release Grid Reprojections on Completion
+                if limit is not None and success_count >= limit:
+                    logger.info(
+                        "LIMIT_REACHED | uploaded=%d | limit=%d | stopping scan",
+                        success_count,
+                        limit,
+                    )
+                    break
+
         del grid_gdf
         del grid_master_crs
         release_memory()
+
+        logger.info(
+            "INGESTION_SUMMARY | uploaded=%d | chunk_candidates=%d | skipped_offset=%d | skipped_empty=%d | skipped_existing=%d",
+            success_count,
+            candidate_chunks,
+            skipped_by_offset,
+            skipped_empty,
+            skipped_existing,
+        )
 
         await status_msg.delete()
         await message.reply_text(
             f"✅ *Master Ingestion Pipeline Completed Successfully!*\n\n"
             f"🏷 *Data Type Index:* `{data_type}`\n"
-            f"🧩 *Total Structural Part Segments Formed:* `{success_count}` chunks\n"
+            f"🧩 *Total Uploaded Chunks:* `{success_count}`\n"
+            f"📦 *Valid Chunk Candidates Seen:* `{candidate_chunks}`\n"
+            f"⏭ *Skipped by Offset:* `{skipped_by_offset}`\n"
             f"🧭 *Window:* `offset={offset}` `limit={limit if limit is not None else 'ALL'}`\n"
             f"🗂 *Target Registry Store:* MongoDB Cluster `[{collection_name}]`",
             parse_mode=ParseMode.MARKDOWN,
@@ -551,7 +576,6 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         sys.stdout.flush()
 
 
-# ── Manual Diagnostics & Broadcasting Interface ──────────────────────────────
 @Client.on_message(filters.command("post") & filters.private)
 async def cmd_manual_broadcast(client: Client, message: Message) -> None:
     """
