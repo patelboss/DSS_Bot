@@ -289,10 +289,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         col = db[collection_name]
 
         total_grid_cells = len(grid_gdf)
-        logger.info("🧭 Grid scan prepared | total_cells=%d | chunk_offset=%s | chunk_limit=%s",
-                    total_grid_cells,
-                    offset,
-                    limit if limit is not None else "ALL")
+        logger.info("🧭 Grid scan prepared | total_cells=%d | chunk_offset=%s | chunk_limit=%s",total_grid_cells,offset, limit if limit is not None else "ALL")
 
         success_count = 0              # uploaded chunks after offset
         candidate_chunks = 0          # non-empty clipped chunks encountered
@@ -418,9 +415,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                                 f"📦 SDSS Production Master Part Asset\n"
                                 f"• DataType: {data_type}\n"
                                 f"• Partition Index: {grid_id}\n"
-                                f"• Chunk No: {chunk_no}\n"
-                                f"• Window Offset: {offset}\n"
-                                f"• Window Limit: {limit if limit is not None else 'ALL'}"
+                                f"• Chunk No: {chunk_no}"
                             ),
                         )
                     except FloodWait as flood_exception:
