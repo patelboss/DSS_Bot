@@ -325,7 +325,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                         elif "WATER" in c_str:
                             standard_label = "WATER"
                         else:
-                            standard_label = "No Data"
+                            standard_label = "NO-DATA"
 
                         c_pct = (class_ha / calculated_area_ha) * 100.0 if calculated_area_ha else 0.0
                         fcm_class_summary[standard_label] = {
