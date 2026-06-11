@@ -193,7 +193,9 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
                     poly_color = FCM_COLORS.get(1, "#004d1a")
                 elif "MDF" in class_attr or "MODERATELY DENSE" in class_attr:
                     poly_color = FCM_COLORS.get(2, "#009933")
-                elif "OPEN" in class_attr or "OF" in class_attr:
+                elif "OPEN FOREST" in class_attr or "OF" in class_attr:
+                    poly_color = FCM_COLORS.get(3, "#66ff66")
+                elif "NOM FOREST" in class_attr or "OF" in class_attr:
                     poly_color = FCM_COLORS.get(3, "#66ff66")
                 elif "SCRUB" in class_attr:
                     poly_color = FCM_COLORS.get(4, "#cc9966")
