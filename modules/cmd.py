@@ -312,20 +312,20 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                     for raw_class, class_ha in grouped.items():
                         c_str = str(raw_class).strip().upper()
 
-                        if "VDF" in c_str or "VERY DENSE" in c_str:
+                        if "VDF" in c_str:
                             standard_label = "Very Dense Forest"
-                        elif "MDF" in c_str or "MODERATELY DENSE" in c_str:
+                        elif "MDF" in c_str:
                             standard_label = "Moderately Dense Forest"
-                        elif "OPEN FOREST" in c_str or "OF" in c_str:
+                        elif "OPEN FOREST" in c_str:
                             standard_label = "Open Forest"
                         elif "NON FOREST" in c_str:
                             standard_label = "Non Forest"
                         elif "SCRUB" in c_str:
                             standard_label = "Scrub"
                         elif "WATER" in c_str:
-                            standard_label = "Water / No Data"
+                            standard_label = "Water"
                         else:
-                            standard_label = "Non-Forest"
+                            standard_label = "No Data"
 
                         c_pct = (class_ha / calculated_area_ha) * 100.0 if calculated_area_ha else 0.0
                         fcm_class_summary[standard_label] = {
