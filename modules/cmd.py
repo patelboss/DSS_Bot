@@ -209,10 +209,15 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
             if not user_gdf.crs:
                 user_gdf.set_crs("EPSG:4326", inplace=True)
 
-            user_geom = user_gdf.unary_union
-
-            user_utm = user_gdf.to_crs(epsg=32644)
-            calculated_area_ha = float(user_utm.geometry.area.sum() / 10000.0)
+            #user_geom = user_gdf.unary_union
+            #user_utm = user_gdf.to_crs(epsg=32644)
+            #calculated_area_ha = float(user_utm.geometry.area.sum() / 10000.0)
+            for poly_index, row in user_gdf.iterrows():
+                user_geom = row.geometry
+                single_gdf = gpd.GeoDataFrame(
+                    [row], columns=user_gdf.columns, crs=user_gdf.crs)
+                user_utm = single_gdf.to_crs(epsg=32644)
+                calculated_area_ha = float(user_utm.geometry.area.sum() / 10000.0 )
 
             await status_msg.edit_text("🛰 *Aligning layout against Spatial Mesh Framework Grid…*")
             from modules.storage import _get_supabase
