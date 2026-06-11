@@ -173,6 +173,8 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
 
     # ── 1. DYNAMICALLY PLOT INTERSECTED CANOPY POLYGONS ──
     fcm_gdfs = results.get("_raw_fcm_gdfs", [])
+    log.info("MAP_TRACE | raw_gdfs=%d | rows=%s",len(fcm_gdfs),[len(gdf) for gdf in fcm_gdfs])
+  
     if fcm_gdfs:
         for gdf in fcm_gdfs:
             if gdf is None or gdf.empty:
@@ -277,8 +279,7 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict) -> None:
     ax.set_aspect("equal")
     ax.set_xlabel("Longitude", fontsize=8, color=PALETTE["text_mid"])
     ax.set_ylabel("Latitude", fontsize=8, color=PALETTE["text_mid"])
-    log.info("MAP_TRACE | raw_gdfs=%d | rows=%s",len(fcm_gdfs),[len(gdf) for gdf in fcm_gdfs])
-
+ 
 
 
 def _draw_scale_bar(ax, xlim, ylim) -> None:
