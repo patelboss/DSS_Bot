@@ -29,24 +29,21 @@ from modules.database import _get_db      # Dynamic helper targeting your active
 from modules.storage import _get_supabase # Supabase client handler
 import resource
 
-def mem_mb() -> float:
-    """
-    Returns the TRUE, real-time Resident Set Size (RSS) memory 
-    of the active Linux container process in Megabytes.
-    """
+def mem_mb():
     try:
-        with open("/proc/self/status", "r") as f:
+        with open("/proc/self/status") as f:
+           # logger.info(open("/proc/self/status").read())
             for line in f:
                 if line.startswith("VmRSS:"):
-                    # Extract the numeric kilobyte value from lines like: VmRSS:   265412 kB
-                    kb_val = float(line.split())
+                    kb_val = int(line.split()[1])
+                    logger.info(line.strip())
                     return kb_val / 1024.0
-    except Exception:
+    except Exception as e:
+        logger.exception("mem_mb code exception")
         pass
-    # Fallback to high-water mark if /proc is unavailable
+
     import resource
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
-
 
 def log_mem(stage: str) -> None:
     logger.info(
