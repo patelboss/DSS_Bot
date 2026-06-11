@@ -313,17 +313,17 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                         c_str = str(raw_class).strip().upper()
 
                         if "VDF" in c_str:
-                            standard_label = "Very Dense Forest"
+                            standard_label = "VDF"
                         elif "MDF" in c_str:
-                            standard_label = "Moderately Dense Forest"
+                            standard_label = "MDF"
                         elif "OPEN FOREST" in c_str:
-                            standard_label = "Open Forest"
+                            standard_label = "OPEN FOREST"
                         elif "NON FOREST" in c_str:
-                            standard_label = "Non Forest"
+                            standard_label = "NON FOREST"
                         elif "SCRUB" in c_str:
-                            standard_label = "Scrub"
+                            standard_label = "SCRUB"
                         elif "WATER" in c_str:
-                            standard_label = "Water"
+                            standard_label = "WATER"
                         else:
                             standard_label = "No Data"
 
