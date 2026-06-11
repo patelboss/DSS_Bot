@@ -83,19 +83,21 @@ cfg = Config()
 
 # ── Forest Cover class mapping (FSI legend) ───────────────────────────────────
 FCM_CLASSES: dict[int, str] = {
-    1: "Very Dense Forest",
-    2: "Moderately Dense Forest",
-    3: "Open Forest",
-    4: "Scrub",
-    5: "Non-Forest",
-    0: "Water / No Data",
+    0: "NO DATA",
+    1: "VDF",
+    2: "MDF",
+    3: "OPEN FOREST",
+    4: "NON FOREST",
+    5: "SCRUB",
+    6: "Water",
 }
 
 FCM_COLORS: dict[int, str] = {
-    1: "#1a6e1a",
-    2: "#4daf4a",
-    3: "#a8d96c",
-    4: "#d9c46c",
-    5: "#e8e8e8",
-    0: "#6aafd6",
+    0: "#25a8a8",
+    1: "#07380e",
+    2: "#17d133",
+    3: "#c1c70e",
+    4: "#8c8c88",
+    5: "#ab180e",
+    6: "#5064fa",
 }
