@@ -488,7 +488,8 @@ def _draw_legend(ax, results: dict) -> None:
         transform=ax.transAxes,
         va="top",
         )
-  """
+  
+"""
 # ── Legend panel ──────────────────────────────────────────────────────────────
 def _draw_legend(ax, results: dict) -> None:
     ax.set_xticks([])
