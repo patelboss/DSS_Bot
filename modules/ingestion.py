@@ -309,24 +309,10 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
 
                 cell_bbox = tuple(grid_master_crs.iloc[pos].geometry.bounds)
 
-                logger.info(
-                    "GRID_BEGIN | pos=%d | grid_id=%s | bbox=(%.6f, %.6f, %.6f, %.6f) | rss=%.1f MB",
-                    pos,
-                    grid_id,
-                    cell_bbox[0],
-                    cell_bbox[1],
-                    cell_bbox[2],
-                    cell_bbox[3],
-                    mem_mb(),
-                )
+                #logger.info( "GRID_BEGIN | pos=%d | grid_id=%s | bbox=(%.6f, %.6f, %.6f, %.6f) | rss=%.1f MB", pos,grid_id,cell_bbox[0],cell_bbox[1],cell_bbox[2],cell_bbox[3],mem_mb(),)
 
                 features_in_box = list(source_stream.filter(bbox=cell_bbox))
-                logger.info(
-                    "GRID_QUERY | grid_id=%s | candidates=%d | bbox=%s",
-                    grid_id,
-                    len(features_in_box),
-                    cell_bbox,
-                )
+                #logger.info("GRID_QUERY | grid_id=%s | candidates=%d | bbox=%s",grid_id,len(features_in_box),cell_bbox,)
 
                 if not features_in_box:
                     skipped_empty += 1
@@ -349,16 +335,11 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 clipped_gdf = clipped_gdf[clipped_gdf.geometry.notnull()].copy()
                 clipped_gdf = clipped_gdf[~clipped_gdf.geometry.is_empty].copy()
 
-                logger.info(
-                    "GRID_CLIP | grid_id=%s | clipped_rows=%d | mem=%.1f MB",
-                    grid_id,
-                    len(clipped_gdf),
-                    mem_mb(),
-                )
+                #logger.info("GRID_CLIP | grid_id=%s | clipped_rows=%d | mem=%.1f MB",grid_id,len(clipped_gdf),mem_mb(),)
 
                 if clipped_gdf.empty:
                     skipped_empty += 1
-                    logger.info("GRID_SKIP | grid_id=%s | empty after clip", grid_id)
+                   # logger.info("GRID_SKIP | grid_id=%s | empty after clip", grid_id)
                     del clipped_gdf
                     del cell_geom
                     release_memory()
@@ -368,24 +349,14 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
 
                 if candidate_chunks <= offset:
                     skipped_by_offset += 1
-                    logger.info(
-                        "CHUNK_OFFSET_SKIP | chunk_no=%d | offset=%d | grid_id=%s | rows=%d",
-                        candidate_chunks,
-                        offset,
-                        grid_id,
-                        len(clipped_gdf),
-                    )
+                    #logger.info("CHUNK_OFFSET_SKIP | chunk_no=%d | offset=%d | grid_id=%s | rows=%d",candidate_chunks,offset,grid_id,len(clipped_gdf),)
                     del clipped_gdf
                     del cell_geom
                     release_memory()
                     continue
 
                 if limit is not None and success_count >= limit:
-                    logger.info(
-                        "LIMIT_REACHED | uploaded=%d | limit=%d | stopping scan",
-                        success_count,
-                        limit,
-                    )
+                    #logger.info("LIMIT_REACHED | uploaded=%d | limit=%d | stopping scan",success_count,limit,)
                     del clipped_gdf
                     del cell_geom
                     release_memory()
@@ -414,23 +385,11 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
                 chunk_filename = f"{data_type.lower()}_{grid_id}.gpkg"
                 chunk_filepath = tmp_dir / chunk_filename
 
-                logger.info(
-                    "CHUNK_READY | chunk_no=%d | upload_no=%d | grid_id=%s | rows=%d | rss=%.1f MB",
-                    chunk_no,
-                    upload_no,
-                    grid_id,
-                    len(clipped_gdf),
-                    mem_mb(),
-                )
+                #logger.info("CHUNK_READY | chunk_no=%d | upload_no=%d | grid_id=%s | rows=%d | rss=%.1f MB",chunk_no,upload_no,grid_id,len(clipped_gdf), mem_mb(),)
 
                 clipped_gdf.to_file(str(chunk_filepath), driver="GPKG")
                 file_bytes_size = chunk_filepath.stat().st_size
-                logger.info(
-                    "GRID_WRITE | grid_id=%s | chunk=%s | size=%.2f MB",
-                    grid_id,
-                    chunk_filename,
-                    file_bytes_size / (1024 * 1024),
-                )
+                logger.info("GRID_WRITE | grid_id=%s | chunk=%s | size=%.2f MB", grid_id,chunk_filename,file_bytes_size / (1024 * 1024),                )
 
                 if (file_bytes_size / (1024 * 1024)) > 250:
                     logger.warning(
