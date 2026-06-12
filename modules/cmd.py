@@ -5,26 +5,25 @@ runs localized vector analytics within tight 512MB RAM constraints, and flushes 
 """
 
 import io
-import logging
-import sys
-import asyncio
 import gc
-import tempfile
+import logging
 import shutil
-from pathlib import Path
+import sys
+import tempfile
 from datetime import datetime
+from pathlib import Path
 
-import pandas as pd
 import geopandas as gpd
-from shapely.geometry import mapping
+import pandas as pd
 from pyrogram import Client, filters
-from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.enums import ParseMode, ChatAction
+from pyrogram.enums import ChatAction, ParseMode
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from shapely.geometry import mapping
 
 from config import cfg
-from modules.database import _get_db, upsert_user, log_analysis
-from modules.spatial_analysis import load_vector_file
+from modules.database import _get_db, log_analysis, upsert_user
 from modules.map_renderer import render_map
+from modules.spatial_analysis import load_vector_file
 
 logger = logging.getLogger("main.commands")
 logger.setLevel(logging.INFO)
@@ -36,20 +35,27 @@ if not logger.handlers:
     )
     logger.addHandler(stdout_handler)
 
-# Runtime cache replacing python-telegram-bot's user_data context
 USER_SESSION_CACHE = {}
 
 
 def _align_gdf_crs(gdf: gpd.GeoDataFrame, target_crs) -> gpd.GeoDataFrame:
-    """Return GeoDataFrame aligned to target CRS without mutating caller state."""
+    """Return a CRS-aligned copy without mutating caller state."""
+    if gdf is None or gdf.empty:
+        return gdf
+
     if gdf.crs is None:
         return gdf.set_crs(target_crs)
-    if gdf.crs != target_crs:
-        return gdf.to_crs(target_crs)
+
+    try:
+        if gdf.crs.to_string().upper() != str(target_crs).upper():
+            return gdf.to_crs(target_crs)
+    except Exception:
+        if str(gdf.crs).upper() != str(target_crs).upper():
+            return gdf.to_crs(target_crs)
+
     return gdf
 
 
-# ── /start ────────────────────────────────────────────────────────────────────
 @Client.on_message(filters.command("start") & filters.private)
 async def cmd_start(client: Client, message: Message) -> None:
     user = message.from_user
@@ -72,7 +78,6 @@ async def cmd_start(client: Client, message: Message) -> None:
     sys.stdout.flush()
 
 
-# ── /help ─────────────────────────────────────────────────────────────────────
 @Client.on_message(filters.command("help") & filters.private)
 async def cmd_help(client: Client, message: Message) -> None:
     text = (
@@ -94,7 +99,6 @@ async def cmd_help(client: Client, message: Message) -> None:
     sys.stdout.flush()
 
 
-# ── Vector File Document Catch Mechanism ──────────────────────────────────────
 @Client.on_message(filters.document & filters.private)
 async def handle_document(client: Client, message: Message) -> None:
     document = message.document
@@ -123,7 +127,6 @@ async def handle_document(client: Client, message: Message) -> None:
         geojson_feature, gdf_attributes = load_vector_file(tmp_path)
         attr_df = gdf_attributes.drop(columns=["geometry"], errors="ignore")
 
-        # Store both for backward compatibility and the new per-polygon workflow.
         USER_SESSION_CACHE[user.id] = {
             "current_feature": geojson_feature,
             "current_gdf": gdf_attributes,
@@ -153,11 +156,10 @@ async def handle_document(client: Client, message: Message) -> None:
             await status_msg.edit_text(f"❌ *Vector ingestion failed:* {exc}", parse_mode=ParseMode.MARKDOWN)
     finally:
         if tmp_path.exists():
-            tmp_path.unlink()
+            tmp_path.unlink(missing_ok=True)
         sys.stdout.flush()
 
 
-# ── Interactive Callback Menu Router ──────────────────────────────────────────
 @Client.on_callback_query()
 async def handle_button_click(client: Client, callback_query: CallbackQuery) -> None:
     await callback_query.answer()
@@ -226,20 +228,20 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
             await client.send_chat_action(chat_id=user.id, action=ChatAction.TYPING)
             db = _get_db()
 
-            # Work with all uploaded features individually.
             uploaded_gdf = uploaded_gdf.copy()
             if uploaded_gdf.crs is None:
                 uploaded_gdf.set_crs("EPSG:4326", inplace=True)
 
             uploaded_gdf = uploaded_gdf.explode(index_parts=False).reset_index(drop=True)
+            uploaded_gdf = uploaded_gdf[uploaded_gdf.geometry.notnull() & ~uploaded_gdf.geometry.is_empty].copy()
 
             if uploaded_gdf.empty:
                 await status_msg.edit_text(
-                    "⚠️ *Analysis Completed:* The uploaded file contains no valid polygon features."
+                    "⚠️ *Analysis Completed:* The uploaded file contains no valid polygon features.",
+                    parse_mode=ParseMode.MARKDOWN,
                 )
                 return
 
-            # Download the framework grid once and reuse it for every polygon.
             await status_msg.edit_text("🛰 *Aligning layout against Spatial Mesh Framework Grid…*")
             from modules.storage import _get_supabase
             supabase = _get_supabase()
@@ -270,7 +272,6 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                     user_utm = single_gdf.to_crs(epsg=32644)
                     calculated_area_ha = float(user_utm.geometry.area.sum() / 10000.0)
 
-                    # Render in WGS84 for map display, regardless of source CRS.
                     render_gdf = _align_gdf_crs(single_gdf.copy(), "EPSG:4326")
                     render_geom = render_gdf.geometry.iloc[0]
 
@@ -284,7 +285,8 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                     }
 
                     await status_msg.edit_text(
-                        f"📍 *Processing polygon `{polygon_number}/{polygon_total}`…*"
+                        f"📍 *Processing polygon `{polygon_number}/{polygon_total}`…*",
+                        parse_mode=ParseMode.MARKDOWN,
                     )
 
                     intersecting_cells = grid_gdf[grid_gdf.geometry.intersects(user_geom)]
@@ -306,7 +308,8 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
 
                     await status_msg.edit_text(
                         f"📍 *Polygon `{polygon_number}/{polygon_total}`* "
-                        f"intersects `{len(target_grid_ids)}` framework grid indices…"
+                        f"intersects `{len(target_grid_ids)}` framework grid indices…",
+                        parse_mode=ParseMode.MARKDOWN,
                     )
 
                     fcm_intersected_gdfs = []
@@ -314,7 +317,6 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                     dem_intersected_gdfs = []
 
                     for grid_id in target_grid_ids:
-                        # ── TASK LAYER 1: FCM ──
                         fcm_doc = db.fcm_layers.find_one({"grid_id": grid_id, "data_type": "FCM"})
                         if fcm_doc:
                             fcm_local = tmp_workspace / f"fcm_{grid_id}.gpkg"
@@ -326,7 +328,6 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                                 fcm_intersected_gdfs.append(clip_part)
                             fcm_local.unlink(missing_ok=True)
 
-                        # ── TASK LAYER 2: FTM ──
                         ftm_doc = db.ftm_layers.find_one({"grid_id": grid_id, "data_type": "FTM"})
                         if ftm_doc:
                             ftm_local = tmp_workspace / f"ftm_{grid_id}.gpkg"
@@ -338,7 +339,6 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                                 ftm_intersected_gdfs.append(clip_part)
                             ftm_local.unlink(missing_ok=True)
 
-                        # ── TASK LAYER 3: DEM ──
                         dem_doc = db.dem_layers.find_one({"grid_id": grid_id, "data_type": "DEM"})
                         if dem_doc:
                             dem_local = tmp_workspace / f"dem_{grid_id}.gpkg"
@@ -359,10 +359,11 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                         f"📊 *Total Boundary Area:* `{calculated_area_ha:.2f} ha`\n\n"
                     )
 
-                    # ── FCM ANALYSIS BLOCK ──
                     fcm_class_summary = {}
                     dominant_cover_type = "NON FOREST"
                     passed_fcm_list = []
+                    passed_dem_list = []
+                    dem_metrics = {}
 
                     if fcm_intersected_gdfs:
                         fcm_compiled = pd.concat(fcm_intersected_gdfs, ignore_index=True)
@@ -432,7 +433,6 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                         report_text += "🌲 *Forest Canopy Cover (FCM):*\n"
                         report_text += "• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
 
-                    # ── FTM ANALYSIS BLOCK ──
                     if ftm_intersected_gdfs:
                         ftm_compiled = pd.concat(ftm_intersected_gdfs, ignore_index=True)
                         ftm_compiled["geometry"] = ftm_compiled.geometry.intersection(user_geom)
@@ -448,40 +448,58 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                         report_text += "🌿 *Forest Type Mapping (FTM):*\n"
                         report_text += "• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
 
-                    # ── DEM ANALYSIS BLOCK ──
                     if dem_intersected_gdfs:
                         dem_compiled = pd.concat(dem_intersected_gdfs, ignore_index=True)
+                        logger.info("DEM Columns = %s", dem_compiled.columns.tolist())
+                        logger.info("DEM Sample = %s", dem_compiled.head(3).to_dict("records"))
+
                         elev_col = next(
                             (c for c in dem_compiled.columns if c.lower() in {"elevation", "elev", "contour", "z"}),
                             None,
                         )
+
                         if elev_col:
-                            mean_val = pd.to_numeric(dem_compiled[elev_col], errors="coerce").mean()
-                            max_val = pd.to_numeric(dem_compiled[elev_col], errors="coerce").max()
-                            min_val = pd.to_numeric(dem_compiled[elev_col], errors="coerce").min()
+                            dem_compiled["geometry"] = dem_compiled.geometry.intersection(user_geom)
+                            dem_compiled = dem_compiled[~dem_compiled.geometry.is_empty].copy()
+                            dem_compiled = dem_compiled[
+                                dem_compiled.geometry.geom_type.isin(["LineString", "MultiLineString", "Polygon", "MultiPolygon"])
+                            ].copy()
 
-                            dem_metrics = {
-                                "elevation_min_m": round(float(min_val), 1),
-                                "elevation_max_m": round(float(max_val), 1),
-                                "elevation_mean_m": round(float(mean_val), 1),
-                                "slope_mean_deg": "—",
-                                "slope_max_deg": "—",
-                            }
+                            if not dem_compiled.empty:
+                                elev_series = pd.to_numeric(dem_compiled[elev_col], errors="coerce").dropna()
 
-                            report_text += "⛰️ *Topographic Elevation Profiles (DEM):*\n"
-                            report_text += f"• Intersecting Mean Elevation: `{mean_val:.1f} m`\n"
-                            report_text += f"• Maximum Vertex Elevation Peak: `{max_val:.1f} m`\n"
-                            report_text += "• Processing Status: `[Natively Evaluated]` ✅\n\n"
+                                if not elev_series.empty:
+                                    mean_val = elev_series.mean()
+                                    max_val = elev_series.max()
+                                    min_val = elev_series.min()
+
+                                    dem_metrics = {
+                                        "elevation_min_m": round(float(min_val), 1),
+                                        "elevation_max_m": round(float(max_val), 1),
+                                        "elevation_mean_m": round(float(mean_val), 1),
+                                        "slope_mean_deg": "—",
+                                        "slope_max_deg": "—",
+                                    }
+
+                                    report_text += "⛰️ *Topographic Elevation Profiles (DEM):*\n"
+                                    report_text += f"• Intersecting Mean Elevation: `{mean_val:.1f} m`\n"
+                                    report_text += f"• Maximum Vertex Elevation Peak: `{max_val:.1f} m`\n"
+                                    report_text += "• Processing Status: `[Natively Evaluated]` ✅\n\n"
+
+                                    passed_dem_list = [dem_compiled]
+                                else:
+                                    report_text += "⛰️ *Topographic Elevation Profiles (DEM):*\n"
+                                    report_text += "• Processing Status: `[Elevation values empty]` ⚠️\n\n"
+                            else:
+                                report_text += "⛰️ *Topographic Elevation Profiles (DEM):*\n"
+                                report_text += "• Processing Status: `[No contour geometry survived clipping]` ⚠️\n\n"
                         else:
-                            dem_metrics = {}
                             report_text += "⛰️ *Topographic Elevation Profiles (DEM):*\n"
                             report_text += "• Processing Status: `[Evaluated - No Elevation Attribute Columns Found]` ⚠️\n\n"
                     else:
-                        dem_metrics = {}
                         report_text += "⛰️ *Topographic Elevation Profiles (DEM):*\n"
                         report_text += "• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
 
-                    # ── RESULTS METADATA DICTIONARY ──
                     results = {
                         "area_ha": calculated_area_ha,
                         "centroid": [
@@ -494,10 +512,10 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                         },
                         "dem": dem_metrics,
                         "_raw_fcm_gdfs": passed_fcm_list,
+                        "_raw_dem_gdfs": passed_dem_list,
                         "_has_water": "WATER" in fcm_class_summary,
                     }
 
-                    # Save metrics trail per polygon
                     polygon_filename = f"{base_name}_polygon_{polygon_number}"
                     log_analysis(
                         user.id,
@@ -507,14 +525,14 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                         results["centroid"],
                     )
 
-                    # Render and send one report per polygon
                     try:
                         logger.info(
-                            "RENDER_TRACE | file=%s | area=%.2f | fcm_classes=%s | raw_gdfs=%d | rows=%s | class_names=%s",
+                            "RENDER_TRACE | file=%s | area=%.2f | fcm_classes=%s | raw_fcm_gdfs=%d | raw_dem_gdfs=%d | rows=%s | class_names=%s",
                             polygon_filename,
                             results.get("area_ha", 0),
                             list(results.get("fcm", {}).get("classes", {}).keys()),
                             len(results.get("_raw_fcm_gdfs", [])),
+                            len(results.get("_raw_dem_gdfs", [])),
                             [len(gdf) for gdf in results.get("_raw_fcm_gdfs", [])],
                             [
                                 gdf["class_name"].dropna().unique().tolist()
@@ -573,11 +591,10 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                 await status_msg.edit_text(f"❌ *Analysis Execution Failed:* {err}")
         finally:
             if tmp_workspace.exists():
-                shutil.rmtree(tmp_workspace)
+                shutil.rmtree(tmp_workspace, ignore_errors=True)
             gc.collect()
 
 
-# ── Plain text listener framework ─────────────────────────────────────────────
 @Client.on_message(filters.text & filters.private & ~filters.regex(r"^/"))
 async def catch_all_text(client: Client, message: Message) -> None:
     await message.reply_text(
