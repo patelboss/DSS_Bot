@@ -1,34 +1,37 @@
 """
 modules/ingestion.py — Production-Grade Admin Data Ingestion Pipeline.
 Capped for strict 512MB RAM constraints using pre-projected spatial arrays,
-libc malloc_trim memory reclamation, and compressed GeoPackage batching.
+libc malloc_trim memory reclamation, and compressed GeoPackage / GeoTIFF batching.
 """
 
+import asyncio
+import ctypes
+import gc
 import logging
-import sys
-import tempfile
 import os
 import shutil
+import sys
+import tempfile
 import zipfile
-import asyncio
-import gc
-import ctypes
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
-import geopandas as gpd
-import pandas as pd
 import fiona
-
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import rasterio
 from pyrogram import Client, filters
-from pyrogram.types import Message
 from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
+from pyrogram.types import Message
+from rasterio.mask import mask
+from shapely.geometry import box
 
 from config import cfg
 from modules.database import _get_db
 from modules.storage import _get_supabase
-
 
 logger = logging.getLogger("main.ingestion")
 logger.setLevel(logging.INFO)
@@ -85,7 +88,7 @@ def release_memory() -> None:
     logger.info("🧹 MEMORY RECLAIM | before=%.1f MB | after=%.1f MB", before, after)
 
 
-def _parse_limit_offset(args: list[str]) -> tuple[int | None, int]:
+def _parse_limit_offset(args: list[str]) -> tuple[Optional[int], int]:
     """
     Supports:
       /upload_master FCM
@@ -134,24 +137,51 @@ def _parse_limit_offset(args: list[str]) -> tuple[int | None, int]:
     return limit, offset
 
 
+def _normalize_channel_id() -> int | str:
+    raw_channel_id = str(cfg.TELEGRAM_CHANNEL_ID).strip()
+    try:
+        return int(raw_channel_id)
+    except ValueError:
+        return raw_channel_id
+
+
+def _align_gdf_crs(gdf: gpd.GeoDataFrame, target_crs) -> gpd.GeoDataFrame:
+    if gdf.crs is None:
+        return gdf.set_crs(target_crs)
+    if gdf.crs != target_crs:
+        return gdf.to_crs(target_crs)
+    return gdf
+
+
+def _safe_make_valid_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    try:
+        from shapely.validation import make_valid
+        gdf = gdf.copy()
+        gdf["geometry"] = gdf.geometry.apply(lambda geom: make_valid(geom) if geom is not None else None)
+        return gdf
+    except Exception:
+        return gdf
+
+
 @Client.on_message(filters.command("upload_master") & filters.private)
 async def cmd_upload_master(client: Client, message: Message) -> None:
     """
     Admin Command: /upload_master [DATA_TYPE] [LIMIT] [OFFSET]
     or: /upload_master [DATA_TYPE] --limit N --offset M
 
-    LIMIT/OFFSET are applied on VALID CHUNKS, not grid cells.
-    That means:
-      offset=150 -> skip first 150 non-empty clipped chunks
-      limit=50    -> upload next 50 non-empty clipped chunks
+    DATA_TYPE:
+      FCM  -> vector
+      FTM  -> vector
+      DEM  -> contour / vector DEM (existing flow)
+      DEMR -> raster DEM (new flow, GeoTIFF/TIFF)
     """
     if not message.reply_to_message or not message.reply_to_message.document:
         logger.warning("❌ Ingestion Rejected: Command executed without replying to a valid file document.")
         await message.reply_text(
             "⚠️ *Usage Instruction:*\n\n"
-            "1. Upload your master vector file.\n"
+            "1. Upload your master vector/raster file.\n"
             "2. Reply to that file.\n"
-            "3. Send `/upload_master FCM` (or FTM, DEM).\n\n"
+            "3. Send `/upload_master FCM` , `/upload_master FTM` , `/upload_master DEM` or `/upload_master DEMR`.\n\n"
             "Optional backup/resume window:\n"
             "`/upload_master FCM --limit 50 --offset 100`",
             parse_mode=ParseMode.MARKDOWN,
@@ -164,15 +194,15 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         logger.warning("❌ Ingestion Rejected: Missing DATA_TYPE parameter argument.")
         await message.reply_text(
             "⚠️ Missing data type variable.\n"
-            "Usage: Reply with `/upload_master FCM`, `FTM`, or `DEM`",
+            "Usage: Reply with `/upload_master FCM`, `FTM`, `DEM`, or `DEMR`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     data_type = args[1].strip().upper()
-    if data_type not in {"FCM", "FTM", "DEM"}:
+    if data_type not in {"FCM", "FTM", "DEM", "DEMR"}:
         await message.reply_text(
-            "⚠️ Invalid DATA_TYPE.\nUsage: `/upload_master FCM`, `FTM`, or `DEM`",
+            "⚠️ Invalid DATA_TYPE.\nUsage: `/upload_master FCM`, `FTM`, `DEM`, or `DEMR`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -196,19 +226,26 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
     logger.info("🧭 Window Settings | limit=%s | offset=%s", str(limit), offset)
     logger.info("==========================================================================")
 
-    if suffix not in {".geojson", ".gpkg", ".zip"}:
-        logger.warning("❌ Ingestion Rejected: File extension '%s' is unsupported.", suffix)
-        await message.reply_text(
-            "⚠️ Unsupported master format. Use `.geojson`, `.gpkg`, or shapefile `.zip`.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
+    vector_suffixes = {".geojson", ".json", ".kml", ".gpkg", ".kmz", ".zip"}
+    raster_suffixes = {".tif", ".tiff"}
 
-    try:
-        raw_channel_id = str(cfg.TELEGRAM_CHANNEL_ID).strip()
-        CHANNEL_CHAT_ID = int(raw_channel_id)
-    except ValueError:
-        CHANNEL_CHAT_ID = raw_channel_id
+    if data_type == "DEMR":
+        if suffix not in raster_suffixes:
+            await message.reply_text(
+                "⚠️ DEMR expects a raster file: `.tif` or `.tiff`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+    else:
+        if suffix not in vector_suffixes:
+            logger.warning("❌ Ingestion Rejected: File extension '%s' is unsupported.", suffix)
+            await message.reply_text(
+                "⚠️ Unsupported master format. Use `.geojson`, `.gpkg`, `.kml`, `.kmz`, or shapefile `.zip`.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+    CHANNEL_CHAT_ID = _normalize_channel_id()
 
     status_msg = await message.reply_text(
         f"⏳ *Initializing MTProto channel-drive pipeline for master {data_type} ingestion…*",
@@ -225,7 +262,7 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
 
         logger.info("📥 Downloading raw file asset '%s' via Pyrogram client...", safe_filename)
         await status_msg.edit_text(
-            f"📥 *Downloading master {data_type} vector layer from Telegram updates…*",
+            f"📥 *Downloading master {data_type} layer from Telegram updates…*",
             parse_mode=ParseMode.MARKDOWN,
         )
         await client.download_media(message.reply_to_message, file_name=str(master_path))
@@ -257,260 +294,49 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
         logger.info("📊 Grid Records initialized: %d mapping cells available.", len(grid_gdf))
         logger.info("📊 Grid Columns = %s", grid_gdf.columns.tolist())
 
-        final_master_source = master_path
-        if suffix == ".zip":
-            logger.info("🗜 Expanding zipped shapefile archive contents...")
-            with zipfile.ZipFile(master_path, "r") as zip_ref:
-                zip_ref.extractall(tmp_dir)
-
-            shp_files = [
-                s for s in tmp_dir.glob("**/*.shp")
-                if s.is_file() and not s.name.startswith("._")
-            ]
-            if not shp_files:
-                raise ValueError("No valid .shp file found inside uploaded archive package.")
-            if len(shp_files) > 1:
-                logger.warning("Multiple shapefiles found in archive. Using first: %s", shp_files)
-
-            final_master_source = shp_files[0]
-
-        with fiona.open(str(final_master_source)) as src:
-            master_crs = src.crs_wkt or src.crs
-
-        if not master_crs:
-            raise ValueError("Master dataset does not contain a valid CRS definition.")
-
-        logger.info("📐 Computing uniform matrix coordinate transformations...")
-        grid_master_crs = grid_gdf.to_crs(master_crs)
-
         db = _get_db()
-        collection_map = {"FCM": "fcm_layers", "FTM": "ftm_layers", "DEM": "dem_layers"}
-        collection_name = collection_map[data_type]
-        col = db[collection_name]
 
-        total_grid_cells = len(grid_gdf)
-        logger.info("🧭 Grid scan prepared | total_cells=%d | chunk_offset=%s | chunk_limit=%s",total_grid_cells,offset, limit if limit is not None else "ALL")
-
-        success_count = 0              # uploaded chunks after offset
-        candidate_chunks = 0          # non-empty clipped chunks encountered
-        skipped_by_offset = 0
-        skipped_empty = 0
-        skipped_existing = 0
-
-        logger.info("✂️ Spatial streaming processes active. Target DB Collection: %s", collection_name)
-
-        with fiona.open(str(final_master_source)) as source_stream:
-            for pos, cell in enumerate(grid_gdf.itertuples(index=False), start=0):
-                grid_id = str(getattr(cell, "TopoSheet_No"))
-                cell_geom = getattr(cell, "geometry")
-
-                cell_bbox = tuple(grid_master_crs.iloc[pos].geometry.bounds)
-
-                #logger.info( "GRID_BEGIN | pos=%d | grid_id=%s | bbox=(%.6f, %.6f, %.6f, %.6f) | rss=%.1f MB", pos,grid_id,cell_bbox[0],cell_bbox[1],cell_bbox[2],cell_bbox[3],mem_mb(),)
-
-                features_in_box = list(source_stream.filter(bbox=cell_bbox))
-                #logger.info("GRID_QUERY | grid_id=%s | candidates=%d | bbox=%s",grid_id,len(features_in_box),cell_bbox,)
-
-                if not features_in_box:
-                    skipped_empty += 1
-                    #logger.info("GRID_EMPTY | grid_id=%s | no source features in bbox", grid_id)
-                    continue
-
-                clipped_gdf = gpd.GeoDataFrame.from_features(features_in_box, crs=master_crs)
-                features_in_box.clear()
-
-                if clipped_gdf.crs != grid_gdf.crs:
-                    clipped_gdf = clipped_gdf.to_crs(grid_gdf.crs)
-
-                try:
-                    from shapely.validation import make_valid
-                    clipped_gdf["geometry"] = clipped_gdf.geometry.apply(make_valid)
-                except Exception:
-                    clipped_gdf["geometry"] = clipped_gdf.geometry.buffer(0)
-
-                clipped_gdf["geometry"] = clipped_gdf.geometry.intersection(cell_geom)
-                clipped_gdf = clipped_gdf[clipped_gdf.geometry.notnull()].copy()
-                clipped_gdf = clipped_gdf[~clipped_gdf.geometry.is_empty].copy()
-
-                #logger.info("GRID_CLIP | grid_id=%s | clipped_rows=%d | mem=%.1f MB",grid_id,len(clipped_gdf),mem_mb(),)
-
-                if clipped_gdf.empty:
-                    skipped_empty += 1
-                   # logger.info("GRID_SKIP | grid_id=%s | empty after clip", grid_id)
-                    del clipped_gdf
-                    del cell_geom
-                    release_memory()
-                    continue
-
-                candidate_chunks += 1
-
-                if candidate_chunks <= offset:
-                    skipped_by_offset += 1
-                    #logger.info("CHUNK_OFFSET_SKIP | chunk_no=%d | offset=%d | grid_id=%s | rows=%d",candidate_chunks,offset,grid_id,len(clipped_gdf),)
-                    del clipped_gdf
-                    del cell_geom
-                    release_memory()
-                    continue
-
-                if limit is not None and success_count >= limit:
-                    #logger.info("LIMIT_REACHED | uploaded=%d | limit=%d | stopping scan",success_count,limit,)
-                    del clipped_gdf
-                    del cell_geom
-                    release_memory()
-                    break
-
-                chunk_no = candidate_chunks
-                upload_no = success_count + 1
-
-                for col_name in clipped_gdf.columns:
-                    if isinstance(clipped_gdf[col_name].dtype, pd.StringDtype):
-                        clipped_gdf[col_name] = clipped_gdf[col_name].astype(object)
-
-                if success_count and success_count % 5 == 0:
-                    try:
-                        await status_msg.edit_text(
-                            f"✂️ *Slicing {data_type} vector assets safely…*\n\n"
-                            f"📍 Active Segment: `Grid_{grid_id}`\n"
-                            f"📦 Uploaded Chunks: `{success_count}`\n"
-                            f"🧩 Valid Chunks Seen: `{candidate_chunks}`\n"
-                            f"🧭 Window: `offset={offset}` `limit={limit if limit is not None else 'ALL'}`",
-                            parse_mode=ParseMode.MARKDOWN,
-                        )
-                    except Exception:
-                        pass
-
-                chunk_filename = f"{data_type.lower()}_{grid_id}.gpkg"
-                chunk_filepath = tmp_dir / chunk_filename
-
-                #logger.info("CHUNK_READY | chunk_no=%d | upload_no=%d | grid_id=%s | rows=%d | rss=%.1f MB",chunk_no,upload_no,grid_id,len(clipped_gdf), mem_mb(),)
-
-                clipped_gdf.to_file(str(chunk_filepath), driver="GPKG")
-                file_bytes_size = chunk_filepath.stat().st_size
-                logger.info("GRID_WRITE | grid_id=%s | chunk=%s | size=%.2f MB", grid_id,chunk_filename,file_bytes_size / (1024 * 1024),                )
-
-                if (file_bytes_size / (1024 * 1024)) > 250:
-                    logger.warning(
-                        "⚠️ Chunk skipped: Segment `%s` (%.1f MB) exceeds safety threshold.",
-                        grid_id,
-                        file_bytes_size / (1024 * 1024),
-                    )
-                    chunk_filepath.unlink(missing_ok=True)
-                    del clipped_gdf
-                    del cell_geom
-                    release_memory()
-                    continue
-
-                chan_msg = None
-                while not chan_msg:
-                    try:
-                        logger.info(
-                            "📤 Uploading partition chunk: %s over to Channel ID: %s",
-                            chunk_filename,
-                            CHANNEL_CHAT_ID,
-                        )
-                        chan_msg = await client.send_document(
-                            chat_id=CHANNEL_CHAT_ID,
-                            document=str(chunk_filepath),
-                            caption=(
-                                f"📦 SDSS Production Master Part Asset\n"
-                                f"• DataType: {data_type}\n"
-                                f"• Partition Index: {grid_id}\n"
-                                f"• Chunk No: {chunk_no}"
-                            ),
-                        )
-                    except FloodWait as flood_exception:
-                        logger.warning(
-                            "⚠️ Telegram FloodWait triggered! Cooling down processing loops for %s seconds.",
-                            flood_exception.value,
-                        )
-                        await asyncio.sleep(flood_exception.value)
-                    except Exception as upload_err:
-                        logger.error("❌ Aborting channel pipe send action sequence: %s", upload_err)
-                        raise upload_err
-
-                payload = {
-                    "grid_id": grid_id,
-                    "data_type": data_type,
-                    "channel_chat_id": str(CHANNEL_CHAT_ID),
-                    "channel_message_id": chan_msg.id,
-                    "file_id": chan_msg.document.file_id,
-                    "file_name": chunk_filename,
-                    "feature_count": len(clipped_gdf),
-                    "updated_at": datetime.now(timezone.utc),
-                    "chunk_no": chunk_no,
-                    "offset": offset,
-                    "limit": limit,
-                }
-                col.update_one(
-                    {"grid_id": grid_id, "data_type": data_type},
-                    {"$set": payload},
-                    upsert=True,
-                )
-
-                logger.info(
-                    "GRID_INDEX_SAVED | grid_id=%s | file_id=%s | message_id=%s | features=%d | chunk_no=%d",
-                    grid_id,
-                    chan_msg.document.file_id,
-                    chan_msg.id,
-                    len(clipped_gdf),
-                    chunk_no,
-                )
-
-                success_count += 1
-                chunk_filepath.unlink(missing_ok=True)
-
-                del clipped_gdf
-                del cell_geom
-                release_memory()
-
-                if success_count % 25 == 0:
-                    logger.info(
-                        "🧹 Batch target reached (%d uploads). Pausing for glibc memory stabilization...",
-                        success_count,
-                    )
-                    try:
-                        await status_msg.edit_text(
-                            f"🧹 *Batch milestone reached (`{success_count}` parts)!*\n\n"
-                            f"⏸️ Freezing ingestion pipeline to stabilize system allocation maps...\n"
-                            f"🧭 Window: `offset={offset}` `limit={limit if limit is not None else 'ALL'}`",
-                            parse_mode=ParseMode.MARKDOWN,
-                        )
-                    except Exception:
-                        pass
-
-                    release_memory()
-                    await asyncio.sleep(1)
-                else:
-                    await asyncio.sleep(0.01)
-
-                if limit is not None and success_count >= limit:
-                    logger.info(
-                        "LIMIT_REACHED | uploaded=%d | limit=%d | stopping scan",
-                        success_count,
-                        limit,
-                    )
-                    break
+        if data_type == "DEMR":
+            collection_name = "demr_layers"
+            col = db[collection_name]
+            await _ingest_raster_demr(
+                client=client,
+                status_msg=status_msg,
+                tmp_dir=tmp_dir,
+                raster_path=master_path,
+                grid_gdf=grid_gdf,
+                channel_chat_id=CHANNEL_CHAT_ID,
+                collection=col,
+                data_type=data_type,
+                filename=safe_filename,
+                offset=offset,
+                limit=limit,
+            )
+        else:
+            collection_map = {"FCM": "fcm_layers", "FTM": "ftm_layers", "DEM": "dem_layers"}
+            collection_name = collection_map[data_type]
+            col = db[collection_name]
+            await _ingest_vector_master(
+                client=client,
+                status_msg=status_msg,
+                tmp_dir=tmp_dir,
+                vector_path=master_path,
+                grid_gdf=grid_gdf,
+                channel_chat_id=CHANNEL_CHAT_ID,
+                collection=col,
+                data_type=data_type,
+                filename=safe_filename,
+                offset=offset,
+                limit=limit,
+            )
 
         del grid_gdf
-        del grid_master_crs
         release_memory()
-
-        logger.info(
-            "INGESTION_SUMMARY | uploaded=%d | chunk_candidates=%d | skipped_offset=%d | skipped_empty=%d | skipped_existing=%d",
-            success_count,
-            candidate_chunks,
-            skipped_by_offset,
-            skipped_empty,
-            skipped_existing,
-        )
 
         await status_msg.delete()
         await message.reply_text(
             f"✅ *Master Ingestion Pipeline Completed Successfully!*\n\n"
             f"🏷 *Data Type Index:* `{data_type}`\n"
-            f"🧩 *Total Uploaded Chunks:* `{success_count}`\n"
-            f"📦 *Valid Chunk Candidates Seen:* `{candidate_chunks}`\n"
-            f"⏭ *Skipped by Offset:* `{skipped_by_offset}`\n"
             f"🧭 *Window:* `offset={offset}` `limit={limit if limit is not None else 'ALL'}`\n"
             f"🗂 *Target Registry Store:* MongoDB Cluster `[{collection_name}]`",
             parse_mode=ParseMode.MARKDOWN,
@@ -528,6 +354,559 @@ async def cmd_upload_master(client: Client, message: Message) -> None:
             logger.exception("Failed to remove temporary directory workspace structures.")
         release_memory()
         sys.stdout.flush()
+
+
+async def _ingest_vector_master(
+    client: Client,
+    status_msg: Message,
+    tmp_dir: Path,
+    vector_path: Path,
+    grid_gdf: gpd.GeoDataFrame,
+    channel_chat_id: int | str,
+    collection,
+    data_type: str,
+    filename: str,
+    offset: int,
+    limit: Optional[int],
+) -> None:
+    safe_filename = Path(filename).name
+    suffix = vector_path.suffix.lower()
+
+    final_master_source: Path = vector_path
+    if suffix == ".kmz":
+        raise ValueError("KMZ should be converted before this stage by the vector loader.")
+    if suffix == ".zip":
+        logger.info("🗜 Expanding zipped shapefile archive contents...")
+        with zipfile.ZipFile(vector_path, "r") as zip_ref:
+            zip_ref.extractall(tmp_dir)
+
+        shp_files = [
+            s for s in tmp_dir.glob("**/*.shp")
+            if s.is_file() and not s.name.startswith("._")
+        ]
+        if not shp_files:
+            raise ValueError("No valid .shp file found inside uploaded archive package.")
+        if len(shp_files) > 1:
+            logger.warning("Multiple shapefiles found in archive. Using first: %s", shp_files)
+
+        final_master_source = shp_files[0]
+
+    with fiona.open(str(final_master_source)) as src:
+        master_crs = src.crs_wkt or src.crs
+
+    if not master_crs:
+        raise ValueError("Master dataset does not contain a valid CRS definition.")
+
+    logger.info("📐 Computing uniform matrix coordinate transformations...")
+    grid_master_crs = grid_gdf.to_crs(master_crs)
+
+    total_grid_cells = len(grid_gdf)
+    logger.info(
+        "🧭 Grid scan prepared | total_cells=%d | chunk_offset=%s | chunk_limit=%s",
+        total_grid_cells,
+        offset,
+        limit if limit is not None else "ALL",
+    )
+
+    success_count = 0
+    candidate_chunks = 0
+    skipped_by_offset = 0
+    skipped_empty = 0
+    skipped_existing = 0
+
+    logger.info("✂️ Spatial streaming processes active. Target DB Collection: %s", collection.name)
+
+    with fiona.open(str(final_master_source)) as source_stream:
+        for pos, cell in enumerate(grid_gdf.itertuples(index=False), start=0):
+            grid_id = str(getattr(cell, "TopoSheet_No"))
+            cell_geom = getattr(cell, "geometry")
+
+            cell_bbox = tuple(grid_master_crs.iloc[pos].geometry.bounds)
+
+            features_in_box = list(source_stream.filter(bbox=cell_bbox))
+
+            if not features_in_box:
+                skipped_empty += 1
+                continue
+
+            clipped_gdf = gpd.GeoDataFrame.from_features(features_in_box, crs=master_crs)
+            features_in_box.clear()
+
+            if clipped_gdf.crs != grid_gdf.crs:
+                clipped_gdf = clipped_gdf.to_crs(grid_gdf.crs)
+
+            clipped_gdf = _safe_make_valid_gdf(clipped_gdf)
+
+            clipped_gdf["geometry"] = clipped_gdf.geometry.intersection(cell_geom)
+            clipped_gdf = clipped_gdf[clipped_gdf.geometry.notnull()].copy()
+            clipped_gdf = clipped_gdf[~clipped_gdf.geometry.is_empty].copy()
+
+            if clipped_gdf.empty:
+                skipped_empty += 1
+                del clipped_gdf
+                del cell_geom
+                release_memory()
+                continue
+
+            candidate_chunks += 1
+
+            if candidate_chunks <= offset:
+                skipped_by_offset += 1
+                logger.info(
+                    "OFFSET_SKIP | chunk_no=%d | offset=%d | grid_id=%s | rows=%d",
+                    candidate_chunks,
+                    offset,
+                    grid_id,
+                    len(clipped_gdf),
+                )
+                del clipped_gdf
+                del cell_geom
+                release_memory()
+                continue
+
+            if limit is not None and success_count >= limit:
+                logger.info(
+                    "LIMIT_REACHED | uploaded=%d | limit=%d | stopping scan",
+                    success_count,
+                    limit,
+                )
+                del clipped_gdf
+                del cell_geom
+                release_memory()
+                break
+
+            for col_name in clipped_gdf.columns:
+                if isinstance(clipped_gdf[col_name].dtype, pd.StringDtype):
+                    clipped_gdf[col_name] = clipped_gdf[col_name].astype(object)
+
+            if success_count and success_count % 5 == 0:
+                try:
+                    await status_msg.edit_text(
+                        f"✂️ *Slicing {data_type} vector assets safely…*\n\n"
+                        f"📍 Active Segment: `Grid_{grid_id}`\n"
+                        f"📦 Uploaded Chunks: `{success_count}`\n"
+                        f"🧩 Valid Chunks Seen: `{candidate_chunks}`\n"
+                        f"🧭 Window: `offset={offset}` `limit={limit if limit is not None else 'ALL'}`",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    pass
+
+            chunk_filename = f"{data_type.lower()}_{grid_id}.gpkg"
+            chunk_filepath = tmp_dir / chunk_filename
+
+            clipped_gdf.to_file(str(chunk_filepath), driver="GPKG")
+            file_bytes_size = chunk_filepath.stat().st_size
+            logger.info(
+                "GRID_WRITE | grid_id=%s | chunk=%s | size=%.2f MB",
+                grid_id,
+                chunk_filename,
+                file_bytes_size / (1024 * 1024),
+            )
+
+            if (file_bytes_size / (1024 * 1024)) > 250:
+                logger.warning(
+                    "⚠️ Chunk skipped: Segment `%s` (%.1f MB) exceeds safety threshold.",
+                    grid_id,
+                    file_bytes_size / (1024 * 1024),
+                )
+                chunk_filepath.unlink(missing_ok=True)
+                del clipped_gdf
+                del cell_geom
+                release_memory()
+                skipped_existing += 1
+                continue
+
+            chan_msg = None
+            while not chan_msg:
+                try:
+                    logger.info(
+                        "📤 Uploading partition chunk: %s over to Channel ID: %s",
+                        chunk_filename,
+                        channel_chat_id,
+                    )
+                    chan_msg = await client.send_document(
+                        chat_id=channel_chat_id,
+                        document=str(chunk_filepath),
+                        caption=(
+                            f"📦 SDSS Production Master Part Asset\n"
+                            f"• DataType: {data_type}\n"
+                            f"• Partition Index: {grid_id}\n"
+                            f"• Chunk No: {candidate_chunks}\n"
+                            f"• Window Offset: {offset}\n"
+                            f"• Window Limit: {limit if limit is not None else 'ALL'}"
+                        ),
+                    )
+                except FloodWait as flood_exception:
+                    logger.warning(
+                        "⚠️ Telegram FloodWait triggered! Cooling down processing loops for %s seconds.",
+                        flood_exception.value,
+                    )
+                    await asyncio.sleep(flood_exception.value)
+                except Exception as upload_err:
+                    logger.error("❌ Aborting channel pipe send action sequence: %s", upload_err)
+                    raise upload_err
+
+            payload = {
+                "grid_id": grid_id,
+                "data_type": data_type,
+                "channel_chat_id": str(channel_chat_id),
+                "channel_message_id": chan_msg.id,
+                "file_id": chan_msg.document.file_id,
+                "file_name": chunk_filename,
+                "feature_count": len(clipped_gdf),
+                "updated_at": datetime.now(timezone.utc),
+                "chunk_no": candidate_chunks,
+                "offset": offset,
+                "limit": limit,
+            }
+            collection.update_one(
+                {"grid_id": grid_id, "data_type": data_type},
+                {"$set": payload},
+                upsert=True,
+            )
+
+            logger.info(
+                "GRID_INDEX_SAVED | grid_id=%s | file_id=%s | message_id=%s | features=%d | chunk_no=%d",
+                grid_id,
+                chan_msg.document.file_id,
+                chan_msg.id,
+                len(clipped_gdf),
+                candidate_chunks,
+            )
+
+            success_count += 1
+            chunk_filepath.unlink(missing_ok=True)
+
+            del clipped_gdf
+            del cell_geom
+            release_memory()
+
+            if success_count % 25 == 0:
+                logger.info(
+                    "🧹 Batch target reached (%d uploads). Pausing for glibc memory stabilization...",
+                    success_count,
+                )
+                try:
+                    await status_msg.edit_text(
+                        f"🧹 *Batch milestone reached (`{success_count}` parts)!*\n\n"
+                        f"⏸️ Freezing ingestion pipeline to stabilize system allocation maps...\n"
+                        f"🧭 Window: `offset={offset}` `limit={limit if limit is not None else 'ALL'}`",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    pass
+
+                release_memory()
+                await asyncio.sleep(1)
+            else:
+                await asyncio.sleep(0.01)
+
+            if limit is not None and success_count >= limit:
+                logger.info(
+                    "LIMIT_REACHED | uploaded=%d | limit=%d | stopping scan",
+                    success_count,
+                    limit,
+                )
+                break
+
+    del grid_gdf
+    del grid_master_crs
+    release_memory()
+
+    logger.info(
+        "INGESTION_SUMMARY | uploaded=%d | chunk_candidates=%d | skipped_offset=%d | skipped_empty=%d | skipped_existing=%d",
+        success_count,
+        candidate_chunks,
+        skipped_by_offset,
+        skipped_empty,
+        skipped_existing,
+    )
+
+    await status_msg.delete()
+    await client.send_message(
+        chat_id=status_msg.chat.id,
+        text=(
+            f"✅ *Master Ingestion Pipeline Completed Successfully!*\n\n"
+            f"🏷 *Data Type Index:* `{data_type}`\n"
+            f"🧩 *Total Uploaded Chunks:* `{success_count}`\n"
+            f"📦 *Valid Chunk Candidates Seen:* `{candidate_chunks}`\n"
+            f"⏭ *Skipped by Offset:* `{skipped_by_offset}`\n"
+            f"🧭 *Window:* `offset={offset}` `limit={limit if limit is not None else 'ALL'}`"
+        ),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def _ingest_raster_demr(
+    client: Client,
+    status_msg: Message,
+    tmp_dir: Path,
+    raster_path: Path,
+    grid_gdf: gpd.GeoDataFrame,
+    channel_chat_id: int | str,
+    collection,
+    data_type: str,
+    filename: str,
+    offset: int,
+    limit: Optional[int],
+) -> None:
+    logger.info("🛰 DEMR raster pipeline selected | file=%s", filename)
+
+    with rasterio.open(str(raster_path)) as src:
+        raster_crs = src.crs
+        if raster_crs is None:
+            raise ValueError("DEMR raster does not contain a valid CRS definition.")
+
+        raster_bounds_geom = box(*src.bounds)
+
+        grid_raster = _align_gdf_crs(grid_gdf.copy(), raster_crs)
+        logger.info("📊 Grid Records initialized for raster clipping: %d mapping cells available.", len(grid_raster))
+
+        total_grid_cells = len(grid_raster)
+        logger.info(
+            "🧭 Raster grid scan prepared | total_cells=%d | chunk_offset=%s | chunk_limit=%s",
+            total_grid_cells,
+            offset,
+            limit if limit is not None else "ALL",
+        )
+
+        success_count = 0
+        candidate_chunks = 0
+        skipped_by_offset = 0
+        skipped_empty = 0
+        skipped_existing = 0
+
+        logger.info("✂️ Spatial streaming processes active. Target DB Collection: %s", collection.name)
+
+        for pos, row in enumerate(grid_raster.itertuples(index=False), start=0):
+            grid_id = str(getattr(row, "TopoSheet_No"))
+            cell_geom = getattr(row, "geometry")
+
+            if cell_geom is None or cell_geom.is_empty:
+                skipped_empty += 1
+                continue
+
+            if not cell_geom.intersects(raster_bounds_geom):
+                skipped_empty += 1
+                continue
+
+            # Candidate chunk exists only after a non-empty clip succeeds.
+            logger.info(
+                "GRID_BEGIN | pos=%d | grid_id=%s | bbox=(%.6f, %.6f, %.6f, %.6f) | rss=%.1f MB",
+                pos,
+                grid_id,
+                cell_geom.bounds[0],
+                cell_geom.bounds[1],
+                cell_geom.bounds[2],
+                cell_geom.bounds[3],
+                mem_mb(),
+            )
+
+            try:
+                out_image, out_transform = mask(
+                    src,
+                    [cell_geom.__geo_interface__],
+                    crop=True,
+                    filled=True,
+                    nodata=src.nodata,
+                )
+            except ValueError:
+                skipped_empty += 1
+                logger.info("GRID_EMPTY | grid_id=%s | raster mask produced no data", grid_id)
+                continue
+
+            if out_image.size == 0:
+                skipped_empty += 1
+                logger.info("GRID_EMPTY | grid_id=%s | empty raster window", grid_id)
+                continue
+
+            if src.nodata is not None:
+                valid_mask = out_image != src.nodata
+                if not np.any(valid_mask):
+                    skipped_empty += 1
+                    logger.info("GRID_EMPTY | grid_id=%s | masked raster is nodata only", grid_id)
+                    continue
+            else:
+                if np.issubdtype(out_image.dtype, np.floating):
+                    valid_mask = np.isfinite(out_image)
+                    if not np.any(valid_mask):
+                        skipped_empty += 1
+                        logger.info("GRID_EMPTY | grid_id=%s | masked raster is invalid-only", grid_id)
+                        continue
+
+            candidate_chunks += 1
+
+            if candidate_chunks <= offset:
+                skipped_by_offset += 1
+                logger.info(
+                    "OFFSET_SKIP | chunk_no=%d | offset=%d | grid_id=%s",
+                    candidate_chunks,
+                    offset,
+                    grid_id,
+                )
+                release_memory()
+                continue
+
+            if limit is not None and success_count >= limit:
+                logger.info(
+                    "LIMIT_REACHED | uploaded=%d | limit=%d | stopping scan",
+                    success_count,
+                    limit,
+                )
+                release_memory()
+                break
+
+            if success_count and success_count % 5 == 0:
+                try:
+                    await status_msg.edit_text(
+                        f"🛰 *Processing raster DEMR safely…*\n\n"
+                        f"📍 Active Segment: `Grid_{grid_id}`\n"
+                        f"📦 Uploaded Chunks: `{success_count}`\n"
+                        f"🧩 Valid Chunks Seen: `{candidate_chunks}`\n"
+                        f"🧭 Window: `offset={offset}` `limit={limit if limit is not None else 'ALL'}`",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    pass
+
+            chunk_filename = f"{data_type.lower()}_{grid_id}.tif"
+            chunk_filepath = tmp_dir / chunk_filename
+
+            out_meta = src.meta.copy()
+            out_meta.update(
+                driver="GTiff",
+                height=out_image.shape[1],
+                width=out_image.shape[2],
+                transform=out_transform,
+                compress="deflate",
+            )
+
+            with rasterio.open(str(chunk_filepath), "w", **out_meta) as dst:
+                dst.write(out_image)
+
+            file_bytes_size = chunk_filepath.stat().st_size
+            logger.info(
+                "GRID_WRITE | grid_id=%s | chunk=%s | size=%.2f MB",
+                grid_id,
+                chunk_filename,
+                file_bytes_size / (1024 * 1024),
+            )
+
+            if (file_bytes_size / (1024 * 1024)) > 250:
+                logger.warning(
+                    "⚠️ Chunk skipped: Segment `%s` (%.1f MB) exceeds safety threshold.",
+                    grid_id,
+                    file_bytes_size / (1024 * 1024),
+                )
+                chunk_filepath.unlink(missing_ok=True)
+                skipped_existing += 1
+                release_memory()
+                continue
+
+            chan_msg = None
+            while not chan_msg:
+                try:
+                    logger.info(
+                        "📤 Uploading partition chunk: %s over to Channel ID: %s",
+                        chunk_filename,
+                        channel_chat_id,
+                    )
+                    chan_msg = await client.send_document(
+                        chat_id=channel_chat_id,
+                        document=str(chunk_filepath),
+                        caption=(
+                            f"📦 SDSS Production Raster DEM Part Asset\n"
+                            f"• DataType: {data_type}\n"
+                            f"• Partition Index: {grid_id}\n"
+                            f"• Chunk No: {candidate_chunks}\n"
+                            f"• Window Offset: {offset}\n"
+                            f"• Window Limit: {limit if limit is not None else 'ALL'}"
+                        ),
+                    )
+                except FloodWait as flood_exception:
+                    logger.warning(
+                        "⚠️ Telegram FloodWait triggered! Cooling down processing loops for %s seconds.",
+                        flood_exception.value,
+                    )
+                    await asyncio.sleep(flood_exception.value)
+                except Exception as upload_err:
+                    logger.error("❌ Aborting channel pipe send action sequence: %s", upload_err)
+                    raise upload_err
+
+            payload = {
+                "grid_id": grid_id,
+                "data_type": data_type,
+                "channel_chat_id": str(channel_chat_id),
+                "channel_message_id": chan_msg.id,
+                "file_id": chan_msg.document.file_id,
+                "file_name": chunk_filename,
+                "chunk_no": candidate_chunks,
+                "offset": offset,
+                "limit": limit,
+                "updated_at": datetime.now(timezone.utc),
+                "band_count": out_image.shape[0],
+                "height": out_image.shape[1],
+                "width": out_image.shape[2],
+                "dtype": str(out_image.dtype),
+            }
+
+            collection.update_one(
+                {"grid_id": grid_id, "data_type": data_type},
+                {"$set": payload},
+                upsert=True,
+            )
+
+            logger.info(
+                "GRID_INDEX_SAVED | grid_id=%s | file_id=%s | message_id=%s | chunk_no=%d | bands=%d",
+                grid_id,
+                chan_msg.document.file_id,
+                chan_msg.id,
+                candidate_chunks,
+                out_image.shape[0],
+            )
+
+            success_count += 1
+            chunk_filepath.unlink(missing_ok=True)
+
+            release_memory()
+
+            if success_count % 25 == 0:
+                logger.info(
+                    "🧹 Batch target reached (%d uploads). Pausing for glibc memory stabilization...",
+                    success_count,
+                )
+                try:
+                    await status_msg.edit_text(
+                        f"🧹 *Batch milestone reached (`{success_count}` parts)!*\n\n"
+                        f"⏸️ Freezing ingestion pipeline to stabilize system allocation maps...\n"
+                        f"🧭 Window: `offset={offset}` `limit={limit if limit is not None else 'ALL'}`",
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+                except Exception:
+                    pass
+
+                release_memory()
+                await asyncio.sleep(1)
+            else:
+                await asyncio.sleep(0.01)
+
+            if limit is not None and success_count >= limit:
+                logger.info(
+                    "LIMIT_REACHED | uploaded=%d | limit=%d | stopping scan",
+                    success_count,
+                    limit,
+                )
+                break
+
+    logger.info(
+        "INGESTION_SUMMARY | uploaded=%d | chunk_candidates=%d | skipped_offset=%d | skipped_empty=%d | skipped_existing=%d",
+        success_count,
+        candidate_chunks,
+        skipped_by_offset,
+        skipped_empty,
+        skipped_existing,
+    )
 
 
 @Client.on_message(filters.command("post") & filters.private)
