@@ -3,9 +3,8 @@ modules/cmd.py — Command handlers, callback routing, and resource-conscious an
 Dynamically streams intersected grid data directly via cached Telegram channel file_ids,
 runs localized vector analytics within tight 512MB RAM constraints, and flushes cache nodes instantly.
 """
-
-import io
 import gc
+import io
 import logging
 import shutil
 import sys
@@ -56,6 +55,29 @@ def _align_gdf_crs(gdf: gpd.GeoDataFrame, target_crs) -> gpd.GeoDataFrame:
     return gdf
 
 
+def _make_single_feature(row, polygon_number: int, filename: str) -> dict:
+    """Build a GeoJSON feature for one polygon with WGS84 geometry."""
+    single_gdf = gpd.GeoDataFrame(
+        [row.to_dict()],
+        geometry="geometry",
+        crs=row.geometry.crs if hasattr(row.geometry, "crs") else None,
+    )
+    if single_gdf.crs is None:
+        single_gdf.set_crs("EPSG:4326", inplace=True)
+
+    render_gdf = _align_gdf_crs(single_gdf.copy(), "EPSG:4326")
+    render_geom = render_gdf.geometry.iloc[0]
+
+    return {
+        "type": "Feature",
+        "properties": {
+            "polygon_id": polygon_number,
+            "source_file": filename,
+        },
+        "geometry": mapping(render_geom),
+    }
+
+
 @Client.on_message(filters.command("start") & filters.private)
 async def cmd_start(client: Client, message: Message) -> None:
     user = message.from_user
@@ -63,12 +85,11 @@ async def cmd_start(client: Client, message: Message) -> None:
 
     text = (
         f"🌿 *Welcome to the SDSS Bot, {user.first_name}!*\n\n"
-        "This system performs automated spatial analysis on forest polygons "
-        "for the *Madhya Pradesh Forest Department*.\n\n"
+        "This system performs automated spatial analysis for the *Madhya Pradesh Forest Department*.\n\n"
         "*What to do:*\n"
-        "1️⃣  Upload a spatial boundary file (`.geojson`, `.kml`, `.kmz`, or `.zip`)\n"
-        "2️⃣  Choose whether to view attributes or run environmental analysis\n"
-        "3️⃣  Receive your custom reporting metrics instantly\n\n"
+        "1️⃣ Upload a spatial boundary file (`.geojson`, `.kml`, `.kmz`, `.zip`)\n"
+        "2️⃣ Choose whether to view attributes or run environmental analysis\n"
+        "3️⃣ Receive your custom reporting metrics instantly\n\n"
         "*Commands:*\n"
         "/help — Detailed instructions\n"
         "/status — Check system health\n\n"
@@ -91,8 +112,8 @@ async def cmd_help(client: Client, message: Message) -> None:
         "• Geometry must be a Polygon or MultiPolygon\n"
         "• Any coordinate reference system is accepted (auto-converted)\n\n"
         "*Output Report options:*\n"
-        "• Custom Attributes Table inspection metrics\n"
-        "• FSI Forest Cover class breakdowns and Terrain Elevation maps\n\n"
+        "• Separate FCM and contour maps for every polygon\n"
+        "• Custom attributes and terrain summary metrics\n\n"
         "_Upload your file to begin_ 👆"
     )
     await message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -214,392 +235,406 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
             document=bio,
             caption=f"📄 Full attribute table export for `{filename}`.",
         )
+        return
 
-    elif action == "action_analysis":
-        status_msg = await callback_query.message.reply_text(
-            "⏳ *Initializing Real-Time Channel-Drive Vector Analysis Engines…*",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+    if action != "action_analysis":
+        return
 
-        tmp_workspace = Path(tempfile.mkdtemp())
-        grid_local_path = tmp_workspace / "state_fishnet_grid.gpkg"
+    status_msg = await callback_query.message.reply_text(
+        "⏳ *Initializing Real-Time Channel-Drive Vector Analysis Engines…*",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
-        try:
-            await client.send_chat_action(chat_id=user.id, action=ChatAction.TYPING)
-            db = _get_db()
+    tmp_workspace = Path(tempfile.mkdtemp())
+    grid_local_path = tmp_workspace / "state_fishnet_grid.gpkg"
 
-            uploaded_gdf = uploaded_gdf.copy()
-            if uploaded_gdf.crs is None:
-                uploaded_gdf.set_crs("EPSG:4326", inplace=True)
+    try:
+        await client.send_chat_action(chat_id=user.id, action=ChatAction.TYPING)
+        db = _get_db()
 
-            uploaded_gdf = uploaded_gdf.explode(index_parts=False).reset_index(drop=True)
-            uploaded_gdf = uploaded_gdf[uploaded_gdf.geometry.notnull() & ~uploaded_gdf.geometry.is_empty].copy()
+        uploaded_gdf = uploaded_gdf.copy()
+        if uploaded_gdf.crs is None:
+            uploaded_gdf.set_crs("EPSG:4326", inplace=True)
 
-            if uploaded_gdf.empty:
+        uploaded_gdf = uploaded_gdf.explode(index_parts=False).reset_index(drop=True)
+        uploaded_gdf = uploaded_gdf[uploaded_gdf.geometry.notnull() & ~uploaded_gdf.geometry.is_empty].copy()
+
+        if uploaded_gdf.empty:
+            await status_msg.edit_text(
+                "⚠️ *Analysis Completed:* The uploaded file contains no valid polygon features.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        await status_msg.edit_text("🛰 *Aligning layout against Spatial Mesh Framework Grid…*")
+        from modules.storage import _get_supabase
+
+        supabase = _get_supabase()
+        with open(grid_local_path, "wb") as f:
+            res = supabase.storage.from_(cfg.SUPABASE_BUCKET).download("state_grid.gpkg")
+            f.write(res)
+
+        grid_gdf = gpd.read_file(str(grid_local_path))
+        grid_gdf = _align_gdf_crs(grid_gdf, uploaded_gdf.crs)
+
+        polygon_total = len(uploaded_gdf)
+        processed_any = False
+
+        for poly_index, row in uploaded_gdf.iterrows():
+            polygon_number = poly_index + 1
+
+            try:
+                user_geom = row.geometry
+                if user_geom is None or user_geom.is_empty:
+                    continue
+
+                single_gdf = gpd.GeoDataFrame(
+                    [row.to_dict()],
+                    geometry="geometry",
+                    crs=uploaded_gdf.crs,
+                )
+
+                user_utm = single_gdf.to_crs(epsg=32644)
+                calculated_area_ha = float(user_utm.geometry.area.sum() / 10000.0)
+
+                single_feature = {
+                    "type": "Feature",
+                    "properties": {
+                        "polygon_id": polygon_number,
+                        "source_file": filename,
+                    },
+                    "geometry": mapping(_align_gdf_crs(single_gdf.copy(), "EPSG:4326").geometry.iloc[0]),
+                }
+
                 await status_msg.edit_text(
-                    "⚠️ *Analysis Completed:* The uploaded file contains no valid polygon features.",
+                    f"📍 *Processing polygon `{polygon_number}/{polygon_total}`…*",
                     parse_mode=ParseMode.MARKDOWN,
                 )
-                return
 
-            await status_msg.edit_text("🛰 *Aligning layout against Spatial Mesh Framework Grid…*")
-            from modules.storage import _get_supabase
-            supabase = _get_supabase()
-            with open(grid_local_path, "wb") as f:
-                res = supabase.storage.from_(cfg.SUPABASE_BUCKET).download("state_grid.gpkg")
-                f.write(res)
+                intersecting_cells = grid_gdf[grid_gdf.geometry.intersects(user_geom)]
+                target_grid_ids = (
+                    intersecting_cells["TopoSheet_No"]
+                    .dropna()
+                    .astype(str)
+                    .unique()
+                    .tolist()
+                )
 
-            grid_gdf = gpd.read_file(str(grid_local_path))
-            grid_gdf = _align_gdf_crs(grid_gdf, uploaded_gdf.crs)
-
-            polygon_total = len(uploaded_gdf)
-            processed_any = False
-
-            for poly_index, row in uploaded_gdf.iterrows():
-                polygon_number = poly_index + 1
-
-                try:
-                    user_geom = row.geometry
-                    if user_geom is None or user_geom.is_empty:
-                        continue
-
-                    single_gdf = gpd.GeoDataFrame(
-                        [row.to_dict()],
-                        geometry="geometry",
-                        crs=uploaded_gdf.crs,
-                    )
-
-                    user_utm = single_gdf.to_crs(epsg=32644)
-                    calculated_area_ha = float(user_utm.geometry.area.sum() / 10000.0)
-
-                    render_gdf = _align_gdf_crs(single_gdf.copy(), "EPSG:4326")
-                    render_geom = render_gdf.geometry.iloc[0]
-
-                    single_feature = {
-                        "type": "Feature",
-                        "properties": {
-                            "polygon_id": polygon_number,
-                            "source_file": filename,
-                        },
-                        "geometry": mapping(render_geom),
-                    }
-
-                    await status_msg.edit_text(
-                        f"📍 *Processing polygon `{polygon_number}/{polygon_total}`…*",
-                        parse_mode=ParseMode.MARKDOWN,
-                    )
-
-                    intersecting_cells = grid_gdf[grid_gdf.geometry.intersects(user_geom)]
-                    target_grid_ids = (
-                        intersecting_cells["TopoSheet_No"]
-                        .dropna()
-                        .astype(str)
-                        .unique()
-                        .tolist()
-                    )
-
-                    if not target_grid_ids:
-                        await callback_query.message.reply_text(
-                            f"⚠️ *Polygon `{polygon_number}/{polygon_total}`:* "
-                            "The uploaded boundary does not intersect the study framework grid area.",
-                            parse_mode=ParseMode.MARKDOWN,
-                        )
-                        continue
-
-                    await status_msg.edit_text(
-                        f"📍 *Polygon `{polygon_number}/{polygon_total}`* "
-                        f"intersects `{len(target_grid_ids)}` framework grid indices…",
-                        parse_mode=ParseMode.MARKDOWN,
-                    )
-
-                    fcm_intersected_gdfs = []
-                    ftm_intersected_gdfs = []
-                    dem_intersected_gdfs = []
-
-                    for grid_id in target_grid_ids:
-                        fcm_doc = db.fcm_layers.find_one({"grid_id": grid_id, "data_type": "FCM"})
-                        if fcm_doc:
-                            fcm_local = tmp_workspace / f"fcm_{grid_id}.gpkg"
-                            await client.download_media(fcm_doc["file_id"], file_name=str(fcm_local))
-                            part_gdf = gpd.read_file(str(fcm_local))
-                            part_gdf = _align_gdf_crs(part_gdf, uploaded_gdf.crs)
-                            clip_part = part_gdf[part_gdf.geometry.intersects(user_geom)].copy()
-                            if not clip_part.empty:
-                                fcm_intersected_gdfs.append(clip_part)
-                            fcm_local.unlink(missing_ok=True)
-
-                        ftm_doc = db.ftm_layers.find_one({"grid_id": grid_id, "data_type": "FTM"})
-                        if ftm_doc:
-                            ftm_local = tmp_workspace / f"ftm_{grid_id}.gpkg"
-                            await client.download_media(ftm_doc["file_id"], file_name=str(ftm_local))
-                            part_gdf = gpd.read_file(str(ftm_local))
-                            part_gdf = _align_gdf_crs(part_gdf, uploaded_gdf.crs)
-                            clip_part = part_gdf[part_gdf.geometry.intersects(user_geom)].copy()
-                            if not clip_part.empty:
-                                ftm_intersected_gdfs.append(clip_part)
-                            ftm_local.unlink(missing_ok=True)
-
-                        dem_doc = db.dem_layers.find_one({"grid_id": grid_id, "data_type": "DEM"})
-                        if dem_doc:
-                            dem_local = tmp_workspace / f"dem_{grid_id}.gpkg"
-                            await client.download_media(dem_doc["file_id"], file_name=str(dem_local))
-                            part_gdf = gpd.read_file(str(dem_local))
-                            part_gdf = _align_gdf_crs(part_gdf, uploaded_gdf.crs)
-                            clip_part = part_gdf[part_gdf.geometry.intersects(user_geom)].copy()
-                            if not clip_part.empty:
-                                dem_intersected_gdfs.append(clip_part)
-                            dem_local.unlink(missing_ok=True)
-
-                        gc.collect()
-
-                    report_text = (
-                        f"🔬 *Conditional Spatial Analysis Report for `{filename}`*\n"
-                        f"🧩 *Polygon:* `{polygon_number}/{polygon_total}`\n"
-                        f"📅 *Generated on:* `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
-                        f"📊 *Total Boundary Area:* `{calculated_area_ha:.2f} ha`\n\n"
-                    )
-
-                    fcm_class_summary = {}
-                    dominant_cover_type = "NON FOREST"
-                    passed_fcm_list = []
-                    passed_dem_list = []
-                    dem_metrics = {}
-
-                    if fcm_intersected_gdfs:
-                        fcm_compiled = pd.concat(fcm_intersected_gdfs, ignore_index=True)
-
-                        logger.info("FCM Columns = %s", fcm_compiled.columns.tolist())
-                        logger.info("FCM Sample = %s", fcm_compiled.head(3).to_dict("records"))
-
-                        fcm_compiled["geometry"] = fcm_compiled.geometry.intersection(user_geom)
-                        fcm_compiled = fcm_compiled[~fcm_compiled.geometry.is_empty].copy()
-
-                        fcm_utm = fcm_compiled.to_crs(epsg=32644)
-
-                        class_col = next(
-                            (c for c in fcm_utm.columns if c.lower() == "class_name"),
-                            None,
-                        )
-
-                        if class_col and not fcm_utm.empty:
-                            fcm_utm["part_area_ha"] = fcm_utm.geometry.area / 10000.0
-                            grouped = fcm_utm.groupby(class_col)["part_area_ha"].sum()
-
-                            max_area = 0.0
-
-                            for raw_class, class_ha in grouped.items():
-                                c_str = str(raw_class).strip().upper()
-
-                                if "VDF" in c_str:
-                                    standard_label = "VDF"
-                                elif "MDF" in c_str:
-                                    standard_label = "MDF"
-                                elif "OPEN FOREST" in c_str:
-                                    standard_label = "OPEN FOREST"
-                                elif "NON FOREST" in c_str:
-                                    standard_label = "NON FOREST"
-                                elif "SCRUB" in c_str:
-                                    standard_label = "SCRUB"
-                                elif "WATER" in c_str:
-                                    standard_label = "WATER"
-                                else:
-                                    standard_label = "NO-DATA"
-
-                                c_pct = (class_ha / calculated_area_ha) * 100.0 if calculated_area_ha else 0.0
-                                fcm_class_summary[standard_label] = {
-                                    "hectares": float(class_ha),
-                                    "percentage": float(c_pct),
-                                }
-
-                                if standard_label not in {"WATER", "NO-DATA"} and class_ha > max_area:
-                                    max_area = class_ha
-                                    dominant_cover_type = standard_label
-
-                        report_text += "🌲 *Forest Canopy Cover (FCM):*\n"
-                        if fcm_class_summary:
-                            for label, metrics in fcm_class_summary.items():
-                                report_text += (
-                                    f"• {label}: `{metrics['hectares']:.2f} ha` "
-                                    f"({metrics['percentage']:.1f}%)\n"
-                                )
-                            report_text += "• Processing Status: `[Natively Evaluated]` ✅\n\n"
-                        else:
-                            report_text += (
-                                "• Processing Status: `[Evaluated - class_name column not usable]` ⚠️\n\n"
-                            )
-
-                        passed_fcm_list = [fcm_compiled]
-                    else:
-                        report_text += "🌲 *Forest Canopy Cover (FCM):*\n"
-                        report_text += "• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
-
-                    if ftm_intersected_gdfs:
-                        ftm_compiled = pd.concat(ftm_intersected_gdfs, ignore_index=True)
-                        ftm_compiled["geometry"] = ftm_compiled.geometry.intersection(user_geom)
-                        ftm_compiled = ftm_compiled[~ftm_compiled.geometry.is_empty].copy()
-
-                        ftm_utm = ftm_compiled.to_crs(epsg=32644)
-                        total_ftm_area_ha = ftm_utm.geometry.area.sum() / 10000.0
-
-                        report_text += "🌿 *Forest Type Mapping (FTM):*\n"
-                        report_text += f"• Active Intersecting Canopy Area: `{total_ftm_area_ha:.2f} ha`\n"
-                        report_text += "• Processing Status: `[Natively Evaluated]` ✅\n\n"
-                    else:
-                        report_text += "🌿 *Forest Type Mapping (FTM):*\n"
-                        report_text += "• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
-
-                    if dem_intersected_gdfs:
-                        dem_compiled = pd.concat(dem_intersected_gdfs, ignore_index=True)
-                        logger.info("DEM Columns = %s", dem_compiled.columns.tolist())
-                        logger.info("DEM Sample = %s", dem_compiled.head(3).to_dict("records"))
-
-                        elev_col = next(
-                            (c for c in dem_compiled.columns if c.lower() in {"elevation", "elev", "contour", "z"}),
-                            None,
-                        )
-
-                        if elev_col:
-                            dem_compiled["geometry"] = dem_compiled.geometry.intersection(user_geom)
-                            dem_compiled = dem_compiled[~dem_compiled.geometry.is_empty].copy()
-                            dem_compiled = dem_compiled[
-                                dem_compiled.geometry.geom_type.isin(["LineString", "MultiLineString", "Polygon", "MultiPolygon"])
-                            ].copy()
-
-                            if not dem_compiled.empty:
-                                elev_series = pd.to_numeric(dem_compiled[elev_col], errors="coerce").dropna()
-
-                                if not elev_series.empty:
-                                    mean_val = elev_series.mean()
-                                    max_val = elev_series.max()
-                                    min_val = elev_series.min()
-
-                                    dem_metrics = {
-                                        "elevation_min_m": round(float(min_val), 1),
-                                        "elevation_max_m": round(float(max_val), 1),
-                                        "elevation_mean_m": round(float(mean_val), 1),
-                                        "slope_mean_deg": "—",
-                                        "slope_max_deg": "—",
-                                    }
-
-                                    report_text += "⛰️ *Topographic Elevation Profiles (DEM):*\n"
-                                    report_text += f"• Intersecting Mean Elevation: `{mean_val:.1f} m`\n"
-                                    report_text += f"• Maximum Vertex Elevation Peak: `{max_val:.1f} m`\n"
-                                    report_text += "• Processing Status: `[Natively Evaluated]` ✅\n\n"
-
-                                    passed_dem_list = [dem_compiled]
-                                else:
-                                    report_text += "⛰️ *Topographic Elevation Profiles (DEM):*\n"
-                                    report_text += "• Processing Status: `[Elevation values empty]` ⚠️\n\n"
-                            else:
-                                report_text += "⛰️ *Topographic Elevation Profiles (DEM):*\n"
-                                report_text += "• Processing Status: `[No contour geometry survived clipping]` ⚠️\n\n"
-                        else:
-                            report_text += "⛰️ *Topographic Elevation Profiles (DEM):*\n"
-                            report_text += "• Processing Status: `[Evaluated - No Elevation Attribute Columns Found]` ⚠️\n\n"
-                    else:
-                        report_text += "⛰️ *Topographic Elevation Profiles (DEM):*\n"
-                        report_text += "• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
-
-                    results = {
-                        "area_ha": calculated_area_ha,
-                        "centroid": [
-                            round(float(user_geom.centroid.x), 6),
-                            round(float(user_geom.centroid.y), 6),
-                        ],
-                        "fcm": {
-                            "dominant": dominant_cover_type,
-                            "classes": fcm_class_summary,
-                        },
-                        "dem": dem_metrics,
-                        "_raw_fcm_gdfs": passed_fcm_list,
-                        "_raw_dem_gdfs": passed_dem_list,
-                        "_has_water": "WATER" in fcm_class_summary,
-                    }
-
-                    polygon_filename = f"{base_name}_polygon_{polygon_number}"
-                    log_analysis(
-                        user.id,
-                        polygon_filename,
-                        single_feature,
-                        {"status": "completed"},
-                        results["centroid"],
-                    )
-
-                    try:
-                        logger.info(
-                            "RENDER_TRACE | file=%s | area=%.2f | fcm_classes=%s | raw_fcm_gdfs=%d | raw_dem_gdfs=%d | rows=%s | class_names=%s",
-                            polygon_filename,
-                            results.get("area_ha", 0),
-                            list(results.get("fcm", {}).get("classes", {}).keys()),
-                            len(results.get("_raw_fcm_gdfs", [])),
-                            len(results.get("_raw_dem_gdfs", [])),
-                            [len(gdf) for gdf in results.get("_raw_fcm_gdfs", [])],
-                            [
-                                gdf["class_name"].dropna().unique().tolist()
-                                if "class_name" in gdf.columns
-                                else "NO_CLASS_FIELD"
-                                for gdf in results.get("_raw_fcm_gdfs", [])
-                            ],
-                        )
-
-                        map_path = render_map(single_feature, results, polygon_filename)
-
-                        if map_path and (isinstance(map_path, io.BytesIO) or Path(map_path).exists()):
-                            await client.send_chat_action(chat_id=user.id, action=ChatAction.UPLOAD_PHOTO)
-                            await callback_query.message.reply_photo(
-                                photo=map_path,
-                                caption=report_text,
-                                parse_mode=ParseMode.MARKDOWN,
-                            )
-                            if isinstance(map_path, (str, Path)):
-                                Path(map_path).unlink(missing_ok=True)
-                        else:
-                            await callback_query.message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN)
-                    except Exception as map_err:
-                        logger.error(
-                            "Map rendering module encountered non-fatal dropout error: %s",
-                            map_err,
-                            exc_info=True,
-                        )
-                        await callback_query.message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN)
-
-                    processed_any = True
-
-                except Exception as polygon_err:
-                    logger.error(
-                        "Polygon %s analysis failed.",
-                        polygon_number,
-                        exc_info=True,
-                    )
+                if not target_grid_ids:
                     await callback_query.message.reply_text(
-                        f"❌ *Polygon `{polygon_number}/{polygon_total}` analysis failed:* `{polygon_err}`",
+                        f"⚠️ *Polygon `{polygon_number}/{polygon_total}`:* "
+                        "The uploaded boundary does not intersect the study framework grid area.",
                         parse_mode=ParseMode.MARKDOWN,
                     )
                     continue
 
-            if not processed_any:
-                await callback_query.message.reply_text(
-                    "⚠️ No valid polygon reports could be generated from the uploaded file.",
+                await status_msg.edit_text(
+                    f"📍 *Polygon `{polygon_number}/{polygon_total}`* "
+                    f"intersects `{len(target_grid_ids)}` framework grid indices…",
                     parse_mode=ParseMode.MARKDOWN,
                 )
 
-            await status_msg.delete()
+                fcm_intersected_gdfs = []
+                ftm_intersected_gdfs = []
+                dem_intersected_gdfs = []
 
-        except Exception as err:
-            logger.error("Error executing dynamic channel vector intersections pipeline", exc_info=True)
-            if "status_msg" in locals():
-                await status_msg.edit_text(f"❌ *Analysis Execution Failed:* {err}")
-        finally:
-            if tmp_workspace.exists():
-                shutil.rmtree(tmp_workspace, ignore_errors=True)
-            gc.collect()
+                for grid_id in target_grid_ids:
+                    fcm_doc = db.fcm_layers.find_one({"grid_id": grid_id, "data_type": "FCM"})
+                    if fcm_doc:
+                        fcm_local = tmp_workspace / f"fcm_{grid_id}.gpkg"
+                        await client.download_media(fcm_doc["file_id"], file_name=str(fcm_local))
+                        part_gdf = gpd.read_file(str(fcm_local))
+                        part_gdf = _align_gdf_crs(part_gdf, uploaded_gdf.crs)
+                        clip_part = part_gdf[part_gdf.geometry.intersects(user_geom)].copy()
+                        if not clip_part.empty:
+                            fcm_intersected_gdfs.append(clip_part)
+                        fcm_local.unlink(missing_ok=True)
+
+                    ftm_doc = db.ftm_layers.find_one({"grid_id": grid_id, "data_type": "FTM"})
+                    if ftm_doc:
+                        ftm_local = tmp_workspace / f"ftm_{grid_id}.gpkg"
+                        await client.download_media(ftm_doc["file_id"], file_name=str(ftm_local))
+                        part_gdf = gpd.read_file(str(ftm_local))
+                        part_gdf = _align_gdf_crs(part_gdf, uploaded_gdf.crs)
+                        clip_part = part_gdf[part_gdf.geometry.intersects(user_geom)].copy()
+                        if not clip_part.empty:
+                            ftm_intersected_gdfs.append(clip_part)
+                        ftm_local.unlink(missing_ok=True)
+
+                    dem_doc = db.dem_layers.find_one({"grid_id": grid_id, "data_type": "DEM"})
+                    if dem_doc:
+                        dem_local = tmp_workspace / f"dem_{grid_id}.gpkg"
+                        await client.download_media(dem_doc["file_id"], file_name=str(dem_local))
+                        part_gdf = gpd.read_file(str(dem_local))
+                        part_gdf = _align_gdf_crs(part_gdf, uploaded_gdf.crs)
+                        clip_part = part_gdf[part_gdf.geometry.intersects(user_geom)].copy()
+                        if not clip_part.empty:
+                            dem_intersected_gdfs.append(clip_part)
+                        dem_local.unlink(missing_ok=True)
+
+                    gc.collect()
+
+                report_text = (
+                    f"🔬 *Conditional Spatial Analysis Report for `{filename}`*\n"
+                    f"🧩 *Polygon:* `{polygon_number}/{polygon_total}`\n"
+                    f"📅 *Generated on:* `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n\n"
+                    f"📊 *Total Boundary Area:* `{calculated_area_ha:.2f} ha`\n\n"
+                )
+
+                fcm_class_summary = {}
+                dominant_cover_type = "NON FOREST"
+                passed_fcm_list = []
+                passed_dem_list = []
+                dem_metrics = {}
+
+                if fcm_intersected_gdfs:
+                    fcm_compiled = pd.concat(fcm_intersected_gdfs, ignore_index=True)
+
+                    logger.info("FCM Columns = %s", fcm_compiled.columns.tolist())
+                    logger.info("FCM Sample = %s", fcm_compiled.head(3).to_dict("records"))
+
+                    fcm_compiled["geometry"] = fcm_compiled.geometry.intersection(user_geom)
+                    fcm_compiled = fcm_compiled[~fcm_compiled.geometry.is_empty].copy()
+
+                    fcm_utm = fcm_compiled.to_crs(epsg=32644)
+
+                    class_col = next((c for c in fcm_utm.columns if c.lower() == "class_name"), None)
+
+                    if class_col and not fcm_utm.empty:
+                        fcm_utm["part_area_ha"] = fcm_utm.geometry.area / 10000.0
+                        grouped = fcm_utm.groupby(class_col)["part_area_ha"].sum()
+
+                        max_area = 0.0
+
+                        for raw_class, class_ha in grouped.items():
+                            c_str = str(raw_class).strip().upper()
+
+                            if "VDF" in c_str:
+                                standard_label = "VDF"
+                            elif "MDF" in c_str:
+                                standard_label = "MDF"
+                            elif "OPEN FOREST" in c_str:
+                                standard_label = "OPEN FOREST"
+                            elif "NON FOREST" in c_str:
+                                standard_label = "NON FOREST"
+                            elif "SCRUB" in c_str:
+                                standard_label = "SCRUB"
+                            elif "WATER" in c_str:
+                                standard_label = "WATER"
+                            else:
+                                standard_label = "NO-DATA"
+
+                            c_pct = (class_ha / calculated_area_ha) * 100.0 if calculated_area_ha else 0.0
+                            fcm_class_summary[standard_label] = {
+                                "hectares": float(class_ha),
+                                "percentage": float(c_pct),
+                            }
+
+                            if standard_label not in {"WATER", "NO-DATA"} and class_ha > max_area:
+                                max_area = class_ha
+                                dominant_cover_type = standard_label
+
+                    report_text += "🌲 *Forest Canopy Cover (FCM):*\n"
+                    if fcm_class_summary:
+                        for label, metrics in fcm_class_summary.items():
+                            report_text += (
+                                f"• {label}: `{metrics['hectares']:.2f} ha` "
+                                f"({metrics['percentage']:.1f}%)\n"
+                            )
+                        report_text += "• Processing Status: `[Natively Evaluated]` ✅\n\n"
+                    else:
+                        report_text += "• Processing Status: `[Evaluated - class_name column not usable]` ⚠️\n\n"
+
+                    passed_fcm_list = [fcm_compiled]
+                else:
+                    report_text += "🌲 *Forest Canopy Cover (FCM):*\n"
+                    report_text += "• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
+
+                if ftm_intersected_gdfs:
+                    ftm_compiled = pd.concat(ftm_intersected_gdfs, ignore_index=True)
+                    ftm_compiled["geometry"] = ftm_compiled.geometry.intersection(user_geom)
+                    ftm_compiled = ftm_compiled[~ftm_compiled.geometry.is_empty].copy()
+
+                    ftm_utm = ftm_compiled.to_crs(epsg=32644)
+                    total_ftm_area_ha = ftm_utm.geometry.area.sum() / 10000.0
+
+                    report_text += "🌿 *Forest Type Mapping (FTM):*\n"
+                    report_text += f"• Active Intersecting Canopy Area: `{total_ftm_area_ha:.2f} ha`\n"
+                    report_text += "• Processing Status: `[Natively Evaluated]` ✅\n\n"
+                else:
+                    report_text += "🌿 *Forest Type Mapping (FTM):*\n"
+                    report_text += "• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
+
+                if dem_intersected_gdfs:
+                    dem_compiled = pd.concat(dem_intersected_gdfs, ignore_index=True)
+                    logger.info("DEM Columns = %s", dem_compiled.columns.tolist())
+                    logger.info("DEM Sample = %s", dem_compiled.head(3).to_dict("records"))
+
+                    elev_col = next(
+                        (c for c in dem_compiled.columns if c.lower() in {"elevation", "elev", "contour", "z"}),
+                        None,
+                    )
+
+                    if elev_col:
+                        dem_compiled["geometry"] = dem_compiled.geometry.intersection(user_geom)
+                        dem_compiled = dem_compiled[~dem_compiled.geometry.is_empty].copy()
+
+                        elev_series = pd.to_numeric(dem_compiled[elev_col], errors="coerce").dropna()
+                        if not elev_series.empty:
+                            mean_val = elev_series.mean()
+                            max_val = elev_series.max()
+                            min_val = elev_series.min()
+
+                            dem_metrics = {
+                                "elevation_min_m": round(float(min_val), 1),
+                                "elevation_max_m": round(float(max_val), 1),
+                                "elevation_mean_m": round(float(mean_val), 1),
+                                "slope_mean_deg": "—",
+                                "slope_max_deg": "—",
+                            }
+
+                            report_text += "⛰️ *Topographic Elevation Profiles (DEM):*\n"
+                            report_text += f"• Intersecting Mean Elevation: `{mean_val:.1f} m`\n"
+                            report_text += f"• Maximum Vertex Elevation Peak: `{max_val:.1f} m`\n"
+                            report_text += "• Processing Status: `[Natively Evaluated]` ✅\n\n"
+
+                            passed_dem_list = [dem_compiled]
+                        else:
+                            report_text += "⛰️ *Topographic Elevation Profiles (DEM):*\n"
+                            report_text += "• Processing Status: `[Elevation values empty]` ⚠️\n\n"
+                    else:
+                        report_text += "⛰️ *Topographic Elevation Profiles (DEM):*\n"
+                        report_text += "• Processing Status: `[Evaluated - No Elevation Attribute Columns Found]` ⚠️\n\n"
+                else:
+                    report_text += "⛰️ *Topographic Elevation Profiles (DEM):*\n"
+                    report_text += "• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
+
+                results = {
+                    "area_ha": calculated_area_ha,
+                    "centroid": [
+                        round(float(user_geom.centroid.x), 6),
+                        round(float(user_geom.centroid.y), 6),
+                    ],
+                    "fcm": {
+                        "dominant": dominant_cover_type,
+                        "classes": fcm_class_summary,
+                    },
+                    "dem": dem_metrics,
+                    "_raw_fcm_gdfs": passed_fcm_list,
+                    "_raw_dem_gdfs": passed_dem_list,
+                    "_has_water": "WATER" in fcm_class_summary,
+                }
+
+                polygon_filename = f"{base_name}_polygon_{polygon_number}"
+                log_analysis(
+                    user.id,
+                    polygon_filename,
+                    single_feature,
+                    {"status": "completed"},
+                    results["centroid"],
+                )
+
+                fcm_results = dict(results)
+                fcm_results["_map_mode"] = "fcm"
+
+                dem_results = dict(results)
+                dem_results["_map_mode"] = "dem"
+
+                try:
+                    logger.info(
+                        "RENDER_TRACE | file=%s | area=%.2f | fcm_classes=%s | raw_fcm_gdfs=%d | raw_dem_gdfs=%d | rows=%s | class_names=%s",
+                        polygon_filename,
+                        results.get("area_ha", 0),
+                        list(results.get("fcm", {}).get("classes", {}).keys()),
+                        len(results.get("_raw_fcm_gdfs", [])),
+                        len(results.get("_raw_dem_gdfs", [])),
+                        [len(gdf) for gdf in results.get("_raw_fcm_gdfs", [])],
+                        [
+                            gdf["class_name"].dropna().unique().tolist()
+                            if "class_name" in gdf.columns
+                            else "NO_CLASS_FIELD"
+                            for gdf in results.get("_raw_fcm_gdfs", [])
+                        ],
+                    )
+
+                    fcm_map_path = render_map(single_feature, fcm_results, f"{polygon_filename}_FCM", map_mode="fcm")
+                    dem_map_path = render_map(single_feature, dem_results, f"{polygon_filename}_DEM", map_mode="dem")
+
+                    fcm_caption = (
+                        report_text
+                        + "\n🗺 *Map View:* Forest cover emphasis\n"
+                        + "This image focuses on FCM classes while keeping the same polygon data.\n"
+                    )
+                    dem_caption = (
+                        report_text
+                        + "\n🗺 *Map View:* Contour emphasis\n"
+                        + "This image focuses on contour / elevation lines while keeping the same polygon data.\n"
+                    )
+
+                    if fcm_map_path and isinstance(fcm_map_path, io.BytesIO):
+                        await client.send_chat_action(chat_id=user.id, action=ChatAction.UPLOAD_PHOTO)
+                        await callback_query.message.reply_photo(
+                            photo=fcm_map_path,
+                            caption=fcm_caption,
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+
+                    if dem_map_path and isinstance(dem_map_path, io.BytesIO):
+                        await client.send_chat_action(chat_id=user.id, action=ChatAction.UPLOAD_PHOTO)
+                        await callback_query.message.reply_photo(
+                            photo=dem_map_path,
+                            caption=dem_caption,
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+
+                    if not fcm_map_path and not dem_map_path:
+                        await callback_query.message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN)
+
+                except Exception as map_err:
+                    logger.error(
+                        "Map rendering module encountered non-fatal dropout error: %s",
+                        map_err,
+                        exc_info=True,
+                    )
+                    await callback_query.message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN)
+
+                processed_any = True
+
+            except Exception as polygon_err:
+                logger.error(
+                    "Polygon %s analysis failed.",
+                    polygon_number,
+                    exc_info=True,
+                )
+                await callback_query.message.reply_text(
+                    f"❌ *Polygon `{polygon_number}/{polygon_total}` analysis failed:* `{polygon_err}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                continue
+
+        if not processed_any:
+            await callback_query.message.reply_text(
+                "⚠️ No valid polygon reports could be generated from the uploaded file.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+        await status_msg.delete()
+
+    except Exception as err:
+        logger.error("Error executing dynamic channel vector intersections pipeline", exc_info=True)
+        if "status_msg" in locals():
+            await status_msg.edit_text(f"❌ *Analysis Execution Failed:* {err}", parse_mode=ParseMode.MARKDOWN)
+    finally:
+        if tmp_workspace.exists():
+            shutil.rmtree(tmp_workspace, ignore_errors=True)
+        gc.collect()
 
 
 @Client.on_message(filters.text & filters.private & ~filters.regex(r"^/"))
 async def catch_all_text(client: Client, message: Message) -> None:
     await message.reply_text(
         "👋 I am ready to process your spatial layouts!\n\n"
-        "Please attach a valid configuration or spatial boundary file (.geojson, .kml, .zip) directly here. "
+        "Please attach a valid boundary file (.geojson, .kml, .zip) directly here. "
         "Type /help if you need formatting examples.",
         parse_mode=ParseMode.MARKDOWN,
     )
