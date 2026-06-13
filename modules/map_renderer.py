@@ -1,7 +1,7 @@
 """
 modules/map_renderer.py — Programmatic cartographic layout engine.
 Produces a multi-page PDF report with separate thematic pages for FCM, FTM,
-DEM (vector or raster contours) and bilingual summary / key facts / thank-you pages.
+DEM (vector contours only) and bilingual summary / key facts / thank-you pages.
 """
 
 from __future__ import annotations
@@ -483,6 +483,52 @@ def _resolve_thematic_modes(results: dict[str, Any]) -> list[str]:
     return modes
 
 
+def _build_figure() -> Figure:
+    fig = plt.figure(figsize=(16, 12))
+    fig.patch.set_facecolor(PALETTE["bg"])
+    fig.add_artist(
+        Rectangle(
+            (0.01, 0.01),
+            0.98,
+            0.98,
+            transform=fig.transFigure,
+            linewidth=3,
+            edgecolor=PALETTE["border"],
+            facecolor="none",
+            zorder=10,
+        )
+    )
+    return fig
+
+
+def _build_layout(fig: Figure):
+    gs = GridSpec(
+        2,
+        2,
+        figure=fig,
+        left=0.04,
+        right=0.96,
+        top=0.88,
+        bottom=0.04,
+        hspace=0.06,
+        wspace=0.06,
+        width_ratios=[4, 1],
+        height_ratios=[3, 1],
+    )
+
+    ax_map = fig.add_subplot(gs[0, 0])
+    ax_legend = fig.add_subplot(gs[0, 1])
+    ax_table = fig.add_subplot(gs[1, :])
+
+    for ax in (ax_map, ax_legend, ax_table):
+        ax.set_facecolor(PALETTE["panel"])
+        for spine in ax.spines.values():
+            spine.set_edgecolor(PALETTE["border"])
+            spine.set_linewidth(1.2)
+
+    return ax_map, ax_legend, ax_table
+
+
 def _build_thematic_figure(mode: str, geojson_feature: dict, results: dict, filename: str) -> Figure:
     fig = _build_figure()
     title = {
@@ -806,7 +852,10 @@ def _draw_dem_layers(ax, results: dict, study_geom) -> None:
             if getattr(gdf, "crs", None) and str(gdf.crs).upper() != "EPSG:4326":
                 gdf = gdf.to_crs("EPSG:4326")
 
-            elev_col = next((c for c in gdf.columns if str(c).lower() in {"elevation", "elev", "contour", "z"}), None)
+            elev_col = next(
+                (c for c in gdf.columns if str(c).lower() in {"elevation", "elev", "contour", "z"}),
+                None,
+            )
 
             for _, row in gdf.iterrows():
                 geom = row.geometry
@@ -1025,7 +1074,7 @@ def _draw_legend(ax, results: dict, mode: str) -> None:
     y -= dy * 0.6
 
     if mode == "dem":
-        sources = ["DEM raster / contours", "User boundary"]
+        sources = ["DEM contours", "User boundary"]
     elif mode == "ftm":
         sources = ["Forest type layer", "User boundary"]
     else:
@@ -1151,7 +1200,13 @@ def _draw_text_panel(
             cursor_y -= 0.02
             continue
 
-        wrapped = textwrap.wrap(raw_line, width=max_width) or [""]
+        wrapped = textwrap.wrap(
+            raw_line,
+            width=max_width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        ) or [""]
+
         for wrapped_line in wrapped:
             ax.text(
                 x + 0.02,
