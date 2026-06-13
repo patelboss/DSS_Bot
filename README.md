@@ -175,7 +175,7 @@ sdss/
 | Telegram       | Bot messaging           | Unlimited               |
 
 ---
-
+[![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?name=dss-bot&type=git&repository=patelboss%2FDSS_Bot&branch=main&builder=dockerfile&dockerfile=Dockerfile&instance_type=free&regions=was&instances_min=0&autoscaling_sleep_idle_delay=3900&env%5BAPI_HASH%5D=5ebe4b5c0a2af776bf5d2e52d7f5aaa4&env%5BAPI_ID%5D=4063950&env%5BBOT_TOKEN%5D=1803483590%3AAAEVHMdL6KcB9_wzzLE5eEqet-ybgtmyId4&env%5BCHANNEL_ID%5D=-1003588416077&env%5BMONGO_URI%5D=mongodb%2Bsrv%3A%2F%2FTelegramBot%3ATelegramBot%40cluster0.42rlp.mongodb.net%2F%3FappName%3DCluster0&env%5BSUPABASE_SERVICE_KEY%5D=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx2dmx0emZydHNpb2pqdHp3a2x4Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MDgyODA2NCwiZXhwIjoyMDk2NDA0MDY0fQ.9sD6XUmRDay3oGi5ppTHi8e9ccP3ZHRqKyOl85zjmVk&env%5BSUPABASE_URL%5D=https%3A%2F%2Flvvltzfrtsiojjtzwklx.supabase.co&ports=8080%3Bhttp%3B%2F&hc_protocol%5B8080%5D=tcp&hc_grace_period%5B8080%5D=5&hc_interval%5B8080%5D=30&hc_restart_limit%5B8080%5D=3&hc_timeout%5B8080%5D=5&hc_path%5B8080%5D=%2F&hc_method%5B8080%5D=get)
 ## License
 
 For internal use by the Madhya Pradesh Forest Department.
