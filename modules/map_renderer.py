@@ -1,13 +1,16 @@
 """
 modules/map_renderer.py — Programmatic cartographic layout engine.
 Produces a multi-page PDF report with separate thematic pages for FCM, FTM,
-DEM (vector or raster contours) and a bilingual summary page.
+DEM (vector or raster contours) and bilingual summary / key facts / thank-you pages.
 """
+
 from __future__ import annotations
 
+import gc
 import io
 import logging
 import math
+import os
 import sys
 import tempfile
 import textwrap
@@ -29,7 +32,15 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import FancyBboxPatch, Rectangle
 from rasterio.mask import mask as rio_mask
 from rasterio.transform import array_bounds
-from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Polygon, mapping, shape
+from shapely.geometry import (
+    GeometryCollection,
+    LineString,
+    MultiLineString,
+    MultiPolygon,
+    Polygon,
+    mapping,
+    shape,
+)
 
 from config import cfg
 
@@ -93,27 +104,40 @@ FTM_FALLBACK_PALETTE = [
     "#5f7a36",
 ]
 
-# Best-effort Devanagari font support.
-_DEVA_FONT_FAMILY = None
+_DEVA_FONT_FAMILY: str | None = None
+_FONT_KWARGS: dict[str, Any] = {}
 
 
 def _configure_fonts() -> str | None:
     """
-    Try to use Kokila first, then common Devanagari fallbacks.
-    If a bundled font exists in the repo, it will be used automatically.
+    Best-effort Hindi/Devanagari font support.
+
+    Tries Kokila first, then common Devanagari-capable fonts on Linux / Windows /
+    macOS. If no Indic font is found, Matplotlib falls back to DejaVu Sans.
     """
-    global _DEVA_FONT_FAMILY
+    global _DEVA_FONT_FAMILY, _FONT_KWARGS
 
     candidates = [
         Path(__file__).resolve().parent / "fonts" / "Kokila.ttf",
         Path(__file__).resolve().parent / "fonts" / "Kokila-Regular.ttf",
         Path("/app/fonts/Kokila.ttf"),
         Path("/app/fonts/Kokila-Regular.ttf"),
+        Path("/app/fonts/NotoSansDevanagari-Regular.ttf"),
         Path("/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf"),
         Path("/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf"),
         Path("/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf"),
+        Path("/usr/share/fonts/truetype/samyak-fonts/Samyak-Devanagari.ttf"),
+        Path("/usr/share/fonts/truetype/samyak/Samyak-Devanagari.ttf"),
+        Path("/usr/share/fonts/truetype/gargi/Gargi.ttf"),
         Path("/usr/share/fonts/truetype/msttcorefonts/Mangal.ttf"),
+        Path("/Library/Fonts/Arial Unicode.ttf"),
+        Path("C:/Windows/Fonts/nirmala.ttf"),
+        Path("C:/Windows/Fonts/mangal.ttf"),
+        Path("C:/Windows/Fonts/aparaj.ttf"),
+        Path("C:/Windows/Fonts/kokila.ttf"),
     ]
+
+    default_sans = ["DejaVu Sans", "Arial", "sans-serif"]
 
     for font_path in candidates:
         try:
@@ -122,19 +146,23 @@ def _configure_fonts() -> str | None:
                 family_name = fm.FontProperties(fname=str(font_path)).get_name()
                 if family_name:
                     _DEVA_FONT_FAMILY = family_name
-                    plt.rcParams["font.family"] = [family_name, "DejaVu Sans", "sans-serif"]
+                    plt.rcParams["font.family"] = "sans-serif"
+                    plt.rcParams["font.sans-serif"] = [family_name] + default_sans
                     plt.rcParams["axes.unicode_minus"] = False
                     plt.rcParams["pdf.fonttype"] = 42
                     plt.rcParams["ps.fonttype"] = 42
+                    _FONT_KWARGS = {"fontfamily": family_name}
                     log.info("Hindi font configured: %s", family_name)
                     return family_name
         except Exception as exc:
             log.warning("Font load skipped for %s: %s", font_path, exc)
 
-    plt.rcParams["font.family"] = ["DejaVu Sans", "sans-serif"]
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["font.sans-serif"] = default_sans
     plt.rcParams["axes.unicode_minus"] = False
     plt.rcParams["pdf.fonttype"] = 42
     plt.rcParams["ps.fonttype"] = 42
+    _FONT_KWARGS = {}
     log.warning("No Devanagari font found; falling back to DejaVu Sans.")
     return None
 
@@ -146,6 +174,222 @@ def PathSafe(name: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(name))
 
 
+def _safe_float(value: Any, default: float | None = None) -> float | None:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _round_to_nice(val: float) -> float:
+    if val <= 0:
+        return 1.0
+    magnitude = 10 ** math.floor(math.log10(val))
+    residual = val / magnitude
+    if residual < 1.5:
+        return 1 * magnitude
+    if residual < 3.5:
+        return 2 * magnitude
+    if residual < 7.5:
+        return 5 * magnitude
+    return 10 * magnitude
+
+
+def _geom_to_xy(coords):
+    return [c[0] for c in coords], [c[1] for c in coords]
+
+
+def _iter_geoms(geom):
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, GeometryCollection):
+        out = []
+        for part in geom.geoms:
+            out.extend(_iter_geoms(part))
+        return out
+    if geom.geom_type in {"MultiPolygon", "MultiLineString"}:
+        return list(geom.geoms)
+    if geom.geom_type in {"Polygon", "LineString"}:
+        return [geom]
+    return []
+
+
+def _match_fcm_color(class_attr: str) -> str:
+    s = str(class_attr or "").strip().upper()
+    if "VDF" in s or "VERY DENSE" in s:
+        return PALETTE["vdf"]
+    if "MDF" in s or "MODERATELY DENSE" in s:
+        return PALETTE["mdf"]
+    if "OPEN" in s:
+        return PALETTE["open"]
+    if "NON FOREST" in s or "NON-FOREST" in s:
+        return PALETTE["nonforest"]
+    if "SCRUB" in s:
+        return PALETTE["scrub"]
+    if "WATER" in s:
+        return PALETTE["water"]
+    return PALETTE["fallback"]
+
+
+def _stable_color_for_label(label: str) -> str:
+    idx = zlib.crc32(str(label).encode("utf-8")) % len(FTM_FALLBACK_PALETTE)
+    return FTM_FALLBACK_PALETTE[idx]
+
+
+def _extract_ftm_label(row) -> str:
+    for field in ("class_name", "forest_type", "type", "name", "species", "category", "label", "cover_type"):
+        try:
+            if field in row and row.get(field) not in (None, ""):
+                return str(row.get(field)).strip()
+        except Exception:
+            pass
+    return "FTM"
+
+
+def _friendly_fcm_label(raw_label: str | None, lang: str = "en") -> str:
+    key = str(raw_label or "").strip().upper()
+    en, hi = FCM_LABELS.get(key, (key or "No Data", "डेटा अनुपलब्ध"))
+    return en if lang == "en" else hi
+
+
+def _auto_sort_fcm_classes(fcm_classes: dict[str, dict[str, Any]]) -> list[tuple[str, float]]:
+    items: list[tuple[str, float]] = []
+    for label, metrics in fcm_classes.items():
+        try:
+            pct = float(metrics.get("percentage", 0.0))
+        except Exception:
+            pct = 0.0
+        items.append((str(label), pct))
+    items.sort(key=lambda x: x[1], reverse=True)
+    return items
+
+
+def _collect_ftm_stats(results: dict) -> list[tuple[str, int, str]]:
+    ftm_gdfs = results.get("_raw_ftm_gdfs", []) or []
+    counts: dict[str, int] = {}
+
+    for gdf in ftm_gdfs:
+        if gdf is None or gdf.empty:
+            continue
+        for _, row in gdf.iterrows():
+            label = _extract_ftm_label(row)
+            counts[label] = counts.get(label, 0) + 1
+
+    ranked = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    return [(label, count, _stable_color_for_label(label)) for label, count in ranked]
+
+
+def _prepare_report_content(results: dict[str, Any]) -> dict[str, Any]:
+    area = float(results.get("area_ha", 0.0) or 0.0)
+
+    fcm = results.get("fcm", {}) or {}
+    classes = fcm.get("classes", {}) or {}
+
+    dominant_raw = str(fcm.get("dominant", "") or "").strip().upper()
+    if dominant_raw not in classes and classes:
+        dominant_raw = max(
+            classes.items(),
+            key=lambda kv: _safe_float(kv[1].get("percentage", 0.0), 0.0) or 0.0,
+        )[0].strip().upper()
+
+    dominant_en = _friendly_fcm_label(dominant_raw, "en")
+    dominant_hi = _friendly_fcm_label(dominant_raw, "hi")
+    dominant_pct = float(classes.get(dominant_raw, {}).get("percentage", 0.0) or 0.0)
+
+    dem = results.get("dem", {}) or {}
+    elev_min = dem.get("elevation_min_m")
+    elev_max = dem.get("elevation_max_m")
+    elev_mean = dem.get("elevation_mean_m")
+
+    if elev_min is not None and elev_max is not None:
+        elevation_range_en = f"{float(elev_min):.0f}–{float(elev_max):.0f} metres above mean sea level"
+        elevation_range_hi = f"{float(elev_min):.0f}–{float(elev_max):.0f} मीटर समुद्र तल से ऊपर"
+    else:
+        elevation_range_en = "not available"
+        elevation_range_hi = "उपलब्ध नहीं"
+
+    if elev_mean is not None:
+        mean_en = f"{float(elev_mean):.0f} metres"
+        mean_hi = f"{float(elev_mean):.0f} मीटर"
+    else:
+        mean_en = "not available"
+        mean_hi = "उपलब्ध नहीं"
+
+    sorted_classes = _auto_sort_fcm_classes(classes)
+
+    non_dom_classes = [
+        label
+        for label, _pct in sorted_classes
+        if label != dominant_raw and label not in {"WATER", "NO-DATA"}
+    ]
+
+    secondary_text_en = ""
+    secondary_text_hi = ""
+    if non_dom_classes:
+        top2 = [_friendly_fcm_label(lbl, "en") for lbl in non_dom_classes[:2]]
+        top2_hi = [_friendly_fcm_label(lbl, "hi") for lbl in non_dom_classes[:2]]
+        secondary_text_en = f" The next dominant classes, where present, are {', '.join(top2)}."
+        secondary_text_hi = f" उपलब्ध होने पर द्वितीय एवं तृतीय प्रमुख आवरण वर्ग {', '.join(top2_hi)} हैं।"
+
+    summary_en = results.get("summary_en")
+    summary_hi = results.get("summary_hi")
+
+    if not summary_en or not summary_hi:
+        summary_en = (
+            f"The analysed area covers {area:.2f} hectares.\n\n"
+            f"Forest Cover Mapping indicates that {dominant_en} is the dominant forest class, "
+            f"accounting for {dominant_pct:.1f}% of the total area.\n\n"
+            f"Terrain analysis derived from DEM data shows an elevation range of {elevation_range_en}, "
+            f"with an average elevation of {mean_en}.\n\n"
+            f"The area is predominantly forested with limited non-forest and scrub patches."
+            f"{secondary_text_en}"
+        )
+        summary_hi = (
+            f"विश्लेषण किए गए क्षेत्र का कुल क्षेत्रफल {area:.2f} हेक्टेयर है।\n\n"
+            f"वन आवरण मैपिंग से पता चलता है कि {dominant_hi} मुख्य वन वर्ग है, "
+            f"जो कुल क्षेत्रफल का {dominant_pct:.1f}% हिस्सा है।\n\n"
+            f"DEM डेटा से किए गए भू-भाग विश्लेषण से पता चलता है कि समुद्र तल से ऊंचाई {elevation_range_hi} है, "
+            f"और औसत ऊंचाई {mean_hi} है।\n\n"
+            f"यह क्षेत्र मुख्य रूप से वनाच्छादित है, तथा गैर-वन और झाड़ीदार क्षेत्र सीमित हैं।"
+            f"{secondary_text_hi}"
+        )
+
+    keyfacts_lines = results.get("key_facts_lines")
+    if not keyfacts_lines:
+        keyfacts_lines = [
+            f"✓ Total Area / कुल क्षेत्रफल: {area:.2f} ha",
+            f"✓ Dominant Forest Class / प्रमुख वन वर्ग: {dominant_en} ({dominant_pct:.1f}%)",
+            "✓ Forest Cover Distribution / वन आवरण वितरण:",
+        ]
+        preferred_order = ["VDF", "MDF", "OPEN FOREST", "NON FOREST", "SCRUB", "WATER", "NO-DATA"]
+        seen = set()
+
+        for label in preferred_order:
+            if label in classes:
+                pct = float(classes.get(label, {}).get("percentage", 0.0) or 0.0)
+                keyfacts_lines.append(f"  • {label} / {_friendly_fcm_label(label, 'hi')}: {pct:.1f}%")
+                seen.add(label)
+
+        for label, metrics in sorted_classes:
+            if label in seen:
+                continue
+            pct = float(metrics.get("percentage", 0.0) or 0.0)
+            keyfacts_lines.append(f"  • {label}: {pct:.1f}%")
+
+        if elev_min is not None and elev_max is not None:
+            keyfacts_lines.append(f"✓ Elevation Range / ऊँचाई सीमा: {float(elev_min):.0f}–{float(elev_max):.0f} m")
+        if elev_mean is not None:
+            keyfacts_lines.append(f"✓ Mean Elevation / औसत ऊँचाई: {float(elev_mean):.0f} m")
+
+    return {
+        "summary_en": str(summary_en).strip(),
+        "summary_hi": str(summary_hi).strip(),
+        "keyfacts_lines": [str(x) for x in keyfacts_lines],
+    }
+
+
 def render_map(
     geojson_feature: dict,
     results: dict[str, Any],
@@ -155,13 +399,13 @@ def render_map(
     """
     Return a multi-page PDF report in memory.
 
-    The page order is dynamic:
-      - FCM page if available
-      - DEM page if available
-      - FTM page if available
-      - Summary page always
-      - Key Facts page always
-      - Thank You page always
+    Page order:
+      - FCM if available
+      - DEM if available
+      - FTM if available
+      - Summary (always)
+      - Key Facts (always)
+      - Thank You (always)
     """
     mode = str(map_mode or results.get("_map_mode", "bundle")).strip().lower()
     if mode not in {"bundle", "fcm", "ftm", "dem"}:
@@ -169,20 +413,17 @@ def render_map(
 
     thematic_modes = _resolve_thematic_modes(results, mode)
     page_specs: list[tuple[str, str | None]] = [(m, None) for m in thematic_modes]
-    page_specs.extend(
-        [
-            ("summary", None),
-            ("keyfacts", None),
-            ("thanks", None),
-        ]
-    )
+    page_specs.extend([("summary", None), ("keyfacts", None), ("thanks", None)])
 
     total_pages = len(page_specs)
-    tmp_pdf = Path(tempfile.gettempdir()) / f"{PathSafe(filename)}_{mode}.pdf"
+
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{PathSafe(filename)}_{mode}_", suffix=".pdf")
+    os.close(fd)
+    tmp_pdf = Path(tmp_name)
 
     try:
         with PdfPages(str(tmp_pdf)) as pdf:
-            for page_index, (page_kind, thematic_mode) in enumerate(page_specs, start=1):
+            for page_index, (page_kind, _thematic_mode) in enumerate(page_specs, start=1):
                 if page_kind in {"fcm", "ftm", "dem"}:
                     fig = _build_thematic_figure(page_kind, geojson_feature, results, filename)
                 elif page_kind == "summary":
@@ -195,6 +436,7 @@ def render_map(
                 _draw_page_footer(fig, page_index, total_pages)
                 pdf.savefig(fig, dpi=300, bbox_inches="tight")
                 plt.close(fig)
+                gc.collect()
 
         buf = io.BytesIO(tmp_pdf.read_bytes())
         buf.seek(0)
@@ -232,6 +474,52 @@ def _resolve_thematic_modes(results: dict[str, Any], requested_mode: str) -> lis
         return ["ftm"]
 
     return []
+
+
+def _build_figure() -> Figure:
+    fig = plt.figure(figsize=(16, 12))
+    fig.patch.set_facecolor(PALETTE["bg"])
+    fig.add_artist(
+        Rectangle(
+            (0.01, 0.01),
+            0.98,
+            0.98,
+            transform=fig.transFigure,
+            linewidth=3,
+            edgecolor=PALETTE["border"],
+            facecolor="none",
+            zorder=10,
+        )
+    )
+    return fig
+
+
+def _build_layout(fig: Figure):
+    gs = GridSpec(
+        2,
+        2,
+        figure=fig,
+        left=0.04,
+        right=0.96,
+        top=0.88,
+        bottom=0.04,
+        hspace=0.06,
+        wspace=0.06,
+        width_ratios=[4, 1],
+        height_ratios=[3, 1],
+    )
+
+    ax_map = fig.add_subplot(gs[0, 0])
+    ax_legend = fig.add_subplot(gs[0, 1])
+    ax_table = fig.add_subplot(gs[1, :])
+
+    for ax in (ax_map, ax_legend, ax_table):
+        ax.set_facecolor(PALETTE["panel"])
+        for spine in ax.spines.values():
+            spine.set_edgecolor(PALETTE["border"])
+            spine.set_linewidth(1.2)
+
+    return ax_map, ax_legend, ax_table
 
 
 def _build_thematic_figure(mode: str, geojson_feature: dict, results: dict, filename: str) -> Figure:
@@ -480,6 +768,7 @@ def _build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
         fontsize=15,
         color=PALETTE["thank_text"],
     )
+
     fig.text(
         0.50,
         0.40,
@@ -489,6 +778,7 @@ def _build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
         fontsize=30,
         fontweight="bold",
         color=PALETTE["thank_text"],
+        **_FONT_KWARGS,
     )
     fig.text(
         0.50,
@@ -498,6 +788,7 @@ def _build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
         va="center",
         fontsize=18,
         color=PALETTE["thank_text"],
+        **_FONT_KWARGS,
     )
     fig.text(
         0.50,
@@ -507,7 +798,9 @@ def _build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
         va="center",
         fontsize=15,
         color=PALETTE["thank_text"],
+        **_FONT_KWARGS,
     )
+
     fig.text(
         0.50,
         0.10,
@@ -518,215 +811,6 @@ def _build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
         color=PALETTE["text_mid"],
     )
     return fig
-
-
-def _build_figure() -> Figure:
-    fig = plt.figure(figsize=(16, 12))
-    fig.patch.set_facecolor(PALETTE["bg"])
-    fig.add_artist(
-        Rectangle(
-            (0.01, 0.01),
-            0.98,
-            0.98,
-            transform=fig.transFigure,
-            linewidth=3,
-            edgecolor=PALETTE["border"],
-            facecolor="none",
-            zorder=10,
-        )
-    )
-    return fig
-
-
-def _build_layout(fig: Figure):
-    gs = GridSpec(
-        2,
-        2,
-        figure=fig,
-        left=0.04,
-        right=0.96,
-        top=0.88,
-        bottom=0.04,
-        hspace=0.06,
-        wspace=0.06,
-        width_ratios=[4, 1],
-        height_ratios=[3, 1],
-    )
-
-    ax_map = fig.add_subplot(gs[0, 0])
-    ax_legend = fig.add_subplot(gs[0, 1])
-    ax_table = fig.add_subplot(gs[1, :])
-
-    for ax in (ax_map, ax_legend, ax_table):
-        ax.set_facecolor(PALETTE["panel"])
-        for spine in ax.spines.values():
-            spine.set_edgecolor(PALETTE["border"])
-            spine.set_linewidth(1.2)
-
-    return ax_map, ax_legend, ax_table
-
-
-def _geom_to_xy(coords):
-    xs = [c[0] for c in coords]
-    ys = [c[1] for c in coords]
-    return xs, ys
-
-
-def _iter_geoms(geom):
-    if geom is None or geom.is_empty:
-        return []
-    if isinstance(geom, GeometryCollection):
-        out = []
-        for part in geom.geoms:
-            out.extend(_iter_geoms(part))
-        return out
-    if geom.geom_type in {"MultiPolygon", "MultiLineString"}:
-        return list(geom.geoms)
-    if geom.geom_type in {"Polygon", "LineString"}:
-        return [geom]
-    return []
-
-
-def _match_fcm_color(class_attr: str) -> str:
-    s = str(class_attr or "").strip().upper()
-    if "VDF" in s or "VERY DENSE" in s:
-        return PALETTE["vdf"]
-    if "MDF" in s or "MODERATELY DENSE" in s:
-        return PALETTE["mdf"]
-    if "OPEN" in s:
-        return PALETTE["open"]
-    if "NON FOREST" in s or "NON-FOREST" in s:
-        return PALETTE["nonforest"]
-    if "SCRUB" in s:
-        return PALETTE["scrub"]
-    if "WATER" in s:
-        return PALETTE["water"]
-    return PALETTE["fallback"]
-
-
-def _stable_color_for_label(label: str) -> str:
-    idx = zlib.crc32(str(label).encode("utf-8")) % len(FTM_FALLBACK_PALETTE)
-    return FTM_FALLBACK_PALETTE[idx]
-
-
-def _extract_ftm_label(row) -> str:
-    for field in ("class_name", "forest_type", "type", "name", "species", "category", "label", "cover_type"):
-        if field in row and row.get(field) not in (None, ""):
-            return str(row.get(field)).strip()
-    return "FTM"
-
-
-def _friendly_fcm_label(raw_label: str | None, lang: str = "en") -> str:
-    key = str(raw_label or "").strip().upper()
-    en, hi = FCM_LABELS.get(key, (key or "No Data", "डेटा अनुपलब्ध"))
-    return en if lang == "en" else hi
-
-
-def _auto_sort_fcm_classes(fcm_classes: dict[str, dict[str, Any]]) -> list[tuple[str, float]]:
-    items: list[tuple[str, float]] = []
-    for label, metrics in fcm_classes.items():
-        try:
-            pct = float(metrics.get("percentage", 0.0))
-        except Exception:
-            pct = 0.0
-        items.append((str(label), pct))
-    items.sort(key=lambda x: x[1], reverse=True)
-    return items
-
-
-def _prepare_report_content(results: dict[str, Any]) -> dict[str, Any]:
-    area = float(results.get("area_ha", 0.0) or 0.0)
-    fcm = results.get("fcm", {}) or {}
-    classes = fcm.get("classes", {}) or {}
-    dominant_raw = str(fcm.get("dominant", "") or "").strip().upper()
-    dominant_en = _friendly_fcm_label(dominant_raw, "en")
-    dominant_hi = _friendly_fcm_label(dominant_raw, "hi")
-    dominant_pct = float(classes.get(dominant_raw, {}).get("percentage", 0.0) or 0.0)
-
-    dem = results.get("dem", {}) or {}
-    elev_min = dem.get("elevation_min_m")
-    elev_max = dem.get("elevation_max_m")
-    elev_mean = dem.get("elevation_mean_m")
-
-    elevation_range_en = "not available"
-    elevation_range_hi = "उपलब्ध नहीं"
-    mean_en = "not available"
-    mean_hi = "उपलब्ध नहीं"
-
-    if elev_min is not None and elev_max is not None:
-        elevation_range_en = f"{float(elev_min):.0f}–{float(elev_max):.0f} metres above mean sea level"
-        elevation_range_hi = f"{float(elev_min):.0f}–{float(elev_max):.0f} मीटर समुद्र तल से ऊपर"
-    if elev_mean is not None:
-        mean_en = f"{float(elev_mean):.0f} metres"
-        mean_hi = f"{float(elev_mean):.0f} मीटर"
-
-    sorted_classes = _auto_sort_fcm_classes(classes)
-    available_cover_lines_en = []
-    available_cover_lines_hi = []
-    for label, pct in sorted_classes:
-        available_cover_lines_en.append(f"{label}: {pct:.1f}%")
-        available_cover_lines_hi.append(f"{_friendly_fcm_label(label, 'hi')}: {pct:.1f}%")
-
-    non_dom_classes = [label for label, _pct in sorted_classes if label != dominant_raw and label not in {"WATER", "NO-DATA"}]
-    secondary_text_en = ""
-    secondary_text_hi = ""
-    if non_dom_classes:
-        top2 = [_friendly_fcm_label(lbl, "en") for lbl in non_dom_classes[:2]]
-        top2_hi = [_friendly_fcm_label(lbl, "hi") for lbl in non_dom_classes[:2]]
-        secondary_text_en = f" The next dominant classes, where present, are {', '.join(top2)}."
-        secondary_text_hi = f" उपलब्ध होने पर द्वितीय एवं तृतीय प्रमुख आवरण वर्ग {', '.join(top2_hi)} हैं।"
-
-    summary_en = results.get("summary_en")
-    summary_hi = results.get("summary_hi")
-    if not summary_en or not summary_hi:
-        summary_en = (
-            f"The analysed area covers {area:.2f} hectares.\n\n"
-            f"Forest Cover Mapping indicates that {dominant_en} is the dominant forest class, "
-            f"accounting for {dominant_pct:.1f}% of the total area.\n\n"
-            f"Terrain analysis derived from DEM data shows an elevation range of {elevation_range_en}, "
-            f"with an average elevation of {mean_en}.\n\n"
-            f"The area is predominantly forested with limited non-forest and scrub patches."
-            f"{secondary_text_en}"
-        )
-        summary_hi = (
-            f"विश्लेषण किए गए क्षेत्र का कुल क्षेत्रफल {area:.2f} हेक्टेयर है।\n\n"
-            f"वन आवरण मैपिंग से पता चलता है कि {dominant_hi} मुख्य वन वर्ग है, "
-            f"जो कुल क्षेत्रफल का {dominant_pct:.1f}% हिस्सा है।\n\n"
-            f"DEM डेटा से किए गए भू-भाग विश्लेषण से पता चलता है कि समुद्र तल से ऊंचाई {elevation_range_hi} है, "
-            f"और औसत ऊंचाई {mean_hi} है।\n\n"
-            f"यह क्षेत्र मुख्य रूप से वनाच्छादित है, तथा गैर-वन और झाड़ीदार क्षेत्र सीमित हैं।"
-            f"{secondary_text_hi}"
-        )
-
-    keyfacts_lines = results.get("key_facts_lines")
-    if not keyfacts_lines:
-        keyfacts_lines = [
-            f"✓ Total Area / कुल क्षेत्रफल: {area:.2f} ha",
-            f"✓ Dominant Forest Class / प्रमुख वन वर्ग: {dominant_en} ({dominant_pct:.1f}%)",
-            "✓ Forest Cover Distribution / वन आवरण वितरण:",
-        ]
-        preferred_order = ["VDF", "MDF", "OPEN FOREST", "NON FOREST", "SCRUB", "WATER", "NO-DATA"]
-        seen = set()
-        for label in preferred_order:
-            if label in classes:
-                pct = float(classes.get(label, {}).get("percentage", 0.0) or 0.0)
-                keyfacts_lines.append(f"  • {label} / { _friendly_fcm_label(label, 'hi') }: {pct:.1f}%")
-                seen.add(label)
-        for label, metrics in sorted_classes:
-            if label in seen:
-                continue
-            pct = float(metrics or 0.0)
-            keyfacts_lines.append(f"  • {label}: {pct:.1f}%")
-        if elev_min is not None and elev_max is not None:
-            keyfacts_lines.append(f"✓ Elevation Range / ऊँचाई सीमा: {float(elev_min):.0f}–{float(elev_max):.0f} m")
-        if elev_mean is not None:
-            keyfacts_lines.append(f"✓ Mean Elevation / औसत ऊँचाई: {float(elev_mean):.0f} m")
-
-    return {
-        "summary_en": str(summary_en).strip(),
-        "summary_hi": str(summary_hi).strip(),
-        "keyfacts_lines": [str(x) for x in keyfacts_lines],
-    }
 
 
 def _draw_map_panel(ax, geojson_feature: dict, results: dict, mode: str) -> None:
@@ -759,6 +843,7 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict, mode: str) -> None
         _draw_dem_layers(ax, results, geom)
 
     _draw_study_boundary(ax, geom)
+
     ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.4f°E"))
     ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.4f°N"))
     ax.tick_params(axis="both", labelsize=7, color=PALETTE["text_mid"])
@@ -783,12 +868,14 @@ def _draw_fcm_layers(ax, results: dict) -> None:
         if getattr(gdf, "crs", None) and str(gdf.crs).upper() != "EPSG:4326":
             gdf = gdf.to_crs("EPSG:4326")
 
-        for _, row in gdf.iterrows():
-            geom = row.geometry
+        for row in gdf.itertuples(index=False):
+            geom = getattr(row, "geometry", None)
             if geom is None or geom.is_empty:
                 continue
 
-            color = _match_fcm_color(row.get("class_name", ""))
+            class_attr = getattr(row, "class_name", "")
+            color = _match_fcm_color(class_attr)
+
             for part in _iter_geoms(geom):
                 if part.geom_type == "Polygon":
                     xs, ys = _geom_to_xy(list(part.exterior.coords))
@@ -816,8 +903,8 @@ def _draw_ftm_layers(ax, results: dict) -> None:
         if getattr(gdf, "crs", None) and str(gdf.crs).upper() != "EPSG:4326":
             gdf = gdf.to_crs("EPSG:4326")
 
-        for _, row in gdf.iterrows():
-            geom = row.geometry
+        for row in gdf.itertuples(index=False):
+            geom = getattr(row, "geometry", None)
             if geom is None or geom.is_empty:
                 continue
 
@@ -859,13 +946,13 @@ def _draw_dem_layers(ax, results: dict, study_geom) -> None:
                         nodata=src.nodata,
                     )
 
-                    data = np.array(out_image[0], dtype="float64")
+                    band = out_image[0].astype("float64")
                     if src.nodata is not None:
-                        data[data == src.nodata] = np.nan
+                        band[band == src.nodata] = np.nan
                     else:
-                        data[~np.isfinite(data)] = np.nan
+                        band[~np.isfinite(band)] = np.nan
 
-                    finite = data[np.isfinite(data)]
+                    finite = band[np.isfinite(band)]
                     if finite.size < 2:
                         continue
 
@@ -874,17 +961,18 @@ def _draw_dem_layers(ax, results: dict, study_geom) -> None:
                     if math.isclose(min_val, max_val):
                         continue
 
-                    left, bottom, right, top = array_bounds(data.shape[0], data.shape[1], out_transform)
+                    height, width = band.shape
+                    left, bottom, right, top = array_bounds(height, width, out_transform)
                     extent = (left, right, bottom, top)
 
-                    # Hillshade first.
                     ls = LightSource(azdeg=315, altdeg=45)
                     hillshade = ls.hillshade(
-                        np.nan_to_num(data, nan=min_val),
+                        np.nan_to_num(band, nan=min_val),
                         vert_exag=1.25,
                         dx=abs(out_transform.a),
                         dy=abs(out_transform.e) if out_transform.e else abs(out_transform.a),
                     )
+
                     ax.imshow(
                         hillshade,
                         cmap="Greys",
@@ -894,9 +982,8 @@ def _draw_dem_layers(ax, results: dict, study_geom) -> None:
                         zorder=1,
                     )
 
-                    # Build contour grid.
-                    x_coords = out_transform.c + (np.arange(data.shape[1]) + 0.5) * out_transform.a
-                    y_coords = out_transform.f + (np.arange(data.shape[0]) + 0.5) * out_transform.e
+                    x_coords = out_transform.c + (np.arange(width) + 0.5) * out_transform.a
+                    y_coords = out_transform.f + (np.arange(height) + 0.5) * out_transform.e
                     X, Y = np.meshgrid(x_coords, y_coords)
 
                     start = math.floor(min_val / contour_interval) * contour_interval
@@ -912,7 +999,7 @@ def _draw_dem_layers(ax, results: dict, study_geom) -> None:
                         ax.contour(
                             X,
                             Y,
-                            data,
+                            band,
                             levels=minor_levels,
                             colors=PALETTE["contour_faint"],
                             linewidths=0.45,
@@ -925,7 +1012,7 @@ def _draw_dem_layers(ax, results: dict, study_geom) -> None:
                         cs_major = ax.contour(
                             X,
                             Y,
-                            data,
+                            band,
                             levels=major_levels,
                             colors=PALETTE["contour"],
                             linewidths=0.9,
@@ -956,12 +1043,12 @@ def _draw_dem_layers(ax, results: dict, study_geom) -> None:
                 None,
             )
 
-            for _, row in gdf.iterrows():
-                geom = row.geometry
+            for row in gdf.itertuples(index=False):
+                geom = getattr(row, "geometry", None)
                 if geom is None or geom.is_empty:
                     continue
 
-                elev_val = row.get(elev_col) if elev_col else None
+                elev_val = getattr(row, elev_col) if elev_col else None
                 is_major = False
                 if elev_val is not None:
                     try:
@@ -1373,21 +1460,6 @@ def _draw_legend(ax, results: dict, mode: str) -> None:
     )
 
 
-def _collect_ftm_stats(results: dict) -> list[tuple[str, int, str]]:
-    ftm_gdfs = results.get("_raw_ftm_gdfs", []) or []
-    counts: dict[str, int] = {}
-
-    for gdf in ftm_gdfs:
-        if gdf is None or gdf.empty:
-            continue
-        for _, row in gdf.iterrows():
-            label = _extract_ftm_label(row)
-            counts[label] = counts.get(label, 0) + 1
-
-    ranked = sorted(counts.items(), key=lambda x: x[1], reverse=True)
-    return [(label, count, _stable_color_for_label(label)) for label, count in ranked]
-
-
 def _draw_table(ax, results: dict, filename: str, mode: str) -> None:
     ax.set_xticks([])
     ax.set_yticks([])
@@ -1502,6 +1574,7 @@ def _draw_text_panel(
         fontweight="bold",
         color=title_color,
         va="top",
+        **_FONT_KWARGS,
     )
 
     if isinstance(body_text, str):
@@ -1528,6 +1601,7 @@ def _draw_text_panel(
                 color=text_color,
                 va="top",
                 ha="left",
+                **_FONT_KWARGS,
             )
             cursor_y -= 0.032 * line_gap
 
@@ -1547,17 +1621,3 @@ def _draw_page_footer(fig: Figure, page_index: int, total_pages: int) -> None:
         fontsize=8,
         color=PALETTE["text_mid"],
     )
-
-
-def _round_to_nice(val: float) -> float:
-    if val <= 0:
-        return 1.0
-    magnitude = 10 ** math.floor(math.log10(val))
-    residual = val / magnitude
-    if residual < 1.5:
-        return 1 * magnitude
-    if residual < 3.5:
-        return 2 * magnitude
-    if residual < 7.5:
-        return 5 * magnitude
-    return 10 * magnitude
