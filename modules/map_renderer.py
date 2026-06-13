@@ -3,7 +3,6 @@ modules/map_renderer.py — Programmatic cartographic layout engine.
 Produces a multi-page PDF report with separate thematic pages for FCM, FTM,
 DEM (vector or raster contours) and a bilingual summary page.
 """
-
 from __future__ import annotations
 
 import io
@@ -12,29 +11,37 @@ import math
 import sys
 import tempfile
 import textwrap
+import zlib
 from pathlib import Path
 from typing import Any
 
+import matplotlib.font_manager as fm
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 import rasterio
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.colors import LightSource
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
+from matplotlib.lines import Line2D
 from matplotlib.patches import FancyBboxPatch, Rectangle
 from rasterio.mask import mask as rio_mask
-from shapely.geometry import GeometryCollection, LineString, MultiLineString, shape
+from rasterio.transform import array_bounds
+from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Polygon, mapping, shape
 
 from config import cfg
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
+
 if not log.handlers:
-    h = logging.StreamHandler(sys.stdout)
-    h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-    log.addHandler(h)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    log.addHandler(handler)
 
 PALETTE = {
     "bg": "#f5f2eb",
@@ -56,8 +63,83 @@ PALETTE = {
     "fallback": "#a3c2c2",
     "ftm": "#6d8c57",
     "contour": "#7a5a3a",
-    "contour_faint": "#8d6a47",
+    "contour_faint": "#a07b5d",
+    "thank_bg": "#e7f3e6",
+    "thank_text": "#1f5f2a",
 }
+
+FCM_LABELS = {
+    "VDF": ("Very Dense Forest", "अत्यधिक घना वन"),
+    "MDF": ("Moderately Dense Forest", "मध्यम घना वन"),
+    "OPEN FOREST": ("Open Forest", "खुला वन"),
+    "NON FOREST": ("Non Forest", "गैर-वन"),
+    "SCRUB": ("Scrub", "झाड़ीदार क्षेत्र"),
+    "WATER": ("Water", "जल"),
+    "NO-DATA": ("No Data", "डेटा अनुपलब्ध"),
+}
+
+FTM_FALLBACK_PALETTE = [
+    "#4c8c2b",
+    "#6a994e",
+    "#a7c957",
+    "#386641",
+    "#bc6c25",
+    "#a98467",
+    "#52796f",
+    "#2f5233",
+    "#8d6e63",
+    "#708238",
+    "#7f9c45",
+    "#5f7a36",
+]
+
+# Best-effort Devanagari font support.
+_DEVA_FONT_FAMILY = None
+
+
+def _configure_fonts() -> str | None:
+    """
+    Try to use Kokila first, then common Devanagari fallbacks.
+    If a bundled font exists in the repo, it will be used automatically.
+    """
+    global _DEVA_FONT_FAMILY
+
+    candidates = [
+        Path(__file__).resolve().parent / "fonts" / "Kokila.ttf",
+        Path(__file__).resolve().parent / "fonts" / "Kokila-Regular.ttf",
+        Path("/app/fonts/Kokila.ttf"),
+        Path("/app/fonts/Kokila-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf"),
+        Path("/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf"),
+        Path("/usr/share/fonts/truetype/msttcorefonts/Mangal.ttf"),
+    ]
+
+    for font_path in candidates:
+        try:
+            if font_path.exists():
+                fm.fontManager.addfont(str(font_path))
+                family_name = fm.FontProperties(fname=str(font_path)).get_name()
+                if family_name:
+                    _DEVA_FONT_FAMILY = family_name
+                    plt.rcParams["font.family"] = [family_name, "DejaVu Sans", "sans-serif"]
+                    plt.rcParams["axes.unicode_minus"] = False
+                    plt.rcParams["pdf.fonttype"] = 42
+                    plt.rcParams["ps.fonttype"] = 42
+                    log.info("Hindi font configured: %s", family_name)
+                    return family_name
+        except Exception as exc:
+            log.warning("Font load skipped for %s: %s", font_path, exc)
+
+    plt.rcParams["font.family"] = ["DejaVu Sans", "sans-serif"]
+    plt.rcParams["axes.unicode_minus"] = False
+    plt.rcParams["pdf.fonttype"] = 42
+    plt.rcParams["ps.fonttype"] = 42
+    log.warning("No Devanagari font found; falling back to DejaVu Sans.")
+    return None
+
+
+_DEVA_FONT_FAMILY = _configure_fonts()
 
 
 def PathSafe(name: str) -> str:
@@ -70,36 +152,54 @@ def render_map(
     filename: str = "output",
     map_mode: str = "bundle",
 ) -> io.BytesIO:
-    """Return a multi-page PDF report in memory."""
+    """
+    Return a multi-page PDF report in memory.
+
+    The page order is dynamic:
+      - FCM page if available
+      - DEM page if available
+      - FTM page if available
+      - Summary page always
+      - Key Facts page always
+      - Thank You page always
+    """
     mode = str(map_mode or results.get("_map_mode", "bundle")).strip().lower()
     if mode not in {"bundle", "fcm", "ftm", "dem"}:
         mode = "bundle"
 
-    page_modes = results.get("_map_modes") if mode == "bundle" else [mode]
-    if mode == "bundle" and not page_modes:
-        page_modes = _auto_modes(results)
+    thematic_modes = _resolve_thematic_modes(results, mode)
+    page_specs: list[tuple[str, str | None]] = [(m, None) for m in thematic_modes]
+    page_specs.extend(
+        [
+            ("summary", None),
+            ("keyfacts", None),
+            ("thanks", None),
+        ]
+    )
 
+    total_pages = len(page_specs)
     tmp_pdf = Path(tempfile.gettempdir()) / f"{PathSafe(filename)}_{mode}.pdf"
+
     try:
         with PdfPages(str(tmp_pdf)) as pdf:
-            for page_mode in page_modes:
-                fig = _build_figure()
-                ax_map, ax_legend, ax_table = _build_layout(fig)
-                _draw_map_panel(ax_map, geojson_feature, results, page_mode)
-                _draw_legend(ax_legend, results, page_mode)
-                _draw_table(ax_table, results, filename, page_mode)
-                _draw_title(fig, filename, page_mode)
+            for page_index, (page_kind, thematic_mode) in enumerate(page_specs, start=1):
+                if page_kind in {"fcm", "ftm", "dem"}:
+                    fig = _build_thematic_figure(page_kind, geojson_feature, results, filename)
+                elif page_kind == "summary":
+                    fig = _build_summary_figure(results, filename)
+                elif page_kind == "keyfacts":
+                    fig = _build_keyfacts_figure(results, filename)
+                else:
+                    fig = _build_thankyou_figure(results, filename)
+
+                _draw_page_footer(fig, page_index, total_pages)
                 pdf.savefig(fig, dpi=300, bbox_inches="tight")
                 plt.close(fig)
-
-            fig = _build_summary_figure(results, filename)
-            pdf.savefig(fig, dpi=300, bbox_inches="tight")
-            plt.close(fig)
 
         buf = io.BytesIO(tmp_pdf.read_bytes())
         buf.seek(0)
         buf.name = f"{PathSafe(filename)}.pdf"
-        log.info("✅ Map successfully rendered | pages=%d | format=PDF | dpi=300", len(page_modes) + 1)
+        log.info("✅ Map successfully rendered | pages=%d | format=PDF | dpi=300", total_pages)
         return buf
     finally:
         try:
@@ -109,41 +209,367 @@ def render_map(
             pass
 
 
-def _auto_modes(results: dict[str, Any]) -> list[str]:
-    modes: list[str] = []
-    if results.get("_raw_fcm_gdfs"):
-        modes.append("fcm")
-    if results.get("_raw_ftm_gdfs"):
-        modes.append("ftm")
-    if results.get("_raw_demr_paths") or results.get("_raw_dem_gdfs"):
-        modes.append("dem")
-    return modes
+def _resolve_thematic_modes(results: dict[str, Any], requested_mode: str) -> list[str]:
+    has_fcm = bool(results.get("_raw_fcm_gdfs"))
+    has_ftm = bool(results.get("_raw_ftm_gdfs"))
+    has_dem = bool(results.get("_raw_demr_paths") or results.get("_raw_dem_gdfs"))
+
+    if requested_mode == "bundle":
+        modes: list[str] = []
+        if has_fcm:
+            modes.append("fcm")
+        if has_dem:
+            modes.append("dem")
+        if has_ftm:
+            modes.append("ftm")
+        return modes
+
+    if requested_mode == "fcm" and has_fcm:
+        return ["fcm"]
+    if requested_mode == "dem" and has_dem:
+        return ["dem"]
+    if requested_mode == "ftm" and has_ftm:
+        return ["ftm"]
+
+    return []
+
+
+def _build_thematic_figure(mode: str, geojson_feature: dict, results: dict, filename: str) -> Figure:
+    fig = _build_figure()
+
+    if mode == "fcm":
+        title = "FOREST COVER MAP (FCM)"
+    elif mode == "dem":
+        title = "DEM HILLSHADE + 20m CONTOURS"
+    elif mode == "ftm":
+        title = "FOREST TYPE MAP (FTM)"
+    else:
+        title = "ANALYSIS MAP"
+
+    fig.text(
+        0.50,
+        0.955,
+        f"SPATIAL DECISION SUPPORT SYSTEM — {title}",
+        ha="center",
+        va="center",
+        fontsize=13,
+        fontweight="bold",
+        color=PALETTE["text_dark"],
+    )
+    fig.text(
+        0.50,
+        0.935,
+        f"MP Forest Department  |  File: {filename}",
+        ha="center",
+        va="center",
+        fontsize=9,
+        color=PALETTE["text_mid"],
+        style="italic",
+    )
+    fig.add_artist(
+        Line2D(
+            [0.04, 0.96],
+            [0.925, 0.925],
+            transform=fig.transFigure,
+            color=PALETTE["border"],
+            linewidth=1.5,
+        )
+    )
+
+    ax_map, ax_legend, ax_table = _build_layout(fig)
+    _draw_map_panel(ax_map, geojson_feature, results, mode)
+    _draw_legend(ax_legend, results, mode)
+    _draw_table(ax_table, results, filename, mode)
+    return fig
+
+
+def _build_summary_figure(results: dict[str, Any], filename: str) -> Figure:
+    content = _prepare_report_content(results)
+
+    fig = plt.figure(figsize=(16, 12))
+    fig.patch.set_facecolor(PALETTE["bg"])
+    fig.add_artist(
+        Rectangle(
+            (0.01, 0.01),
+            0.98,
+            0.98,
+            transform=fig.transFigure,
+            linewidth=3,
+            edgecolor=PALETTE["border"],
+            facecolor="none",
+            zorder=10,
+        )
+    )
+
+    fig.text(
+        0.50,
+        0.955,
+        "SDSS SUMMARY",
+        ha="center",
+        va="center",
+        fontsize=16,
+        fontweight="bold",
+        color=PALETTE["text_dark"],
+    )
+    fig.text(
+        0.50,
+        0.935,
+        f"MP Forest Department  |  File: {filename}",
+        ha="center",
+        va="center",
+        fontsize=9,
+        color=PALETTE["text_mid"],
+        style="italic",
+    )
+    fig.add_artist(
+        Line2D(
+            [0.04, 0.96],
+            [0.925, 0.925],
+            transform=fig.transFigure,
+            color=PALETTE["border"],
+            linewidth=1.5,
+        )
+    )
+
+    ax = fig.add_axes([0.04, 0.06, 0.92, 0.84])
+    ax.set_axis_off()
+
+    _draw_text_panel(
+        ax,
+        0.03,
+        0.53,
+        0.94,
+        0.38,
+        "English",
+        content["summary_en"],
+        box_face="#ffffff",
+        title_color=PALETTE["accent"],
+        text_color=PALETTE["text_dark"],
+        font_size=10.5,
+    )
+
+    _draw_text_panel(
+        ax,
+        0.03,
+        0.08,
+        0.94,
+        0.38,
+        "हिंदी",
+        content["summary_hi"],
+        box_face="#f8fbf6",
+        title_color="#1e4620",
+        text_color=PALETTE["text_dark"],
+        font_size=10.8,
+    )
+
+    return fig
+
+
+def _build_keyfacts_figure(results: dict[str, Any], filename: str) -> Figure:
+    content = _prepare_report_content(results)
+
+    fig = plt.figure(figsize=(16, 12))
+    fig.patch.set_facecolor(PALETTE["bg"])
+    fig.add_artist(
+        Rectangle(
+            (0.01, 0.01),
+            0.98,
+            0.98,
+            transform=fig.transFigure,
+            linewidth=3,
+            edgecolor=PALETTE["border"],
+            facecolor="none",
+            zorder=10,
+        )
+    )
+
+    fig.text(
+        0.50,
+        0.955,
+        "KEY FACTS",
+        ha="center",
+        va="center",
+        fontsize=16,
+        fontweight="bold",
+        color=PALETTE["text_dark"],
+    )
+    fig.text(
+        0.50,
+        0.935,
+        f"MP Forest Department  |  File: {filename}",
+        ha="center",
+        va="center",
+        fontsize=9,
+        color=PALETTE["text_mid"],
+        style="italic",
+    )
+    fig.add_artist(
+        Line2D(
+            [0.04, 0.96],
+            [0.925, 0.925],
+            transform=fig.transFigure,
+            color=PALETTE["border"],
+            linewidth=1.5,
+        )
+    )
+
+    ax = fig.add_axes([0.04, 0.08, 0.92, 0.80])
+    ax.set_axis_off()
+
+    _draw_text_panel(
+        ax,
+        0.03,
+        0.03,
+        0.94,
+        0.90,
+        "Key Facts / मुख्य तथ्य",
+        content["keyfacts_lines"],
+        box_face="#ffffff",
+        title_color=PALETTE["accent"],
+        text_color=PALETTE["text_dark"],
+        font_size=10.4,
+        line_gap=1.25,
+    )
+
+    return fig
+
+
+def _build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
+    fig = plt.figure(figsize=(16, 12))
+    fig.patch.set_facecolor(PALETTE["thank_bg"])
+
+    fig.add_artist(
+        Rectangle(
+            (0.01, 0.01),
+            0.98,
+            0.98,
+            transform=fig.transFigure,
+            linewidth=4,
+            edgecolor=PALETTE["thank_text"],
+            facecolor="none",
+            zorder=10,
+        )
+    )
+
+    fig.text(
+        0.50,
+        0.70,
+        "THANK YOU",
+        ha="center",
+        va="center",
+        fontsize=28,
+        fontweight="bold",
+        color=PALETTE["thank_text"],
+    )
+    fig.text(
+        0.50,
+        0.60,
+        "Spatial Decision Support System",
+        ha="center",
+        va="center",
+        fontsize=18,
+        fontweight="bold",
+        color=PALETTE["thank_text"],
+    )
+    fig.text(
+        0.50,
+        0.53,
+        "MP Forest Department",
+        ha="center",
+        va="center",
+        fontsize=15,
+        color=PALETTE["thank_text"],
+    )
+    fig.text(
+        0.50,
+        0.40,
+        "धन्यवाद",
+        ha="center",
+        va="center",
+        fontsize=30,
+        fontweight="bold",
+        color=PALETTE["thank_text"],
+    )
+    fig.text(
+        0.50,
+        0.31,
+        "स्थानिक निर्णय सहायता प्रणाली",
+        ha="center",
+        va="center",
+        fontsize=18,
+        color=PALETTE["thank_text"],
+    )
+    fig.text(
+        0.50,
+        0.24,
+        "मध्य प्रदेश वन विभाग",
+        ha="center",
+        va="center",
+        fontsize=15,
+        color=PALETTE["thank_text"],
+    )
+    fig.text(
+        0.50,
+        0.10,
+        f"Generated automatically by SDSS | File: {filename}",
+        ha="center",
+        va="center",
+        fontsize=8.5,
+        color=PALETTE["text_mid"],
+    )
+    return fig
 
 
 def _build_figure() -> Figure:
     fig = plt.figure(figsize=(16, 12))
     fig.patch.set_facecolor(PALETTE["bg"])
-    fig.add_artist(Rectangle((0.01, 0.01), 0.98, 0.98, transform=fig.transFigure,
-                             linewidth=3, edgecolor=PALETTE["border"], facecolor="none", zorder=10))
+    fig.add_artist(
+        Rectangle(
+            (0.01, 0.01),
+            0.98,
+            0.98,
+            transform=fig.transFigure,
+            linewidth=3,
+            edgecolor=PALETTE["border"],
+            facecolor="none",
+            zorder=10,
+        )
+    )
     return fig
 
 
 def _build_layout(fig: Figure):
-    gs = GridSpec(2, 2, figure=fig, left=0.04, right=0.96, top=0.88, bottom=0.04,
-                  hspace=0.06, wspace=0.06, width_ratios=[4, 1], height_ratios=[3, 1])
+    gs = GridSpec(
+        2,
+        2,
+        figure=fig,
+        left=0.04,
+        right=0.96,
+        top=0.88,
+        bottom=0.04,
+        hspace=0.06,
+        wspace=0.06,
+        width_ratios=[4, 1],
+        height_ratios=[3, 1],
+    )
+
     ax_map = fig.add_subplot(gs[0, 0])
     ax_legend = fig.add_subplot(gs[0, 1])
     ax_table = fig.add_subplot(gs[1, :])
+
     for ax in (ax_map, ax_legend, ax_table):
         ax.set_facecolor(PALETTE["panel"])
         for spine in ax.spines.values():
             spine.set_edgecolor(PALETTE["border"])
             spine.set_linewidth(1.2)
+
     return ax_map, ax_legend, ax_table
 
 
 def _geom_to_xy(coords):
-    return [c[0] for c in coords], [c[1] for c in coords]
+    xs = [c[0] for c in coords]
+    ys = [c[1] for c in coords]
+    return xs, ys
 
 
 def _iter_geoms(geom):
@@ -178,6 +604,131 @@ def _match_fcm_color(class_attr: str) -> str:
     return PALETTE["fallback"]
 
 
+def _stable_color_for_label(label: str) -> str:
+    idx = zlib.crc32(str(label).encode("utf-8")) % len(FTM_FALLBACK_PALETTE)
+    return FTM_FALLBACK_PALETTE[idx]
+
+
+def _extract_ftm_label(row) -> str:
+    for field in ("class_name", "forest_type", "type", "name", "species", "category", "label", "cover_type"):
+        if field in row and row.get(field) not in (None, ""):
+            return str(row.get(field)).strip()
+    return "FTM"
+
+
+def _friendly_fcm_label(raw_label: str | None, lang: str = "en") -> str:
+    key = str(raw_label or "").strip().upper()
+    en, hi = FCM_LABELS.get(key, (key or "No Data", "डेटा अनुपलब्ध"))
+    return en if lang == "en" else hi
+
+
+def _auto_sort_fcm_classes(fcm_classes: dict[str, dict[str, Any]]) -> list[tuple[str, float]]:
+    items: list[tuple[str, float]] = []
+    for label, metrics in fcm_classes.items():
+        try:
+            pct = float(metrics.get("percentage", 0.0))
+        except Exception:
+            pct = 0.0
+        items.append((str(label), pct))
+    items.sort(key=lambda x: x[1], reverse=True)
+    return items
+
+
+def _prepare_report_content(results: dict[str, Any]) -> dict[str, Any]:
+    area = float(results.get("area_ha", 0.0) or 0.0)
+    fcm = results.get("fcm", {}) or {}
+    classes = fcm.get("classes", {}) or {}
+    dominant_raw = str(fcm.get("dominant", "") or "").strip().upper()
+    dominant_en = _friendly_fcm_label(dominant_raw, "en")
+    dominant_hi = _friendly_fcm_label(dominant_raw, "hi")
+    dominant_pct = float(classes.get(dominant_raw, {}).get("percentage", 0.0) or 0.0)
+
+    dem = results.get("dem", {}) or {}
+    elev_min = dem.get("elevation_min_m")
+    elev_max = dem.get("elevation_max_m")
+    elev_mean = dem.get("elevation_mean_m")
+
+    elevation_range_en = "not available"
+    elevation_range_hi = "उपलब्ध नहीं"
+    mean_en = "not available"
+    mean_hi = "उपलब्ध नहीं"
+
+    if elev_min is not None and elev_max is not None:
+        elevation_range_en = f"{float(elev_min):.0f}–{float(elev_max):.0f} metres above mean sea level"
+        elevation_range_hi = f"{float(elev_min):.0f}–{float(elev_max):.0f} मीटर समुद्र तल से ऊपर"
+    if elev_mean is not None:
+        mean_en = f"{float(elev_mean):.0f} metres"
+        mean_hi = f"{float(elev_mean):.0f} मीटर"
+
+    sorted_classes = _auto_sort_fcm_classes(classes)
+    available_cover_lines_en = []
+    available_cover_lines_hi = []
+    for label, pct in sorted_classes:
+        available_cover_lines_en.append(f"{label}: {pct:.1f}%")
+        available_cover_lines_hi.append(f"{_friendly_fcm_label(label, 'hi')}: {pct:.1f}%")
+
+    non_dom_classes = [label for label, _pct in sorted_classes if label != dominant_raw and label not in {"WATER", "NO-DATA"}]
+    secondary_text_en = ""
+    secondary_text_hi = ""
+    if non_dom_classes:
+        top2 = [_friendly_fcm_label(lbl, "en") for lbl in non_dom_classes[:2]]
+        top2_hi = [_friendly_fcm_label(lbl, "hi") for lbl in non_dom_classes[:2]]
+        secondary_text_en = f" The next dominant classes, where present, are {', '.join(top2)}."
+        secondary_text_hi = f" उपलब्ध होने पर द्वितीय एवं तृतीय प्रमुख आवरण वर्ग {', '.join(top2_hi)} हैं।"
+
+    summary_en = results.get("summary_en")
+    summary_hi = results.get("summary_hi")
+    if not summary_en or not summary_hi:
+        summary_en = (
+            f"The analysed area covers {area:.2f} hectares.\n\n"
+            f"Forest Cover Mapping indicates that {dominant_en} is the dominant forest class, "
+            f"accounting for {dominant_pct:.1f}% of the total area.\n\n"
+            f"Terrain analysis derived from DEM data shows an elevation range of {elevation_range_en}, "
+            f"with an average elevation of {mean_en}.\n\n"
+            f"The area is predominantly forested with limited non-forest and scrub patches."
+            f"{secondary_text_en}"
+        )
+        summary_hi = (
+            f"विश्लेषण किए गए क्षेत्र का कुल क्षेत्रफल {area:.2f} हेक्टेयर है।\n\n"
+            f"वन आवरण मैपिंग से पता चलता है कि {dominant_hi} मुख्य वन वर्ग है, "
+            f"जो कुल क्षेत्रफल का {dominant_pct:.1f}% हिस्सा है।\n\n"
+            f"DEM डेटा से किए गए भू-भाग विश्लेषण से पता चलता है कि समुद्र तल से ऊंचाई {elevation_range_hi} है, "
+            f"और औसत ऊंचाई {mean_hi} है।\n\n"
+            f"यह क्षेत्र मुख्य रूप से वनाच्छादित है, तथा गैर-वन और झाड़ीदार क्षेत्र सीमित हैं।"
+            f"{secondary_text_hi}"
+        )
+
+    keyfacts_lines = results.get("key_facts_lines")
+    if not keyfacts_lines:
+        keyfacts_lines = [
+            f"✓ Total Area / कुल क्षेत्रफल: {area:.2f} ha",
+            f"✓ Dominant Forest Class / प्रमुख वन वर्ग: {dominant_en} ({dominant_pct:.1f}%)",
+            "✓ Forest Cover Distribution / वन आवरण वितरण:",
+        ]
+        preferred_order = ["VDF", "MDF", "OPEN FOREST", "NON FOREST", "SCRUB", "WATER", "NO-DATA"]
+        seen = set()
+        for label in preferred_order:
+            if label in classes:
+                pct = float(classes.get(label, {}).get("percentage", 0.0) or 0.0)
+                keyfacts_lines.append(f"  • {label} / { _friendly_fcm_label(label, 'hi') }: {pct:.1f}%")
+                seen.add(label)
+        for label, metrics in sorted_classes:
+            if label in seen:
+                continue
+            pct = float(metrics or 0.0)
+            keyfacts_lines.append(f"  • {label}: {pct:.1f}%")
+        if elev_min is not None and elev_max is not None:
+            keyfacts_lines.append(f"✓ Elevation Range / ऊँचाई सीमा: {float(elev_min):.0f}–{float(elev_max):.0f} m")
+        if elev_mean is not None:
+            keyfacts_lines.append(f"✓ Mean Elevation / औसत ऊँचाई: {float(elev_mean):.0f} m")
+
+    return {
+        "summary_en": str(summary_en).strip(),
+        "summary_hi": str(summary_hi).strip(),
+        "keyfacts_lines": [str(x) for x in keyfacts_lines],
+    }
+
+
 def _draw_map_panel(ax, geojson_feature: dict, results: dict, mode: str) -> None:
     geom = shape(geojson_feature["geometry"])
     minx, miny, maxx, maxy = geom.bounds
@@ -189,6 +740,7 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict, mode: str) -> None
     ax.set_xlim(*xlim)
     ax.set_ylim(*ylim)
     ax.set_axisbelow(True)
+
     if mode == "dem":
         ax.set_facecolor("#efe8de")
         ax.grid(True, color="#cdbfae", linewidth=0.45, linestyle="--", alpha=0.55)
@@ -219,47 +771,70 @@ def _draw_map_panel(ax, geojson_feature: dict, results: dict, mode: str) -> None
 
 def _draw_fcm_layers(ax, results: dict) -> None:
     fcm_gdfs = results.get("_raw_fcm_gdfs", [])
-    log.info("MAP_TRACE | mode=fcm | raw_fcm_gdfs=%d | rows=%s", len(fcm_gdfs), [len(gdf) for gdf in fcm_gdfs] if fcm_gdfs else [])
+    log.info(
+        "MAP_TRACE | mode=fcm | raw_fcm_gdfs=%d | rows=%s",
+        len(fcm_gdfs),
+        [len(gdf) for gdf in fcm_gdfs] if fcm_gdfs else [],
+    )
+
     for gdf in fcm_gdfs:
         if gdf is None or gdf.empty:
             continue
         if getattr(gdf, "crs", None) and str(gdf.crs).upper() != "EPSG:4326":
             gdf = gdf.to_crs("EPSG:4326")
+
         for _, row in gdf.iterrows():
             geom = row.geometry
             if geom is None or geom.is_empty:
                 continue
+
             color = _match_fcm_color(row.get("class_name", ""))
             for part in _iter_geoms(geom):
                 if part.geom_type == "Polygon":
                     xs, ys = _geom_to_xy(list(part.exterior.coords))
-                    ax.fill(xs, ys, color=color, alpha=0.58, linewidth=0, zorder=2)
+                    ax.fill(xs, ys, color=color, alpha=0.62, linewidth=0, zorder=2)
+                    for ring in part.interiors:
+                        hx, hy = _geom_to_xy(list(ring.coords))
+                        ax.fill(hx, hy, color=ax.get_facecolor(), linewidth=0, zorder=2.5)
                 elif part.geom_type == "MultiPolygon":
                     for sub in part.geoms:
                         xs, ys = _geom_to_xy(list(sub.exterior.coords))
-                        ax.fill(xs, ys, color=color, alpha=0.58, linewidth=0, zorder=2)
+                        ax.fill(xs, ys, color=color, alpha=0.62, linewidth=0, zorder=2)
 
 
 def _draw_ftm_layers(ax, results: dict) -> None:
     ftm_gdfs = results.get("_raw_ftm_gdfs", [])
-    log.info("MAP_TRACE | mode=ftm | raw_ftm_gdfs=%d | rows=%s", len(ftm_gdfs), [len(gdf) for gdf in ftm_gdfs] if ftm_gdfs else [])
+    log.info(
+        "MAP_TRACE | mode=ftm | raw_ftm_gdfs=%d | rows=%s",
+        len(ftm_gdfs),
+        [len(gdf) for gdf in ftm_gdfs] if ftm_gdfs else [],
+    )
+
     for gdf in ftm_gdfs:
         if gdf is None or gdf.empty:
             continue
         if getattr(gdf, "crs", None) and str(gdf.crs).upper() != "EPSG:4326":
             gdf = gdf.to_crs("EPSG:4326")
+
         for _, row in gdf.iterrows():
             geom = row.geometry
             if geom is None or geom.is_empty:
                 continue
+
+            label = _extract_ftm_label(row)
+            color = _stable_color_for_label(label)
+
             for part in _iter_geoms(geom):
                 if part.geom_type == "Polygon":
                     xs, ys = _geom_to_xy(list(part.exterior.coords))
-                    ax.fill(xs, ys, color=PALETTE["ftm"], alpha=0.32, linewidth=0.6, zorder=2)
+                    ax.fill(xs, ys, color=color, alpha=0.40, linewidth=0.4, edgecolor="#ffffff40", zorder=2)
+                    for ring in part.interiors:
+                        hx, hy = _geom_to_xy(list(ring.coords))
+                        ax.fill(hx, hy, color=ax.get_facecolor(), linewidth=0, zorder=2.5)
                 elif part.geom_type == "MultiPolygon":
                     for sub in part.geoms:
                         xs, ys = _geom_to_xy(list(sub.exterior.coords))
-                        ax.fill(xs, ys, color=PALETTE["ftm"], alpha=0.32, linewidth=0.6, zorder=2)
+                        ax.fill(xs, ys, color=color, alpha=0.40, linewidth=0.4, edgecolor="#ffffff40", zorder=2)
 
 
 def _draw_dem_layers(ax, results: dict, study_geom) -> None:
@@ -268,56 +843,144 @@ def _draw_dem_layers(ax, results: dict, study_geom) -> None:
 
     if demr_paths:
         log.info("MAP_TRACE | mode=dem-raster | raw_demr_paths=%d", len(demr_paths))
-        contour_interval = int(results.get("_contour_interval_m", 20))
+        contour_interval = int(results.get("_contour_interval_m", 20) or 20)
+
         for raster_path in demr_paths:
             if not raster_path.exists():
                 continue
+
             try:
                 with rasterio.open(str(raster_path)) as src:
-                    out_image, out_transform = rio_mask(src, [study_geom.__geo_interface__], crop=True, filled=True, nodata=src.nodata)
+                    out_image, out_transform = rio_mask(
+                        src,
+                        [mapping(study_geom)],
+                        crop=True,
+                        filled=True,
+                        nodata=src.nodata,
+                    )
+
                     data = np.array(out_image[0], dtype="float64")
                     if src.nodata is not None:
                         data[data == src.nodata] = np.nan
                     else:
                         data[~np.isfinite(data)] = np.nan
+
                     finite = data[np.isfinite(data)]
                     if finite.size < 2:
                         continue
+
                     min_val = float(np.nanmin(finite))
                     max_val = float(np.nanmax(finite))
                     if math.isclose(min_val, max_val):
                         continue
+
+                    left, bottom, right, top = array_bounds(data.shape[0], data.shape[1], out_transform)
+                    extent = (left, right, bottom, top)
+
+                    # Hillshade first.
+                    ls = LightSource(azdeg=315, altdeg=45)
+                    hillshade = ls.hillshade(
+                        np.nan_to_num(data, nan=min_val),
+                        vert_exag=1.25,
+                        dx=abs(out_transform.a),
+                        dy=abs(out_transform.e) if out_transform.e else abs(out_transform.a),
+                    )
+                    ax.imshow(
+                        hillshade,
+                        cmap="Greys",
+                        extent=extent,
+                        origin="upper",
+                        alpha=0.42,
+                        zorder=1,
+                    )
+
+                    # Build contour grid.
                     x_coords = out_transform.c + (np.arange(data.shape[1]) + 0.5) * out_transform.a
                     y_coords = out_transform.f + (np.arange(data.shape[0]) + 0.5) * out_transform.e
                     X, Y = np.meshgrid(x_coords, y_coords)
+
                     start = math.floor(min_val / contour_interval) * contour_interval
                     end = math.ceil(max_val / contour_interval) * contour_interval
                     levels = np.arange(start, end + contour_interval, contour_interval)
                     if levels.size < 2:
                         continue
-                    ax.contour(X, Y, data, levels=levels, colors=PALETTE["contour"], linewidths=0.65, alpha=0.88, zorder=2)
+
+                    minor_levels = [lvl for lvl in levels if int(lvl) % 100 != 0]
+                    major_levels = [lvl for lvl in levels if int(lvl) % 100 == 0]
+
+                    if minor_levels:
+                        ax.contour(
+                            X,
+                            Y,
+                            data,
+                            levels=minor_levels,
+                            colors=PALETTE["contour_faint"],
+                            linewidths=0.45,
+                            alpha=0.80,
+                            zorder=2,
+                            antialiased=True,
+                        )
+
+                    if major_levels:
+                        cs_major = ax.contour(
+                            X,
+                            Y,
+                            data,
+                            levels=major_levels,
+                            colors=PALETTE["contour"],
+                            linewidths=0.9,
+                            alpha=0.95,
+                            zorder=3,
+                            antialiased=True,
+                        )
+                        ax.clabel(cs_major, inline=True, fmt="%d m", fontsize=6, colors=PALETTE["contour"])
+
             except Exception as exc:
                 log.warning("Raster DEM contour render skipped for %s: %s", raster_path.name, exc)
 
     if dem_gdfs:
-        log.info("MAP_TRACE | mode=dem-vector | raw_dem_gdfs=%d | rows=%s", len(dem_gdfs), [len(gdf) for gdf in dem_gdfs] if dem_gdfs else [])
+        log.info(
+            "MAP_TRACE | mode=dem-vector | raw_dem_gdfs=%d | rows=%s",
+            len(dem_gdfs),
+            [len(gdf) for gdf in dem_gdfs] if dem_gdfs else [],
+        )
+
         for gdf in dem_gdfs:
             if gdf is None or gdf.empty:
                 continue
             if getattr(gdf, "crs", None) and str(gdf.crs).upper() != "EPSG:4326":
                 gdf = gdf.to_crs("EPSG:4326")
+
+            elev_col = next(
+                (c for c in gdf.columns if str(c).lower() in {"elevation", "elev", "contour", "z"}),
+                None,
+            )
+
             for _, row in gdf.iterrows():
                 geom = row.geometry
                 if geom is None or geom.is_empty:
                     continue
+
+                elev_val = row.get(elev_col) if elev_col else None
+                is_major = False
+                if elev_val is not None:
+                    try:
+                        elev_num = float(elev_val)
+                        is_major = int(round(elev_num)) % 100 == 0
+                    except Exception:
+                        is_major = False
+
+                color = PALETTE["contour"] if is_major else PALETTE["contour_faint"]
+                lw = 0.9 if is_major else 0.45
+
                 for part in _iter_geoms(geom):
                     if part.geom_type == "LineString":
                         xs, ys = _geom_to_xy(list(part.coords))
-                        ax.plot(xs, ys, color=PALETTE["contour"], linewidth=0.8, alpha=0.85, zorder=2)
+                        ax.plot(xs, ys, color=color, linewidth=lw, alpha=0.90, zorder=2)
                     elif part.geom_type == "MultiLineString":
                         for sub in part.geoms:
                             xs, ys = _geom_to_xy(list(sub.coords))
-                            ax.plot(xs, ys, color=PALETTE["contour"], linewidth=0.8, alpha=0.85, zorder=2)
+                            ax.plot(xs, ys, color=color, linewidth=lw, alpha=0.90, zorder=2)
 
 
 def _draw_study_boundary(ax, geom) -> None:
@@ -325,19 +988,22 @@ def _draw_study_boundary(ax, geom) -> None:
         if part.geom_type == "Polygon":
             xs, ys = _geom_to_xy(list(part.exterior.coords))
             ax.fill(xs, ys, color=PALETTE["poly_fill"], linewidth=0, alpha=0.15, zorder=3)
-            ax.plot(xs, ys, color=PALETTE["poly_edge"], linewidth=2.5, solid_capstyle="round", zorder=4)
+            ax.plot(xs, ys, color=PALETTE["poly_edge"], linewidth=2.4, solid_capstyle="round", zorder=4)
+            for ring in part.interiors:
+                hx, hy = _geom_to_xy(list(ring.coords))
+                ax.fill(hx, hy, color=ax.get_facecolor(), linewidth=0, zorder=3.5)
         elif part.geom_type == "MultiPolygon":
             for sub in part.geoms:
                 xs, ys = _geom_to_xy(list(sub.exterior.coords))
                 ax.fill(xs, ys, color=PALETTE["poly_fill"], linewidth=0, alpha=0.15, zorder=3)
-                ax.plot(xs, ys, color=PALETTE["poly_edge"], linewidth=2.5, solid_capstyle="round", zorder=4)
+                ax.plot(xs, ys, color=PALETTE["poly_edge"], linewidth=2.4, solid_capstyle="round", zorder=4)
         elif part.geom_type == "LineString":
             xs, ys = _geom_to_xy(list(part.coords))
-            ax.plot(xs, ys, color=PALETTE["poly_edge"], linewidth=2.5, zorder=4)
+            ax.plot(xs, ys, color=PALETTE["poly_edge"], linewidth=2.4, zorder=4)
         elif part.geom_type == "MultiLineString":
             for sub in part.geoms:
                 xs, ys = _geom_to_xy(list(sub.coords))
-                ax.plot(xs, ys, color=PALETTE["poly_edge"], linewidth=2.5, zorder=4)
+                ax.plot(xs, ys, color=PALETTE["poly_edge"], linewidth=2.4, zorder=4)
 
 
 def _draw_scale_bar(ax, xlim, ylim) -> None:
@@ -349,13 +1015,40 @@ def _draw_scale_bar(ax, xlim, ylim) -> None:
     bar_deg = bar_km / km_per_deg
     x0 = xlim[0] + span_deg * 0.05
     y0 = ylim[0] + y_span * 0.05
+
     for i in range(4):
         seg_color = "black" if i % 2 == 0 else "white"
-        ax.barh(y0, bar_deg / 4, left=x0 + i * bar_deg / 4, height=y_span * 0.012,
-                color=seg_color, edgecolor="black", linewidth=0.5, zorder=6)
-    ax.text(x0 + bar_deg / 2, y0 + y_span * 0.025, f"{bar_km:.1f} km", ha="center", va="bottom",
-            fontsize=7, color=PALETTE["text_dark"], fontweight="bold", zorder=7)
-    ax.text(x0, y0 - y_span * 0.01, "0", ha="center", fontsize=6, color=PALETTE["text_dark"], zorder=7)
+        ax.barh(
+            y0,
+            bar_deg / 4,
+            left=x0 + i * bar_deg / 4,
+            height=y_span * 0.012,
+            color=seg_color,
+            edgecolor="black",
+            linewidth=0.5,
+            zorder=6,
+        )
+
+    ax.text(
+        x0 + bar_deg / 2,
+        y0 + y_span * 0.025,
+        f"{bar_km:.1f} km",
+        ha="center",
+        va="bottom",
+        fontsize=7,
+        color=PALETTE["text_dark"],
+        fontweight="bold",
+        zorder=7,
+    )
+    ax.text(
+        x0,
+        y0 - y_span * 0.01,
+        "0",
+        ha="center",
+        fontsize=6,
+        color=PALETTE["text_dark"],
+        zorder=7,
+    )
 
 
 def _draw_north_arrow(ax, xlim, ylim) -> None:
@@ -364,93 +1057,359 @@ def _draw_north_arrow(ax, xlim, ylim) -> None:
     x = xlim[0] + x_span * 0.92
     y = ylim[0] + y_span * 0.88
     h = y_span * 0.07
-    ax.annotate("", xy=(x, y + h), xytext=(x, y), arrowprops=dict(arrowstyle="-|>", color="black", lw=1.5, mutation_scale=14), zorder=8)
-    ax.text(x, y + h + y_span * 0.01, "N", ha="center", va="bottom", fontsize=9, fontweight="bold", color=PALETTE["text_dark"], zorder=8)
+
+    ax.annotate(
+        "",
+        xy=(x, y + h),
+        xytext=(x, y),
+        arrowprops=dict(
+            arrowstyle="-|>",
+            color="black",
+            lw=1.5,
+            mutation_scale=14,
+        ),
+        zorder=8,
+    )
+    ax.text(
+        x,
+        y + h + y_span * 0.01,
+        "N",
+        ha="center",
+        va="bottom",
+        fontsize=9,
+        fontweight="bold",
+        color=PALETTE["text_dark"],
+        zorder=8,
+    )
 
 
 def _draw_legend(ax, results: dict, mode: str) -> None:
-    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_xticks([])
+    ax.set_yticks([])
     ax.set_title("Legend", fontsize=10, fontweight="bold", color=PALETTE["text_dark"], pad=6)
+
     y = 0.92
     dy = 0.075
 
     if mode == "dem":
-        ax.text(0.05, y, "Contour Elevation View", fontsize=8, fontweight="bold", color=PALETTE["accent"], transform=ax.transAxes, va="top")
+        ax.text(
+            0.05,
+            y,
+            "Contour Elevation View",
+            fontsize=8,
+            fontweight="bold",
+            color=PALETTE["accent"],
+            transform=ax.transAxes,
+            va="top",
+        )
         y -= dy * 0.7
-        ax.add_patch(mpatches.Rectangle((0.05, y - 0.022), 0.10, 0.044, transform=ax.transAxes,
-                                        facecolor=PALETTE["contour"], edgecolor="#555", linewidth=0.5))
-        ax.text(0.20, y, "Contours / Elevation Lines", fontsize=7, color=PALETTE["text_dark"], transform=ax.transAxes, va="center")
+
+        ax.add_patch(
+            mpatches.Rectangle(
+                (0.05, y - 0.022),
+                0.10,
+                0.044,
+                transform=ax.transAxes,
+                facecolor=PALETTE["contour"],
+                edgecolor="#555",
+                linewidth=0.5,
+            )
+        )
+        ax.text(
+            0.20,
+            y,
+            "Index Contours (100 m)",
+            fontsize=7,
+            color=PALETTE["text_dark"],
+            transform=ax.transAxes,
+            va="center",
+        )
         y -= dy
-        dem = results.get("dem", {})
-        for label, value in [("Elevation (Min)", dem.get("elevation_min_m", "—")),
-                             ("Elevation (Max)", dem.get("elevation_max_m", "—")),
-                             ("Elevation (Mean)", dem.get("elevation_mean_m", "—"))]:
-            ax.text(0.05, y, f"{label}: {value}", fontsize=7, color=PALETTE["text_dark"], transform=ax.transAxes, va="top")
+
+        ax.add_patch(
+            mpatches.Rectangle(
+                (0.05, y - 0.022),
+                0.10,
+                0.044,
+                transform=ax.transAxes,
+                facecolor=PALETTE["contour_faint"],
+                edgecolor="#555",
+                linewidth=0.5,
+            )
+        )
+        ax.text(
+            0.20,
+            y,
+            "Intermediate Contours (20 m)",
+            fontsize=7,
+            color=PALETTE["text_dark"],
+            transform=ax.transAxes,
+            va="center",
+        )
+        y -= dy
+
+        ax.add_patch(
+            mpatches.Rectangle(
+                (0.05, y - 0.022),
+                0.10,
+                0.044,
+                transform=ax.transAxes,
+                facecolor="#bfb6aa",
+                edgecolor="#555",
+                linewidth=0.5,
+            )
+        )
+        ax.text(
+            0.20,
+            y,
+            "Hillshade Background",
+            fontsize=7,
+            color=PALETTE["text_dark"],
+            transform=ax.transAxes,
+            va="center",
+        )
+        y -= dy
+
+        dem = results.get("dem", {}) or {}
+        for label, value in [
+            ("Elevation (Min)", dem.get("elevation_min_m", "—")),
+            ("Elevation (Max)", dem.get("elevation_max_m", "—")),
+            ("Elevation (Mean)", dem.get("elevation_mean_m", "—")),
+        ]:
+            ax.text(
+                0.05,
+                y,
+                f"{label}: {value}",
+                fontsize=7,
+                color=PALETTE["text_dark"],
+                transform=ax.transAxes,
+                va="top",
+            )
             y -= dy * 0.7
+
     elif mode == "ftm":
-        ax.text(0.05, y, "Forest Type Mapping", fontsize=8, fontweight="bold", color=PALETTE["accent"], transform=ax.transAxes, va="top")
-        y -= dy * 0.7
-        ax.add_patch(mpatches.Rectangle((0.05, y - 0.022), 0.10, 0.044, transform=ax.transAxes,
-                                        facecolor=PALETTE["ftm"], edgecolor="#555", linewidth=0.5))
-        ax.text(0.20, y, "FTM Coverage", fontsize=7, color=PALETTE["text_dark"], transform=ax.transAxes, va="center")
-        y -= dy
-        ftm_area = results.get("ftm", {}).get("area_ha")
-        ax.text(0.05, y, f"Intersecting Area: {ftm_area:.2f} ha" if ftm_area is not None else "No FTM area calculated",
-                fontsize=7, color=PALETTE["text_dark"], transform=ax.transAxes, va="top")
+        ax.text(
+            0.05,
+            y,
+            "Forest Type Mapping",
+            fontsize=8,
+            fontweight="bold",
+            color=PALETTE["accent"],
+            transform=ax.transAxes,
+            va="top",
+        )
+        y -= dy * 0.8
+
+        ftm_stats = _collect_ftm_stats(results)
+        if not ftm_stats:
+            ax.text(
+                0.05,
+                y,
+                "No FTM classes available",
+                fontsize=7,
+                color=PALETTE["text_mid"],
+                transform=ax.transAxes,
+                va="top",
+            )
+        else:
+            for label, count, color in ftm_stats[:8]:
+                ax.add_patch(
+                    mpatches.Rectangle(
+                        (0.05, y - 0.022),
+                        0.10,
+                        0.044,
+                        transform=ax.transAxes,
+                        facecolor=color,
+                        edgecolor="#555",
+                        linewidth=0.5,
+                    )
+                )
+                ax.text(
+                    0.20,
+                    y,
+                    f"{label} ({count})",
+                    fontsize=7,
+                    color=PALETTE["text_dark"],
+                    transform=ax.transAxes,
+                    va="center",
+                )
+                y -= dy
+
     else:
-        ax.text(0.05, y, "Forest Cover Classes (FCM)", fontsize=8, fontweight="bold", color=PALETTE["accent"], transform=ax.transAxes, va="top")
+        ax.text(
+            0.05,
+            y,
+            "Forest Cover Classes (FCM)",
+            fontsize=8,
+            fontweight="bold",
+            color=PALETTE["accent"],
+            transform=ax.transAxes,
+            va="top",
+        )
         y -= dy * 0.7
-        fcm_classes = results.get("fcm", {}).get("classes", {})
+
+        fcm_classes = results.get("fcm", {}).get("classes", {}) or {}
+        log.info("LEGEND_TRACE | keys=%s", list(fcm_classes.keys()))
+
         if not fcm_classes:
-            ax.text(0.05, y, "No class summary available", fontsize=7, color=PALETTE["text_mid"], transform=ax.transAxes, va="top")
+            ax.text(
+                0.05,
+                y,
+                "No class summary available",
+                fontsize=7,
+                color=PALETTE["text_mid"],
+                transform=ax.transAxes,
+                va="top",
+            )
         else:
             order = ["VDF", "MDF", "OPEN FOREST", "NON FOREST", "SCRUB", "WATER", "NO-DATA"]
             used = set()
+
             for label in order:
                 if label not in fcm_classes:
                     continue
-                pct = fcm_classes.get(label, {}).get("percentage", 0.0)
-                ax.add_patch(mpatches.Rectangle((0.05, y - 0.022), 0.10, 0.044, transform=ax.transAxes,
-                                                facecolor=_match_fcm_color(label), edgecolor="#555", linewidth=0.5))
-                ax.text(0.20, y, f"{label} ({pct:.1f}%)", fontsize=7, color=PALETTE["text_dark"], transform=ax.transAxes, va="center")
+                pct = float(fcm_classes.get(label, {}).get("percentage", 0.0) or 0.0)
+                ax.add_patch(
+                    mpatches.Rectangle(
+                        (0.05, y - 0.022),
+                        0.10,
+                        0.044,
+                        transform=ax.transAxes,
+                        facecolor=_match_fcm_color(label),
+                        edgecolor="#555",
+                        linewidth=0.5,
+                    )
+                )
+                ax.text(
+                    0.20,
+                    y,
+                    f"{label} ({pct:.1f}%)",
+                    fontsize=7,
+                    color=PALETTE["text_dark"],
+                    transform=ax.transAxes,
+                    va="center",
+                )
                 y -= dy
                 used.add(label)
+
             for label, metrics in fcm_classes.items():
                 if label in used:
                     continue
-                pct = metrics.get("percentage", 0.0)
-                ax.add_patch(mpatches.Rectangle((0.05, y - 0.022), 0.10, 0.044, transform=ax.transAxes,
-                                                facecolor=_match_fcm_color(label), edgecolor="#555", linewidth=0.5))
-                ax.text(0.20, y, f"{label} ({pct:.1f}%)", fontsize=7, color=PALETTE["text_dark"], transform=ax.transAxes, va="center")
+                pct = float(metrics.get("percentage", 0.0) or 0.0)
+                ax.add_patch(
+                    mpatches.Rectangle(
+                        (0.05, y - 0.022),
+                        0.10,
+                        0.044,
+                        transform=ax.transAxes,
+                        facecolor=_match_fcm_color(label),
+                        edgecolor="#555",
+                        linewidth=0.5,
+                    )
+                )
+                ax.text(
+                    0.20,
+                    y,
+                    f"{label} ({pct:.1f}%)",
+                    fontsize=7,
+                    color=PALETTE["text_dark"],
+                    transform=ax.transAxes,
+                    va="center",
+                )
                 y -= dy
+
         y -= dy * 0.2
         ax.plot([0.05, 0.15], [y, y], color=PALETTE["poly_edge"], linewidth=2, transform=ax.transAxes)
-        ax.text(0.20, y, "Study Area Boundary", fontsize=7, color=PALETTE["text_dark"], transform=ax.transAxes, va="center")
+        ax.text(
+            0.20,
+            y,
+            "Study Area Boundary",
+            fontsize=7,
+            color=PALETTE["text_dark"],
+            transform=ax.transAxes,
+            va="center",
+        )
 
     y -= dy * 1.1
-    ax.text(0.05, y, "Data Sources:", fontsize=7, fontweight="bold", color=PALETTE["text_mid"], transform=ax.transAxes, va="top")
+    ax.text(
+        0.05,
+        y,
+        "Data Sources:",
+        fontsize=7,
+        fontweight="bold",
+        color=PALETTE["text_mid"],
+        transform=ax.transAxes,
+        va="top",
+    )
     y -= dy * 0.6
+
     if mode == "dem":
         sources = ["DEM raster / contours", "User boundary"]
     elif mode == "ftm":
         sources = ["Forest type layer", "User boundary"]
     else:
         sources = ["FSI Forest Cover Map", "User boundary"]
+
     for source in sources:
-        ax.text(0.05, y, f"• {source}", fontsize=6.5, color=PALETTE["text_mid"], transform=ax.transAxes, va="top")
+        ax.text(
+            0.05,
+            y,
+            f"• {source}",
+            fontsize=6.5,
+            color=PALETTE["text_mid"],
+            transform=ax.transAxes,
+            va="top",
+        )
         y -= dy * 0.55
-    ax.text(0.05, y - dy * 0.1, "CRS: WGS-84 (EPSG:4326)", fontsize=6.5, color=PALETTE["text_mid"], transform=ax.transAxes, va="top")
+
+    ax.text(
+        0.05,
+        y - dy * 0.1,
+        "CRS: WGS-84 (EPSG:4326)",
+        fontsize=6.5,
+        color=PALETTE["text_mid"],
+        transform=ax.transAxes,
+        va="top",
+    )
+
+
+def _collect_ftm_stats(results: dict) -> list[tuple[str, int, str]]:
+    ftm_gdfs = results.get("_raw_ftm_gdfs", []) or []
+    counts: dict[str, int] = {}
+
+    for gdf in ftm_gdfs:
+        if gdf is None or gdf.empty:
+            continue
+        for _, row in gdf.iterrows():
+            label = _extract_ftm_label(row)
+            counts[label] = counts.get(label, 0) + 1
+
+    ranked = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    return [(label, count, _stable_color_for_label(label)) for label, count in ranked]
 
 
 def _draw_table(ax, results: dict, filename: str, mode: str) -> None:
-    ax.set_xticks([]); ax.set_yticks([])
-    title = {"fcm": "Spatial Analysis Summary", "ftm": "Forest Type Summary", "dem": "Terrain / Contour Summary"}.get(mode, "Spatial Analysis Summary")
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    title = {
+        "fcm": "Spatial Analysis Summary",
+        "ftm": "Forest Type Summary",
+        "dem": "Terrain / Contour Summary",
+    }.get(mode, "Spatial Analysis Summary")
     ax.set_title(title, fontsize=10, fontweight="bold", color=PALETTE["text_dark"], pad=4)
-    dem = results.get("dem", {})
-    fcm = results.get("fcm", {})
-    ftm = results.get("ftm", {})
+
+    dem = results.get("dem", {}) or {}
+    fcm = results.get("fcm", {}) or {}
+    ftm = results.get("ftm", {}) or {}
+
     centroid_x, centroid_y = results.get("centroid", ("—", "—"))
-    centroid_str = f"{centroid_x:.6f}, {centroid_y:.6f}" if isinstance(centroid_x, (int, float)) and isinstance(centroid_y, (int, float)) else "—"
+    centroid_str = (
+        f"{centroid_x:.6f}, {centroid_y:.6f}"
+        if isinstance(centroid_x, (int, float)) and isinstance(centroid_y, (int, float))
+        else "—"
+    )
+
     rows = [
         ("Map Mode", mode.upper()),
         ("Total Area", f"{results.get('area_ha', 0):.2f} hectares"),
@@ -462,60 +1421,132 @@ def _draw_table(ax, results: dict, filename: str, mode: str) -> None:
         ("Source File", filename),
         ("Centroid (lon/lat)", centroid_str),
     ]
+
     mid = math.ceil(len(rows) / 2)
-    for col_idx, col_rows in enumerate((rows[:mid], rows[mid:])):
+    cols = (rows[:mid], rows[mid:])
+
+    for col_idx, col_rows in enumerate(cols):
         x_label = 0.02 + col_idx * 0.50
         x_value = 0.22 + col_idx * 0.50
+
         for row_idx, (label, value) in enumerate(col_rows):
             y = 0.85 - row_idx * 0.19
             bg_color = PALETTE["table_alt"] if row_idx % 2 == 0 else PALETTE["panel"]
-            ax.add_patch(FancyBboxPatch((x_label - 0.01, y - 0.09), 0.48, 0.16, boxstyle="round,pad=0.01",
-                                        facecolor=bg_color, edgecolor="none", transform=ax.transAxes))
-            ax.text(x_label, y, label, fontsize=8, fontweight="bold", color=PALETTE["text_mid"], transform=ax.transAxes, va="center")
-            ax.text(x_value, y, value, fontsize=8, color=PALETTE["text_dark"], transform=ax.transAxes, va="center")
+
+            ax.add_patch(
+                FancyBboxPatch(
+                    (x_label - 0.01, y - 0.09),
+                    0.48,
+                    0.16,
+                    boxstyle="round,pad=0.01",
+                    facecolor=bg_color,
+                    edgecolor="none",
+                    transform=ax.transAxes,
+                )
+            )
+
+            ax.text(
+                x_label,
+                y,
+                label,
+                fontsize=8,
+                fontweight="bold",
+                color=PALETTE["text_mid"],
+                transform=ax.transAxes,
+                va="center",
+            )
+            ax.text(
+                x_value,
+                y,
+                value,
+                fontsize=8,
+                color=PALETTE["text_dark"],
+                transform=ax.transAxes,
+                va="center",
+            )
 
 
-def _draw_title(fig: Figure, filename: str, mode: str) -> None:
-    header = {"fcm": "FOREST COVER MAP", "ftm": "FOREST TYPE MAP", "dem": "CONTOUR ELEVATION MAP"}.get(mode, "ANALYSIS MAP")
-    fig.text(0.50, 0.955, f"SPATIAL DECISION SUPPORT SYSTEM — {header}", ha="center", va="center", fontsize=13, fontweight="bold", color=PALETTE["text_dark"])
-    fig.text(0.50, 0.935, f"MP Forest Department  |  File: {filename}", ha="center", va="center", fontsize=9, color=PALETTE["text_mid"], style="italic")
-    fig.add_artist(plt.Line2D([0.04, 0.96], [0.925, 0.925], transform=fig.transFigure, color=PALETTE["border"], linewidth=1.5))
+def _draw_text_panel(
+    ax,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    title: str,
+    body_text: str | list[str],
+    *,
+    box_face: str,
+    title_color: str,
+    text_color: str,
+    font_size: float,
+    line_gap: float = 1.20,
+) -> None:
+    ax.add_patch(
+        FancyBboxPatch(
+            (x, y),
+            w,
+            h,
+            boxstyle="round,pad=0.012,rounding_size=0.02",
+            transform=ax.transAxes,
+            facecolor=box_face,
+            edgecolor=PALETTE["border"],
+            linewidth=1.0,
+        )
+    )
+    ax.text(
+        x + 0.02,
+        y + h - 0.04,
+        title,
+        transform=ax.transAxes,
+        fontsize=11,
+        fontweight="bold",
+        color=title_color,
+        va="top",
+    )
+
+    if isinstance(body_text, str):
+        raw_lines = body_text.splitlines()
+    else:
+        raw_lines = [str(item) for item in body_text]
+
+    cursor_y = y + h - 0.09
+    max_width = 92 if w >= 0.9 else 72
+
+    for raw_line in raw_lines:
+        if raw_line.strip() == "":
+            cursor_y -= 0.02
+            continue
+
+        wrapped = textwrap.wrap(raw_line, width=max_width) or [""]
+        for wrapped_line in wrapped:
+            ax.text(
+                x + 0.02,
+                cursor_y,
+                wrapped_line,
+                transform=ax.transAxes,
+                fontsize=font_size,
+                color=text_color,
+                va="top",
+                ha="left",
+            )
+            cursor_y -= 0.032 * line_gap
+
+        cursor_y -= 0.006
+
+        if cursor_y < y + 0.02:
+            break
 
 
-def _build_summary_figure(results: dict[str, Any], filename: str) -> Figure:
-    fig = plt.figure(figsize=(16, 12))
-    fig.patch.set_facecolor(PALETTE["bg"])
-    fig.add_artist(Rectangle((0.01, 0.01), 0.98, 0.98, transform=fig.transFigure,
-                             linewidth=3, edgecolor=PALETTE["border"], facecolor="none", zorder=10))
-    ax = fig.add_axes([0.04, 0.05, 0.92, 0.84])
-    ax.set_axis_off()
-    fig.text(0.50, 0.955, "SPATIAL DECISION SUPPORT SYSTEM — SUMMARY", ha="center", va="center",
-             fontsize=15, fontweight="bold", color=PALETTE["text_dark"])
-    fig.text(0.50, 0.935, f"MP Forest Department  |  File: {filename}", ha="center", va="center",
-             fontsize=9, color=PALETTE["text_mid"], style="italic")
-    fig.add_artist(plt.Line2D([0.04, 0.96], [0.925, 0.925], transform=fig.transFigure, color=PALETTE["border"], linewidth=1.5))
-
-    summary_en = str(results.get("summary_en") or "No summary text was supplied for this analysis.").strip()
-    summary_hi = str(results.get("summary_hi") or "इस विश्लेषण के लिए कोई सारांश उपलब्ध नहीं है।").strip()
-    key_facts_en = list(results.get("key_facts_en") or ["No key facts available."])
-    key_facts_hi = list(results.get("key_facts_hi") or ["कोई मुख्य तथ्य उपलब्ध नहीं है।"])
-
-    def draw_box(x, y, w, h, title, body_lines, facecolor):
-        ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.012,rounding_size=0.02",
-                                    transform=ax.transAxes, facecolor=facecolor, edgecolor=PALETTE["border"], linewidth=1.0))
-        ax.text(x + 0.02, y + h - 0.05, title, transform=ax.transAxes, fontsize=11, fontweight="bold",
-                color=PALETTE["accent"], va="top")
-        yy = y + h - 0.10
-        for line in body_lines:
-            ax.text(x + 0.02, yy, line, transform=ax.transAxes, fontsize=9.5, color=PALETTE["text_dark"], va="top", wrap=True)
-            yy -= 0.05
-
-    draw_box(0.02, 0.52, 0.46, 0.40, "English Summary", textwrap.wrap(summary_en, width=58), "#ffffff")
-    draw_box(0.52, 0.52, 0.46, 0.40, "हिंदी सारांश", textwrap.wrap(summary_hi, width=58), "#f8fbf6")
-    draw_box(0.02, 0.08, 0.46, 0.35, "Key Facts (English)", [f"• {fact}" for fact in key_facts_en], "#fbfcf8")
-    draw_box(0.52, 0.08, 0.46, 0.35, "मुख्य तथ्य (हिंदी)", [f"• {fact}" for fact in key_facts_hi], "#fbfcf8")
-    fig.text(0.50, 0.02, "Generated automatically by SDSS | तैयार किया गया SDSS द्वारा", ha="center", va="bottom", fontsize=8, color=PALETTE["text_mid"])
-    return fig
+def _draw_page_footer(fig: Figure, page_index: int, total_pages: int) -> None:
+    fig.text(
+        0.96,
+        0.02,
+        f"Page {page_index} / {total_pages}",
+        ha="right",
+        va="bottom",
+        fontsize=8,
+        color=PALETTE["text_mid"],
+    )
 
 
 def _round_to_nice(val: float) -> float:
