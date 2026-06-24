@@ -7,7 +7,7 @@
 # ── Stage 1: Build dependencies ───────────────────────────────────────────────
 FROM python:3.11-slim AS builder
 
-# FIX: Added libcairo2-dev and libfreetype6-dev for compiling mplcairo/pycairo
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         gdal-bin \
@@ -18,7 +18,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         libcairo2-dev \
         libfreetype6-dev \
+        libharfbuzz-dev \
+        libfribidi-dev \
+        libraqm-dev \
         git \
+        
     && rm -rf /var/lib/apt/lists/*
 
 ENV CPLUS_INCLUDE_PATH=/usr/include/gdal
@@ -27,9 +31,19 @@ ENV C_INCLUDE_PATH=/usr/include/gdal
 WORKDIR /build
 COPY requirements.txt .
 
-RUN pip install --upgrade pip wheel && \
-    pip install --no-cache-dir --prefix=/install -r requirements.txt
+#RUN pip install --upgrade pip wheel && \
+    #pip install --no-cache-dir --prefix=/install -r requirements.txt
+#RUN pip install --upgrade pip wheel
 
+RUN pip install \
+    --no-binary=mplcairo \
+    --prefix=/install \
+    mplcairo
+
+RUN pip install \
+    --no-cache-dir \
+    --prefix=/install \
+    -r requirements.txt
 
 # ── Stage 2: Final runtime image ──────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
@@ -43,8 +57,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libspatialindex-dev \
         libcairo2 \
         libfreetype6 \
+        libharfbuzz0b \
+        libfribidi0 \
+        libraqm0 \
         curl \
-    && rm -rf /var/lib/apt/lists/*
+        && rm -rf /var/lib/apt/lists/*
 
 # Copy compiled Python packages from builder stage
 COPY --from=builder /install /usr/local
