@@ -7,7 +7,7 @@
 # ── Stage 1: Build dependencies ───────────────────────────────────────────────
 FROM python:3.11-slim AS builder
 
-# GDAL headers needed to compile rasterio wheel
+# FIX: Added libcairo2-dev and libfreetype6-dev for compiling mplcairo/pycairo
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         gdal-bin \
@@ -16,6 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libproj-dev \
         libspatialindex-dev \
         pkg-config \
+        libcairo2-dev \
+        libfreetype6-dev \
         git \
     && rm -rf /var/lib/apt/lists/*
 
@@ -32,13 +34,15 @@ RUN pip install --upgrade pip wheel && \
 # ── Stage 2: Final runtime image ──────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
 
-# FIX: Install Debian-native runtime shared libraries dynamically 
+# FIX: Added shared runtime packages (libcairo2, libfreetype6) for execution stage
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gdal-bin \
         libgdal-dev \
         libgeos-dev \
         libproj-dev \
         libspatialindex-dev \
+        libcairo2 \
+        libfreetype6 \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -69,3 +73,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 EXPOSE 8080
 
 CMD ["python", "main.py"]
+
