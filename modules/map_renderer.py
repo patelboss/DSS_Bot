@@ -61,7 +61,7 @@ PALETTE = {
     "accent": "#2c6e31",
     "text_dark": "#1a2a1b",
     "text_mid": "#3d5c3f",
-    "poly_fill": "#ffffffa0",
+    "poly_fill": "#ffffffff",
     "poly_edge": "#d62828",
     "grid": "#b0c4b1",
     "table_alt": "#e8f0e9",
