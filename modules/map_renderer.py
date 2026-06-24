@@ -1,8 +1,9 @@
 """
 modules/map_renderer.py — Programmatic cartographic layout engine.
 
-Produces thematic map-only PDF pages for FCM, FTM, and DEM.
-Summary / key facts / thank-you pages are handled separately by utils/summary.py.
+Produces thematic map pages for FCM, FTM, and DEM (vector or raster contours).
+Summary / key facts / thank-you pages are provided by utils.summary and appended
+into the same PDF.
 """
 
 from __future__ import annotations
@@ -22,12 +23,16 @@ import matplotlib
 
 try:
     import mplcairo  # noqa: F401
+
     matplotlib.use("module://mplcairo.base")
 except Exception:
     matplotlib.use("Agg")
 
+# FORCE Matplotlib to pass literal strings to Cairo without internal parsing
 matplotlib.rcParams["text.parse_math"] = False
 matplotlib.rcParams["pgf.rcpresets"] = False
+
+# Tell the PDF backend to output actual native vectors rather than Type-3 fonts
 matplotlib.rcParams["pdf.fonttype"] = 42
 matplotlib.rcParams["ps.fonttype"] = 42
 
@@ -43,7 +48,21 @@ from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
 from matplotlib.patches import FancyBboxPatch, Rectangle
 from rasterio.mask import mask as rio_mask
-from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Polygon, mapping, shape
+from shapely.geometry import (
+    GeometryCollection,
+    LineString,
+    MultiLineString,
+    MultiPolygon,
+    Polygon,
+    mapping,
+    shape,
+)
+
+from utils.summary import (
+    build_keyfacts_figure,
+    build_summary_figure,
+    build_thankyou_figure,
+)
 
 try:
     from config import cfg  # type: ignore
@@ -368,22 +387,23 @@ def render_map(
     map_mode: str = "bundle",
 ) -> io.BytesIO:
     """
-    Return a PDF in memory containing thematic map pages only.
+    Return a multi-page PDF report in memory.
 
     Page order:
       - FCM if available
       - DEM if available
       - FTM if available
+      - Summary
+      - Key Facts
+      - Thank You
     """
     mode = str(map_mode or results.get("_map_mode", "bundle")).strip().lower()
     if mode not in {"bundle", "fcm", "ftm", "dem"}:
         mode = "bundle"
 
     thematic_modes = _resolve_thematic_modes(results, mode)
-    if not thematic_modes:
-        thematic_modes = ["fcm"]
-
-    total_pages = len(thematic_modes)
+    page_specs: list[str] = thematic_modes + ["summary", "keyfacts", "thanks"]
+    total_pages = len(page_specs)
 
     fd, tmp_name = tempfile.mkstemp(prefix=f"{PathSafe(filename)}_", suffix=".pdf")
     os.close(fd)
@@ -391,8 +411,16 @@ def render_map(
 
     try:
         with PdfPages(str(tmp_pdf)) as pdf:
-            for page_index, page_kind in enumerate(thematic_modes, start=1):
-                fig = _build_thematic_figure(page_kind, geojson_feature, results, filename)
+            for page_index, page_kind in enumerate(page_specs, start=1):
+                if page_kind in {"fcm", "ftm", "dem"}:
+                    fig = _build_thematic_figure(page_kind, geojson_feature, results, filename)
+                elif page_kind == "summary":
+                    fig = build_summary_figure(results, filename)
+                elif page_kind == "keyfacts":
+                    fig = build_keyfacts_figure(results, filename)
+                else:
+                    fig = build_thankyou_figure(results, filename)
+
                 _draw_page_footer(fig, page_index, total_pages)
                 pdf.savefig(fig, dpi=_OUTPUT_DPI)
                 plt.close(fig)
@@ -401,7 +429,7 @@ def render_map(
         buf = io.BytesIO(tmp_pdf.read_bytes())
         buf.seek(0)
         buf.name = f"{PathSafe(filename)}.pdf"
-        log.info("✅ Thematic map successfully rendered | pages=%d | format=PDF | dpi=%d", total_pages, _OUTPUT_DPI)
+        log.info("✅ Map successfully rendered | pages=%d | format=PDF | dpi=%d", total_pages, _OUTPUT_DPI)
         return buf
     finally:
         try:
@@ -561,11 +589,7 @@ def _maybe_to_wgs84(gdf):
 
 def _draw_fcm_layers(ax, results: dict) -> None:
     fcm_gdfs = results.get("_raw_fcm_gdfs", []) or []
-    log.info(
-        "MAP_TRACE | mode=fcm | raw_fcm_gdfs=%d | rows=%s",
-        len(fcm_gdfs),
-        [len(gdf) for gdf in fcm_gdfs] if fcm_gdfs else [],
-    )
+    log.info("MAP_TRACE | mode=fcm | raw_fcm_gdfs=%d | rows=%s", len(fcm_gdfs), [len(gdf) for gdf in fcm_gdfs] if fcm_gdfs else [])
 
     for gdf in fcm_gdfs:
         if gdf is None or getattr(gdf, "empty", True):
@@ -597,11 +621,7 @@ def _draw_fcm_layers(ax, results: dict) -> None:
 
 def _draw_ftm_layers(ax, results: dict) -> None:
     ftm_gdfs = results.get("_raw_ftm_gdfs", []) or []
-    log.info(
-        "MAP_TRACE | mode=ftm | raw_ftm_gdfs=%d | rows=%s",
-        len(ftm_gdfs),
-        [len(gdf) for gdf in ftm_gdfs] if ftm_gdfs else [],
-    )
+    log.info("MAP_TRACE | mode=ftm | raw_ftm_gdfs=%d | rows=%s", len(ftm_gdfs), [len(gdf) for gdf in ftm_gdfs] if ftm_gdfs else [])
 
     for gdf in ftm_gdfs:
         if gdf is None or getattr(gdf, "empty", True):
@@ -711,24 +731,13 @@ def _draw_dem_layers(ax, results: dict, study_geom) -> None:
                 log.warning("Raster DEM contour render skipped for %s: %s", raster_path.name, exc)
 
     if dem_gdfs:
-        log.info(
-            "MAP_TRACE | mode=dem-vector | raw_dem_gdfs=%d | rows=%s",
-            len(dem_gdfs),
-            [len(gdf) for gdf in dem_gdfs] if dem_gdfs else [],
-        )
+        log.info("MAP_TRACE | mode=dem-vector | raw_dem_gdfs=%d | rows=%s", len(dem_gdfs), [len(gdf) for gdf in dem_gdfs] if dem_gdfs else [])
         for gdf in dem_gdfs:
             if gdf is None or getattr(gdf, "empty", True):
                 continue
             gdf = _maybe_to_wgs84(gdf)
 
-            elev_col = next(
-                (
-                    c
-                    for c in getattr(gdf, "columns", [])
-                    if str(c).lower() in {"elevation", "elev", "contour", "z", "elev_m"}
-                ),
-                None,
-            )
+            elev_col = next((c for c in getattr(gdf, "columns", []) if str(c).lower() in {"elevation", "elev", "contour", "z", "elev_m"}), None)
 
             for _, row in gdf.iterrows():
                 geom = getattr(row, "geometry", None)
@@ -872,11 +881,31 @@ def _draw_legend(ax, results: dict, mode: str) -> None:
         ax.text(0.05, y, "Contour Elevation View", fontsize=8, fontweight="bold", color=PALETTE["accent"], transform=ax.transAxes, va="top")
         y -= dy * 0.7
 
-        ax.add_patch(mpatches.Rectangle((0.05, y - 0.022), 0.10, 0.044, transform=ax.transAxes, facecolor=PALETTE["contour"], edgecolor="#555", linewidth=0.5))
+        ax.add_patch(
+            mpatches.Rectangle(
+                (0.05, y - 0.022),
+                0.10,
+                0.044,
+                transform=ax.transAxes,
+                facecolor=PALETTE["contour"],
+                edgecolor="#555",
+                linewidth=0.5,
+            )
+        )
         ax.text(0.20, y, "Index Contours (100 m)", fontsize=7, color=PALETTE["text_dark"], transform=ax.transAxes, va="center")
         y -= dy
 
-        ax.add_patch(mpatches.Rectangle((0.05, y - 0.022), 0.10, 0.044, transform=ax.transAxes, facecolor=PALETTE["contour_faint"], edgecolor="#555", linewidth=0.5))
+        ax.add_patch(
+            mpatches.Rectangle(
+                (0.05, y - 0.022),
+                0.10,
+                0.044,
+                transform=ax.transAxes,
+                facecolor=PALETTE["contour_faint"],
+                edgecolor="#555",
+                linewidth=0.5,
+            )
+        )
         ax.text(0.20, y, "Intermediate Contours (20 m)", fontsize=7, color=PALETTE["text_dark"], transform=ax.transAxes, va="center")
         y -= dy
 
@@ -898,7 +927,17 @@ def _draw_legend(ax, results: dict, mode: str) -> None:
             ax.text(0.05, y, "No FTM classes available", fontsize=7, color=PALETTE["text_mid"], transform=ax.transAxes, va="top")
         else:
             for label, count, color in ftm_stats[:8]:
-                ax.add_patch(mpatches.Rectangle((0.05, y - 0.022), 0.10, 0.044, transform=ax.transAxes, facecolor=color, edgecolor="#555", linewidth=0.5))
+                ax.add_patch(
+                    mpatches.Rectangle(
+                        (0.05, y - 0.022),
+                        0.10,
+                        0.044,
+                        transform=ax.transAxes,
+                        facecolor=color,
+                        edgecolor="#555",
+                        linewidth=0.5,
+                    )
+                )
                 ax.text(0.20, y, f"{label} ({count})", fontsize=7, color=PALETTE["text_dark"], transform=ax.transAxes, va="center")
                 y -= dy
 
@@ -920,7 +959,17 @@ def _draw_legend(ax, results: dict, mode: str) -> None:
                 if label not in normalized:
                     continue
                 pct = _safe_float(normalized.get(label, {}).get("percentage", 0.0), 0.0) or 0.0
-                ax.add_patch(mpatches.Rectangle((0.05, y - 0.022), 0.10, 0.044, transform=ax.transAxes, facecolor=_match_fcm_color(label), edgecolor="#555", linewidth=0.5))
+                ax.add_patch(
+                    mpatches.Rectangle(
+                        (0.05, y - 0.022),
+                        0.10,
+                        0.044,
+                        transform=ax.transAxes,
+                        facecolor=_match_fcm_color(label),
+                        edgecolor="#555",
+                        linewidth=0.5,
+                    )
+                )
                 ax.text(0.20, y, f"{label} ({pct:.1f}%)", fontsize=7, color=PALETTE["text_dark"], transform=ax.transAxes, va="center")
                 y -= dy
                 used.add(label)
@@ -929,7 +978,17 @@ def _draw_legend(ax, results: dict, mode: str) -> None:
                 if label in used:
                     continue
                 pct = _safe_float((metrics or {}).get("percentage", 0.0), 0.0) or 0.0
-                ax.add_patch(mpatches.Rectangle((0.05, y - 0.022), 0.10, 0.044, transform=ax.transAxes, facecolor=_match_fcm_color(label), edgecolor="#555", linewidth=0.5))
+                ax.add_patch(
+                    mpatches.Rectangle(
+                        (0.05, y - 0.022),
+                        0.10,
+                        0.044,
+                        transform=ax.transAxes,
+                        facecolor=_match_fcm_color(label),
+                        edgecolor="#555",
+                        linewidth=0.5,
+                    )
+                )
                 ax.text(0.20, y, f"{label} ({pct:.1f}%)", fontsize=7, color=PALETTE["text_dark"], transform=ax.transAxes, va="center")
                 y -= dy
 
