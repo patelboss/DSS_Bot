@@ -19,6 +19,9 @@ import textwrap
 import zlib
 from pathlib import Path
 from typing import Any, Iterable
+import matplotlib
+import mplcairo
+matplotlib.use("module://mplcairo.base") # Overrides the default layout engine
 
 import matplotlib.font_manager as fm
 import matplotlib.patches as mpatches
