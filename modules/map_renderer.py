@@ -146,7 +146,7 @@ def _iter_font_files(base: Path) -> list[Path]:
 
 def _find_devanagari_font() -> Path | None:
     preferred_names = (
-     #   "kokila",
+        "devanagari-Black",
         "nirmala",
         "mangal",
         "noto sans devanagari",
