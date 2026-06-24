@@ -33,8 +33,15 @@ try:
 except Exception:
     matplotlib.use("Agg")
 
-matplotlib.rcParams["text.parse_math"] = False
-matplotlib.rcParams["pgf.rcpresets"] = False
+# FORCE Matplotlib to pass literal strings to Cairo without internal parsing
+if "text.parse_math" in matplotlib.rcParams:
+    matplotlib.rcParams["text.parse_math"] = False
+    
+#matplotlib.rcParams["pgf.rcpresets"] = False
+if "pgf.rcpresets" in matplotlib.rcParams:
+    matplotlib.rcParams["pgf.rcpresets"] = False
+print("pgf.rcpresets" in matplotlib.rcParams)
+print("text.parse_math" in matplotlib.rcParams)
 matplotlib.rcParams["pdf.fonttype"] = 42
 matplotlib.rcParams["ps.fonttype"] = 42
 
