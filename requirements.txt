@@ -15,7 +15,7 @@ packaging==24.0           # 🚀 RESTORED: Required by GeoPandas internal driver
 
 # ── Map rendering ─────────────────────────────────────────────────────────────
 matplotlib==3.9.1         # Cartographic layout canvas
-#mplcairo #==0.7  # Or latest stable version
+mplcairo==0.6.1  # Or latest stable version
 
 # ── Database ──────────────────────────────────────────────────────────────────
 pymongo==4.8.0            # MongoDB Atlas driver
