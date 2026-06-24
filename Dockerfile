@@ -33,19 +33,13 @@ COPY requirements.txt .
 
 RUN pip install --upgrade pip setuptools wheel
 
-# Build mplcairo from source against HarfBuzz/Raqm
-RUN pip install \
-        --no-binary=mplcairo \
-        --prefix=/install \
-        mplcairo==0.6.1
 
 # Install remaining requirements (excluding mplcairo to avoid wheel overwrite)
-RUN grep -vi "^mplcairo" requirements.txt > requirements_no_mplcairo.txt && \
+RUN PIP_NO_BINARY=mplcairo \
     pip install \
-        --no-cache-dir \
-        --prefix=/install \
-        -r requirements_no_mplcairo.txt
-
+    --no-cache-dir \
+    --prefix=/install \
+    -r requirements.txt
 
 # ── Stage 2: Runtime image ───────────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
