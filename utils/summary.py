@@ -1,13 +1,14 @@
 """
 utils/summary.py — Summary-only report builder.
 
-Handles:
+Provides:
 - English summary page
 - Hindi summary page
 - Key facts page
 - Thank-you page
 
-This module is separate from modules/map_renderer.py.
+This module is imported by modules/map_renderer.py so the full PDF remains a
+single report.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from __future__ import annotations
 import gc
 import io
 import logging
-import math
+import os
 import sys
 import tempfile
 import textwrap
@@ -27,6 +28,7 @@ import matplotlib
 
 try:
     import mplcairo  # noqa: F401
+
     matplotlib.use("module://mplcairo.base")
 except Exception:
     matplotlib.use("Agg")
@@ -42,6 +44,11 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.patches import FancyBboxPatch, Rectangle
+
+try:
+    from config import cfg  # type: ignore
+except Exception:  # pragma: no cover - config is optional
+    cfg = None  # type: ignore
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
@@ -96,6 +103,7 @@ UTILS_DIR = PROJECT_ROOT / "utils"
 
 _DEVA_FONT_FAMILY: str | None = None
 _FONT_KWARGS: dict[str, Any] = {}
+_OUTPUT_DPI = int(getattr(cfg, "OUTPUT_DPI", 300) or 300) if cfg is not None else 300
 
 
 def _iter_font_files(base: Path) -> list[Path]:
@@ -226,7 +234,7 @@ def _auto_sort_fcm_classes(fcm_classes: dict[str, dict[str, Any]]) -> list[tuple
     return items
 
 
-def _prepare_report_content(results: dict[str, Any]) -> dict[str, Any]:
+def prepare_report_content(results: dict[str, Any]) -> dict[str, Any]:
     area = _safe_float(results.get("area_ha", 0.0), 0.0) or 0.0
 
     fcm = results.get("fcm", {}) or {}
@@ -268,7 +276,8 @@ def _prepare_report_content(results: dict[str, Any]) -> dict[str, Any]:
 
     sorted_classes = _auto_sort_fcm_classes(normalized_classes)
     non_dom_classes = [
-        label for label, _pct in sorted_classes
+        label
+        for label, _pct in sorted_classes
         if label != dominant_raw and label not in {"WATER", "NO-DATA"}
     ]
 
@@ -341,26 +350,25 @@ def render_summary_pdf(results: dict[str, Any], filename: str = "output") -> io.
     """
     Return a PDF in memory containing:
       - English Summary
-      - Hindi Summary
       - Key Facts
       - Thank You
     """
     fd, tmp_name = tempfile.mkstemp(prefix=f"{PathSafe(filename)}_", suffix=".pdf")
-    Path(tmp_name).write_bytes(b"")  # ensure path exists on all platforms
+    os.close(fd)
     tmp_pdf = Path(tmp_name)
 
     try:
         with PdfPages(str(tmp_pdf)) as pdf:
             pages = [
-                _build_summary_figure(results, filename),
-                _build_keyfacts_figure(results, filename),
-                _build_thankyou_figure(results, filename),
+                build_summary_figure(results, filename),
+                build_keyfacts_figure(results, filename),
+                build_thankyou_figure(results, filename),
             ]
             total_pages = len(pages)
 
             for idx, fig in enumerate(pages, start=1):
                 _draw_page_footer(fig, idx, total_pages)
-                pdf.savefig(fig, dpi=300)
+                pdf.savefig(fig, dpi=_OUTPUT_DPI)
                 plt.close(fig)
                 gc.collect()
 
@@ -377,8 +385,8 @@ def render_summary_pdf(results: dict[str, Any], filename: str = "output") -> io.
             pass
 
 
-def _build_summary_figure(results: dict[str, Any], filename: str) -> Figure:
-    content = _prepare_report_content(results)
+def build_summary_figure(results: dict[str, Any], filename: str) -> Figure:
+    content = prepare_report_content(results)
     fig = plt.figure(figsize=(16, 12))
     fig.patch.set_facecolor(PALETTE["bg"])
     fig.add_artist(
@@ -458,8 +466,8 @@ def _build_summary_figure(results: dict[str, Any], filename: str) -> Figure:
     return fig
 
 
-def _build_keyfacts_figure(results: dict[str, Any], filename: str) -> Figure:
-    content = _prepare_report_content(results)
+def build_keyfacts_figure(results: dict[str, Any], filename: str) -> Figure:
+    content = prepare_report_content(results)
     fig = plt.figure(figsize=(16, 12))
     fig.patch.set_facecolor(PALETTE["bg"])
     fig.add_artist(
@@ -524,7 +532,7 @@ def _build_keyfacts_figure(results: dict[str, Any], filename: str) -> Figure:
     return fig
 
 
-def _build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
+def build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
     fig = plt.figure(figsize=(16, 12))
     fig.patch.set_facecolor(PALETTE["thank_bg"])
     fig.add_artist(
