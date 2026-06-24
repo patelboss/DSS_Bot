@@ -29,9 +29,12 @@ except Exception:
     matplotlib.use("Agg")
 
 # FORCE Matplotlib to pass literal strings to Cairo without internal parsing
-matplotlib.rcParams["text.parse_math"] = False
-matplotlib.rcParams["pgf.rcpresets"] = False
-
+if "text.parse_math" in matplotlib.rcParams:
+    matplotlib.rcParams["text.parse_math"] = False
+    
+#matplotlib.rcParams["pgf.rcpresets"] = False
+if "pgf.rcpresets" in matplotlib.rcParams:
+    matplotlib.rcParams["pgf.rcpresets"] = False
 # Tell the PDF backend to output actual native vectors rather than Type-3 fonts
 matplotlib.rcParams["pdf.fonttype"] = 42
 matplotlib.rcParams["ps.fonttype"] = 42
