@@ -137,9 +137,9 @@ def _iter_font_files(base: Path) -> list[Path]:
     if not base.exists():
         return []
     if base.is_file():
-        return [base] if base.suffix.lower() in {".ttf", ".otf", ".ttc"} else []
+        return [base] if base.suffix.lower() in {".ttf", ".otf", ".ttc", ".TTF", ".OTF", ".TTC"} else []
     out: list[Path] = []
-    for pattern in ("*.ttf", "*.otf", "*.ttc"):
+    for pattern in ("*.ttf", "*.otf", "*.ttc", "*.TTF", "*.OTF", "*.TTC"):
         out.extend(base.rglob(pattern))
     return out
 
