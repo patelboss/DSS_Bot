@@ -670,6 +670,24 @@ async def catch_all_text(client: Client, message: Message) -> None:
     sys.stdout.flush()
 
 
+from utils import *
+
+
+@Client.on_message(filters.command("testtext") & filters.user(ADMIN_IDS))
+async def testtext_handler(client, message: Message):
+    arg = None
+    if len(message.command) > 1:
+        arg = message.command[1].strip().lower()
+
+    if arg == "png":
+        out = render_texttest_png()
+        out.name = "texttest.png"
+        await message.reply_photo(photo=out, caption="Text shaping test PNG")
+        return
+
+    out = render_texttest_pdf()
+    out.name = "texttest.pdf"
+    await message.reply_document(document=out, caption="Text shaping test PDF")
 
 @Client.on_message(filters.command("testtext"))
 async def testtext_handler(client, message: Message):
