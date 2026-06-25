@@ -538,45 +538,6 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                 else:
                     report_text += "🌲 *Forest Canopy Cover (FCM):*\n"
                     report_text += "• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
-                    
-"""
-                    if class_col and not fcm_utm.empty:
-                        fcm_utm["part_area_ha"] = fcm_utm.geometry.area / 10000.0
-                        grouped = fcm_utm.groupby(class_col)["part_area_ha"].sum()
-                        max_area = 0.0
-                        for raw_class, class_ha in grouped.items():
-                            c_str = str(raw_class).strip().upper()
-                            if "VDF" in c_str:
-                                standard_label = "VDF"
-                            elif "MDF" in c_str:
-                                standard_label = "MDF"
-                            elif "OPEN FOREST" in c_str:
-                                standard_label = "OPEN FOREST"
-                        #    elif "NON FOREST" in c_str:
-                        #        standard_label = "NON FOREST"
-                            elif "SCRUB" in c_str:
-                                standard_label = "SCRUB"
-                            elif "WATER" in c_str:
-                                standard_label = "WATER"
-                            else:
-                                standard_label = "NO-DATA"
-                            c_pct = (class_ha / calculated_area_ha) * 100.0 if calculated_area_ha else 0.0
-                            fcm_class_summary[standard_label] = {"hectares": float(class_ha), "percentage": float(c_pct)}
-                            if standard_label not in {"WATER", "NO-DATA"} and class_ha > max_area:
-                                max_area = class_ha
-                                dominant_cover_type = standard_label
-                    report_text += "🌲 *Forest Canopy Cover (FCM):*\n"
-                    if fcm_class_summary:
-                        for label, metrics in fcm_class_summary.items():
-                            report_text += f"• {label}: `{metrics['hectares']:.2f} ha` ({metrics['percentage']:.1f}%)\n"
-
-                    else:
-                        report_text += "• Processing Status: `[Evaluated - class_name column not usable]` ⚠️\n\n"
-                    passed_fcm_list = [fcm_compiled]
-                else:
-                    report_text += "🌲 *Forest Canopy Cover (FCM):*\n"
-                    report_text += "• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
-"""
                 # FTM
                 if ftm_intersected_gdfs:
                     ftm_compiled = pd.concat(ftm_intersected_gdfs, ignore_index=True)
