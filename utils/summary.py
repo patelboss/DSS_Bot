@@ -636,7 +636,7 @@ def build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
         **_FONT_KWARGS,
     )
     return fig
-
+"""
 
 def _draw_text_panel(
     ax,
@@ -710,7 +710,86 @@ def _draw_text_panel(
         cursor_y -= 0.006
         if cursor_y < y + 0.02:
             break
+"""
 
+def _draw_text_panel(
+    ax,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    title: str,
+    body_text: str | list[str],
+    *,
+    box_face: str,
+    title_color: str,
+    text_color: str,
+    font_size: float,
+    line_gap: float = 1.20,
+    fontproperties: fm.FontProperties | None = None,
+) -> None:
+    ax.add_patch(
+        FancyBboxPatch(
+            (x, y),
+            w,
+            h,
+            boxstyle="round,pad=0.012,rounding_size=0.02",
+            transform=ax.transAxes,
+            facecolor=box_face,
+            edgecolor=PALETTE["border"],
+            linewidth=1.0,
+        )
+    )
+
+    text_kwargs: dict[str, Any] = {}
+    if fontproperties is not None:
+        text_kwargs["fontproperties"] = fontproperties
+
+    ax.text(
+        x + 0.02,
+        y + h - 0.04,
+        title,
+        transform=ax.transAxes,
+        fontsize=11,
+        fontweight="bold",
+        color=title_color,
+        va="top",
+        **text_kwargs,
+    )
+
+    raw_lines = body_text.splitlines() if isinstance(body_text, str) else [str(item) for item in body_text]
+    cursor_y = y + h - 0.09
+    max_width = 92 if w >= 0.9 else 72
+
+    for raw_line in raw_lines:
+        if raw_line.strip() == "":
+            cursor_y -= 0.02
+            continue
+
+        wrapped = textwrap.wrap(
+            raw_line,
+            width=max_width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        ) or [""]
+
+        for wrapped_line in wrapped:
+            ax.text(
+                x + 0.02,
+                cursor_y,
+                wrapped_line,
+                transform=ax.transAxes,
+                fontsize=font_size,
+                color=text_color,
+                va="top",
+                ha="left",
+                **text_kwargs,
+            )
+            cursor_y -= 0.032 * line_gap
+
+        cursor_y -= 0.006
+        if cursor_y < y + 0.02:
+            break
 
 def _draw_page_footer(fig: Figure, page_index: int, total_pages: int) -> None:
     fig.text(
