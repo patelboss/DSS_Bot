@@ -34,15 +34,20 @@ if not log.handlers:
 
 log.info("--- INITIALIZING SUMMARY.PY ---")
 
-# 1. BULLETPROOF BACKEND FALLBACK
-log.info("Attempting to load 'mplcairo' backend for proper text shaping...")
 try:
     import mplcairo  # noqa: F401
     matplotlib.use("module://mplcairo.base", force=True)
-    log.info("SUCCESS: 'mplcairo' backend activated via module://mplcairo.base")
+    log.info("SUCCESS: 'mplcairo' backend activated.")
 except Exception as e:
-    log.warning(f"FAILED to load 'mplcairo' ({e}). Falling back to 'Agg'. Text shaping may break!")
+    log.warning(f"FAILED to load 'mplcairo' ({e}). Falling back to 'Agg'.")
     matplotlib.use("Agg", force=True)
+
+# Try to import pypdf to merge individual crisp mplcairo PDF pages
+try:
+    import pypdf
+    log.info("SUCCESS: pypdf imported successfully for merging pages.")
+except ImportError:
+    raise ImportError("Please install pypdf via 'pip install pypdf' to merge high-quality shaped PDF pages.")
 
 try:
     if "text.parse_math" in matplotlib.rcParams:
@@ -50,14 +55,12 @@ try:
 except Exception:
     pass
 
-# Prevent Matplotlib from subsetting/stripping fonts
 matplotlib.rcParams["pdf.fonttype"] = 42
 matplotlib.rcParams["ps.fonttype"] = 42
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.patches import FancyBboxPatch, Rectangle
@@ -66,8 +69,6 @@ try:
     from config import cfg  # type: ignore
 except Exception:
     cfg = None  # type: ignore
-
-log.info("Active Matplotlib backend after imports: %s", matplotlib.get_backend())
 
 PALETTE = {
     "bg": "#f5f2eb",
@@ -104,7 +105,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 UTILS_DIR = PROJECT_ROOT / "utils"
 _OUTPUT_DPI = int(getattr(cfg, "OUTPUT_DPI", 300) or 300) if cfg is not None else 300
 
-# 2. EXPLICIT FONT CANDIDATES FROM TESTTEXT.PY
 FONT_CANDIDATES: tuple[str, ...] = (
     "/app/utils/fonts/Devanagari-Regular.ttf",
     "/app/utils/fonts/mangal.ttf",
@@ -118,58 +118,44 @@ FONT_CANDIDATES: tuple[str, ...] = (
 )
 
 def _safe_font_path(font_path: str | None = None) -> Path | None:
-    log.info("Searching for a valid Devanagari font...")
     if font_path:
         p = Path(font_path)
         if p.exists():
-            log.info(f"Using explicitly provided font path: {p}")
             return p
 
     for candidate in FONT_CANDIDATES:
         p = Path(candidate)
         if p.exists():
-            log.info(f"Found font from candidates list: {p}")
             return p
-        else:
-            log.debug(f"Candidate not found: {p}")
 
     search_dirs = [
         UTILS_DIR, UTILS_DIR / "fonts", PROJECT_ROOT / "fonts",
         Path("/app/fonts"), Path("/usr/local/share/fonts"),
         Path("/usr/share/fonts/truetype/noto"), Path("/usr/share/fonts/truetype/msttcorefonts"),
     ]
-    
     for base in search_dirs:
         if not base.exists():
-            log.debug(f"Search directory does not exist: {base}")
             continue
         for suffix in ("*.ttf", "*.otf", "*.ttc", "*.TTF", "*.OTF", "*.TTC"):
             found = sorted(base.rglob(suffix))
             if found:
-                log.info(f"Discovered fallback font via glob search: {found}")
                 return found
-                
-    log.warning("CRITICAL: No local Devanagari fonts found in any search path!")
     return None
 
 def _make_font_properties(font_path: str | None = None) -> fm.FontProperties:
-    log.info("Building FontProperties object...")
     p = _safe_font_path(font_path)
     if p is not None:
         try:
             fm.fontManager.addfont(str(p))
             fp = fm.FontProperties(fname=str(p))
-            log.info(f"FontProperties created successfully. Family: {fp.get_name()}, File: {fm.findfont(fp)}")
+            log.info(f"Using font file: {p}")
             return fp
         except Exception as exc:
             log.warning(f"Could not load font {p}: {exc}")
 
-    log.warning("Falling back to DejaVu Sans. HINDI LIGATURES WILL BREAK.")
     return fm.FontProperties(family="DejaVu Sans")
 
-# Build the global FontProperties object immediately
 _DEVA_FP = _make_font_properties()
-
 
 def PathSafe(name: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(name))
@@ -200,7 +186,6 @@ def _auto_sort_fcm_classes(fcm_classes: dict[str, dict[str, Any]]) -> list[tuple
     return items
 
 def prepare_report_content(results: dict[str, Any]) -> dict[str, Any]:
-    log.info("Preparing report content data strings...")
     area = _safe_float(results.get("area_ha", 0.0), 0.0) or 0.0
     fcm = results.get("fcm", {}) or {}
     classes = fcm.get("classes", {}) or {}
@@ -297,44 +282,55 @@ def prepare_report_content(results: dict[str, Any]) -> dict[str, Any]:
     }
 
 def render_summary_pdf(results: dict[str, Any], filename: str = "output") -> io.BytesIO:
-    log.info(f"Starting render_summary_pdf for filename: {filename}")
-    fd, tmp_name = tempfile.mkstemp(prefix=f"{PathSafe(filename)}_", suffix=".pdf")
-    os.close(fd)
-    tmp_pdf = Path(tmp_name)
-    log.info(f"Created temporary PDF file at: {tmp_pdf}")
+    log.info("Starting pure mplcairo single-page split render...")
+    
+    # Generate standalone figures
+    pages = [
+        build_summary_figure(results, filename),
+        build_keyfacts_figure(results, filename),
+        build_thankyou_figure(results, filename),
+    ]
+    total_pages = len(pages)
+    
+    pdf_merger = pypdf.PdfMerger()
+    temp_files: list[str] = []
 
     try:
-        with PdfPages(str(tmp_pdf)) as pdf:
-            pages = [
-                build_summary_figure(results, filename),
-                build_keyfacts_figure(results, filename),
-                build_thankyou_figure(results, filename),
-            ]
-            total_pages = len(pages)
-            log.info(f"Generated {total_pages} figure pages in memory. Saving to PdfPages...")
+        # Save every single page explicitly via savefig to preserve shaping
+        for idx, fig in enumerate(pages, start=1):
+            _draw_page_footer(fig, idx, total_pages)
+            
+            fd, tmp_page_name = tempfile.mkstemp(prefix=f"page_{idx}_", suffix=".pdf")
+            os.close(fd)
+            temp_files.append(tmp_page_name)
+            
+            log.info(f"Rendering Page {idx} to individual file via mplcairo context...")
+            fig.savefig(tmp_page_name, format="pdf", dpi=_OUTPUT_DPI)
+            plt.close(fig)
+            
+            pdf_merger.append(tmp_page_name)
+        
+        # Merge individual pristine files into single stream
+        out_buf = io.BytesIO()
+        pdf_merger.write(out_buf)
+        pdf_merger.close()
+        
+        out_buf.seek(0)
+        out_buf.name = f"{PathSafe(filename)}_summary.pdf"
+        log.info("✅ All pages merged flawlessly into final memory stream!")
+        return out_buf
 
-            for idx, fig in enumerate(pages, start=1):
-                log.info(f"Saving Page {idx}/{total_pages}...")
-                _draw_page_footer(fig, idx, total_pages)
-                pdf.savefig(fig, dpi=_OUTPUT_DPI)
-                plt.close(fig)
-                gc.collect()
-
-        buf = io.BytesIO(tmp_pdf.read_bytes())
-        buf.seek(0)
-        buf.name = f"{PathSafe(filename)}_summary.pdf"
-        log.info("✅ Summary PDF successfully rendered to memory buffer.")
-        return buf
     finally:
-        try:
-            if tmp_pdf.exists():
-                tmp_pdf.unlink()
-                log.info(f"Cleaned up temporary file: {tmp_pdf}")
-        except Exception as e:
-            log.warning(f"Failed to cleanup temp file {tmp_pdf}: {e}")
+        # Clean temporary page files safely
+        for tmp_f in temp_files:
+            try:
+                if os.path.exists(tmp_f):
+                    os.unlink(tmp_f)
+            except Exception:
+                pass
+        gc.collect()
 
 def build_summary_figure(results: dict[str, Any], filename: str) -> Figure:
-    log.info("Building Summary Figure...")
     content = prepare_report_content(results)
     fig = plt.figure(figsize=(16, 12))
     
@@ -352,7 +348,6 @@ def build_summary_figure(results: dict[str, Any], filename: str) -> Figure:
     return fig
 
 def build_keyfacts_figure(results: dict[str, Any], filename: str) -> Figure:
-    log.info("Building Key Facts Figure...")
     content = prepare_report_content(results)
     fig = plt.figure(figsize=(16, 12))
     
@@ -369,7 +364,6 @@ def build_keyfacts_figure(results: dict[str, Any], filename: str) -> Figure:
     return fig
 
 def build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
-    log.info("Building Thank You Figure...")
     fig = plt.figure(figsize=(16, 12))
     
     fig.patch.set_facecolor(PALETTE["thank_bg"])
@@ -384,15 +378,12 @@ def build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
     fig.text(0.50, 0.10, f"Generated automatically by SDSS | File: {filename}", ha="center", va="center", fontsize=8.5, color=PALETTE["text_mid"], fontproperties=_DEVA_FP)
     return fig
 
-# 3. EXPLICIT FONTPROPERTIES PASSING (Like testtext.py)
 def _draw_text_panel(
     ax, x: float, y: float, w: float, h: float, title: str,
     body_text: str | list[str], *, box_face: str, title_color: str,
     text_color: str, font_size: float, line_gap: float = 1.20,
     fontproperties: fm.FontProperties | None = None,
 ) -> None:
-    log.info(f"Drawing text panel: '{title}' at coords ({x}, {y})")
-    
     text_kwargs: dict[str, Any] = {}
     if fontproperties is not None:
         text_kwargs["fontproperties"] = fontproperties
@@ -404,7 +395,6 @@ def _draw_text_panel(
     cursor_y = y + h - 0.09
     max_width = 92 if w >= 0.9 else 72
 
-    log.debug(f"Panel '{title}': Processing {len(raw_lines)} lines of text.")
     for raw_line in raw_lines:
         if raw_line.strip() == "":
             cursor_y -= 0.02
@@ -418,9 +408,7 @@ def _draw_text_panel(
 
         cursor_y -= 0.006
         if cursor_y < y + 0.02:
-            log.debug(f"Panel '{title}': Hit vertical limit. Truncating remaining text.")
             break
 
 def _draw_page_footer(fig: Figure, page_index: int, total_pages: int) -> None:
     fig.text(0.96, 0.02, f"Page {page_index} / {total_pages}", ha="right", va="bottom", fontsize=8, color=PALETTE["text_mid"], fontproperties=_DEVA_FP)
-
