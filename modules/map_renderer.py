@@ -136,10 +136,9 @@ FCM_LABELS = {
     "VDF": ("Very Dense Forest", "अत्यधिक घना वन"),
     "MDF": ("Moderately Dense Forest", "मध्यम घना वन"),
     "OPEN FOREST": ("Open Forest", "खुला वन"),
-    "NON FOREST": ("Non Forest", "गैर-वन"),
     "SCRUB": ("Scrub", "झाड़ीदार क्षेत्र"),
     "WATER": ("Water", "जल"),
-    "NO-DATA": ("No Data", "डेटा अनुपलब्ध"),
+    "NO-DATA": ("Non Forest", "गैर-वन"), # The single unified label
 }
 
 FCM_ALIASES = {
@@ -151,9 +150,9 @@ FCM_ALIASES = {
     "MDF": "MDF",
     "OPEN FOREST": "OPEN FOREST",
     "OPEN": "OPEN FOREST",
-    "NON FOREST": "NON FOREST",
-    "NON-FOREST": "NON FOREST",
-    "NON FOREST AREA": "NON FOREST",
+    "NON FOREST": "NO-DATA",
+    "NON-FOREST": "NO-DATA",
+    "NON FOREST AREA": "NO-DATA",
     "SCRUB": "SCRUB",
     "WATER": "WATER",
     "NO DATA": "NO-DATA",
