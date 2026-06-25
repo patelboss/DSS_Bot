@@ -476,6 +476,70 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                     fcm_compiled = fcm_compiled[~fcm_compiled.geometry.is_empty].copy()
                     fcm_utm = fcm_compiled.to_crs(epsg=32644)
                     class_col = next((c for c in fcm_utm.columns if c.lower() == "class_name"), None)
+                                        if class_col and not fcm_utm.empty:
+                        fcm_utm["part_area_ha"] = fcm_utm.geometry.area / 10000.0
+                        
+                        # ─── 1. INITIALIZE FIXED ACCUMULATOR BUCKETS ───
+                        fcm_area_agg = {
+                            "VDF": 0.0,
+                            "MDF": 0.0,
+                            "OPEN FOREST": 0.0,
+                            "SCRUB": 0.0,
+                            "WATER": 0.0,
+                            "NO-DATA": 0.0
+                        }
+                        
+                        # ─── 2. LOOP AND AGGREGATE AREA BY STANDARDIZED LABELS ───
+                        for _, row_cell in fcm_utm.iterrows():
+                            c_str = str(row_cell[class_col]).strip().upper()
+                            cell_ha = float(row_cell["part_area_ha"])
+                            
+                            if "VDF" in c_str:
+                                standard_label = "VDF"
+                            elif "MDF" in c_str:
+                                standard_label = "MDF"
+                            elif "OPEN FOREST" in c_str or "OPEN" in c_str:
+                                standard_label = "OPEN FOREST"
+                            elif "SCRUB" in c_str:
+                                standard_label = "SCRUB"
+                            elif "WATER" in c_str:
+                                standard_label = "WATER"
+                            else:
+                                # Treats old "NON FOREST", missing text, or gaps as NO-DATA ("Non Forest")
+                                standard_label = "NO-DATA"
+                                
+                            fcm_area_agg[standard_label] += cell_ha
+
+                        # ─── 3. COMPUTE METRICS OVER ACCUMULATED TOTALS ───
+                        max_area = 0.0
+                        for standard_label, class_ha in fcm_area_agg.items():
+                            if class_ha <= 0:
+                                continue  # Don't add empty classes to summary
+                                
+                            c_pct = (class_ha / calculated_area_ha) * 100.0 if calculated_area_ha else 0.0
+                            fcm_class_summary[standard_label] = {"hectares": float(class_ha), "percentage": float(c_pct)}
+                            
+                            if standard_label not in {"WATER", "NO-DATA"} and class_ha > max_area:
+                                max_area = class_ha
+                                dominant_cover_type = standard_label
+
+                        # Fallback: If the area contains zero forest classes, set "NO-DATA" as dominant
+                        if max_area == 0.0 and fcm_area_agg["NO-DATA"] > 0:
+                            dominant_cover_type = "NO-DATA"
+
+                    report_text += "🌲 *Forest Canopy Cover (FCM):*\n"
+                    if fcm_class_summary:
+                        for label, metrics in fcm_class_summary.items():
+                            report_text += f"• {label}: `{metrics['hectares']:.2f} ha` ({metrics['percentage']:.1f}%)\n"
+                        report_text += "• Processing Status: `[Natively Evaluated]` ✅\n\n"
+                    else:
+                        report_text += "• Processing Status: `[Evaluated - class_name column not usable]` ⚠️\n\n"
+                    passed_fcm_list = [fcm_compiled]
+                else:
+                    report_text += "🌲 *Forest Canopy Cover (FCM):*\n"
+                    report_text += "• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
+                    
+"""
                     if class_col and not fcm_utm.empty:
                         fcm_utm["part_area_ha"] = fcm_utm.geometry.area / 10000.0
                         grouped = fcm_utm.groupby(class_col)["part_area_ha"].sum()
@@ -488,8 +552,8 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                                 standard_label = "MDF"
                             elif "OPEN FOREST" in c_str:
                                 standard_label = "OPEN FOREST"
-                            elif "NON FOREST" in c_str:
-                                standard_label = "NON FOREST"
+                        #    elif "NON FOREST" in c_str:
+                        #        standard_label = "NON FOREST"
                             elif "SCRUB" in c_str:
                                 standard_label = "SCRUB"
                             elif "WATER" in c_str:
@@ -505,14 +569,14 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                     if fcm_class_summary:
                         for label, metrics in fcm_class_summary.items():
                             report_text += f"• {label}: `{metrics['hectares']:.2f} ha` ({metrics['percentage']:.1f}%)\n"
-                        report_text += "• Processing Status: `[Natively Evaluated]` ✅\n\n"
+
                     else:
                         report_text += "• Processing Status: `[Evaluated - class_name column not usable]` ⚠️\n\n"
                     passed_fcm_list = [fcm_compiled]
                 else:
                     report_text += "🌲 *Forest Canopy Cover (FCM):*\n"
                     report_text += "• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
-
+"""
                 # FTM
                 if ftm_intersected_gdfs:
                     ftm_compiled = pd.concat(ftm_intersected_gdfs, ignore_index=True)
