@@ -39,11 +39,16 @@ import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 
+# 1. Try importing components at the top of utils/pdf_renderer.py safely
 try:
-    from pypdf import PdfMerger, PdfReader
-except Exception as exc:
-    pass
-
+    from pypdf import PdfReader, PdfWriter, PdfMerger
+except Exception:
+    PdfMerger = None  # Fallback flag if your pypdf version lacks it
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except Exception:
+        pass
+        
 try:
     from config import cfg  # type: ignore
 except Exception:
