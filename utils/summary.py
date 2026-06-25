@@ -20,28 +20,20 @@ import os
 import sys
 import tempfile
 import textwrap
-import zlib
 from pathlib import Path
 from typing import Any
+
 import matplotlib
 import mplcairo  # noqa: F401
 
 matplotlib.use("module://mplcairo.base", force=True)
 
-import logging
-logging.getLogger(__name__).info(
-    "Matplotlib backend: %s",
-    matplotlib.get_backend()
-)
-# FORCE Matplotlib to pass literal strings to Cairo without internal parsing
-if "text.parse_math" in matplotlib.rcParams:
-    matplotlib.rcParams["text.parse_math"] = False
-    
-#matplotlib.rcParams["pgf.rcpresets"] = False
-if "pgf.rcpresets" in matplotlib.rcParams:
-    matplotlib.rcParams["pgf.rcpresets"] = False
-print("pgf.rcpresets" in matplotlib.rcParams)
-print("text.parse_math" in matplotlib.rcParams)
+try:
+    if "text.parse_math" in matplotlib.rcParams:
+        matplotlib.rcParams["text.parse_math"] = False
+except Exception:
+    pass
+
 matplotlib.rcParams["pdf.fonttype"] = 42
 matplotlib.rcParams["ps.fonttype"] = 42
 
@@ -63,6 +55,8 @@ if not log.handlers:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     log.addHandler(handler)
+
+log.info("Matplotlib backend: %s", matplotlib.get_backend())
 
 PALETTE = {
     "bg": "#f5f2eb",
@@ -109,6 +103,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 UTILS_DIR = PROJECT_ROOT / "utils"
 
 _DEVA_FONT_FAMILY: str | None = None
+_DEVA_FONT: fm.FontProperties | None = None
 _FONT_KWARGS: dict[str, Any] = {}
 _OUTPUT_DPI = int(getattr(cfg, "OUTPUT_DPI", 300) or 300) if cfg is not None else 300
 
@@ -126,8 +121,9 @@ def _iter_font_files(base: Path) -> list[Path]:
 
 def _find_devanagari_font() -> Path | None:
     preferred_names = (
-        "Devanagari-Regular",
-        "devanagari-black",
+        "devanagari-regular",
+        "devanagari-regular.ttf",
+        "devanagari-regular.otf",
         "nirmala",
         "mangal",
         "noto sans devanagari",
@@ -171,7 +167,7 @@ def _find_devanagari_font() -> Path | None:
 
 
 def _configure_fonts() -> str | None:
-    global _DEVA_FONT_FAMILY, _FONT_KWARGS
+    global _DEVA_FONT_FAMILY, _DEVA_FONT, _FONT_KWARGS
 
     default_sans = ["DejaVu Sans", "Arial", "sans-serif"]
     font_path = _find_devanagari_font()
@@ -179,19 +175,25 @@ def _configure_fonts() -> str | None:
     if font_path is not None:
         try:
             fm.fontManager.addfont(str(font_path))
-            family_name = fm.FontProperties(fname=str(font_path)).get_name()
+            _DEVA_FONT = fm.FontProperties(fname=str(font_path))
+            family_name = _DEVA_FONT.get_name()
             _DEVA_FONT_FAMILY = family_name
+
             plt.rcParams["font.family"] = "sans-serif"
             plt.rcParams["font.sans-serif"] = [family_name] + default_sans
             plt.rcParams["axes.unicode_minus"] = False
             plt.rcParams["pdf.fonttype"] = 42
             plt.rcParams["ps.fonttype"] = 42
-            _FONT_KWARGS = {"fontfamily": family_name}
+
+            _FONT_KWARGS = {"fontproperties": _DEVA_FONT}
+
             log.info("Hindi font configured: %s (%s)", family_name, font_path.name)
+            log.info("Matplotlib resolved font: %s", fm.findfont(_DEVA_FONT))
             return family_name
         except Exception as exc:
             log.warning("Failed to load Hindi font %s: %s", font_path, exc)
 
+    _DEVA_FONT = None
     plt.rcParams["font.family"] = "sans-serif"
     plt.rcParams["font.sans-serif"] = default_sans
     plt.rcParams["axes.unicode_minus"] = False
@@ -418,6 +420,7 @@ def build_summary_figure(results: dict[str, Any], filename: str) -> Figure:
         fontsize=16,
         fontweight="bold",
         color=PALETTE["text_dark"],
+        **_FONT_KWARGS,
     )
     fig.text(
         0.50,
@@ -428,6 +431,7 @@ def build_summary_figure(results: dict[str, Any], filename: str) -> Figure:
         fontsize=9,
         color=PALETTE["text_mid"],
         style="italic",
+        **_FONT_KWARGS,
     )
     fig.add_artist(
         Line2D(
@@ -499,6 +503,7 @@ def build_keyfacts_figure(results: dict[str, Any], filename: str) -> Figure:
         fontsize=16,
         fontweight="bold",
         color=PALETTE["text_dark"],
+        **_FONT_KWARGS,
     )
     fig.text(
         0.50,
@@ -509,6 +514,7 @@ def build_keyfacts_figure(results: dict[str, Any], filename: str) -> Figure:
         fontsize=9,
         color=PALETTE["text_mid"],
         style="italic",
+        **_FONT_KWARGS,
     )
     fig.add_artist(
         Line2D(
@@ -565,6 +571,7 @@ def build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
         fontsize=28,
         fontweight="bold",
         color=PALETTE["thank_text"],
+        **_FONT_KWARGS,
     )
     fig.text(
         0.50,
@@ -575,6 +582,7 @@ def build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
         fontsize=18,
         fontweight="bold",
         color=PALETTE["thank_text"],
+        **_FONT_KWARGS,
     )
     fig.text(
         0.50,
@@ -584,6 +592,7 @@ def build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
         va="center",
         fontsize=15,
         color=PALETTE["thank_text"],
+        **_FONT_KWARGS,
     )
     fig.text(
         0.50,
@@ -624,6 +633,7 @@ def build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
         va="center",
         fontsize=8.5,
         color=PALETTE["text_mid"],
+        **_FONT_KWARGS,
     )
     return fig
 
@@ -711,4 +721,5 @@ def _draw_page_footer(fig: Figure, page_index: int, total_pages: int) -> None:
         va="bottom",
         fontsize=8,
         color=PALETTE["text_mid"],
+        **_FONT_KWARGS,
     )
