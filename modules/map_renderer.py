@@ -938,7 +938,16 @@ def _draw_legend(ax, results: dict, mode: str) -> None:
                         linewidth=0.5,
                     )
                 )
-                ax.text(0.20, y, f"{label} ({pct:.1f}%)", fontsize=7, color=PALETTE["text_dark"], transform=ax.transAxes, va="center")
+                display_text = _friendly_fcm_label(label, lang="en").upper()  # .upper() makes it match the all-caps look
+                ax.text(
+                    0.20, 
+                    y, 
+                    f"{display_text} ({pct:.1f}%)", 
+                    fontsize=7, 
+                    color=PALETTE["text_dark"], 
+                    transform=ax.transAxes, 
+                    va="center"
+                )
                 y -= dy
                 used.add(label)
 
@@ -957,8 +966,19 @@ def _draw_legend(ax, results: dict, mode: str) -> None:
                         linewidth=0.5,
                     )
                 )
-                ax.text(0.20, y, f"{label} ({pct:.1f}%)", fontsize=7, color=PALETTE["text_dark"], transform=ax.transAxes, va="center")
+                display_text = _friendly_fcm_label(label, lang="en").upper()  # .upper() makes it match the all-caps look
+                
+                ax.text(
+                    0.20, 
+                    y, 
+                    f"{display_text} ({pct:.1f}%)", 
+                    fontsize=7, 
+                    color=PALETTE["text_dark"], 
+                    transform=ax.transAxes, 
+                    va="center"
+                )
                 y -= dy
+                #used.add(label)
 
         y -= dy * 0.2
         ax.plot([0.05, 0.15], [y, y], color=PALETTE["poly_edge"], linewidth=2, transform=ax.transAxes)
