@@ -477,6 +477,80 @@ def build_summary_figure(results: dict[str, Any], filename: str) -> Figure:
     )
     return fig
 
+def build_keyfacts_figure(
+    font_path: str | None = None,
+    lines: Sequence[str] | None = None,
+    title: str = "TEXT SHAPING TEST",
+) -> Figure:
+    fp = _make_font_properties(font_path)
+    fig = plt.figure(figsize=(16, 12))
+    fig.patch.set_facecolor(PALETTE["bg"])
+    fig.add_artist(
+        Rectangle(
+            (0.01, 0.01),
+            0.98,
+            0.98,
+            transform=fig.transFigure,
+            linewidth=3,
+            edgecolor=PALETTE["border"],
+            facecolor="none",
+            zorder=10,
+        )
+    )
+
+    fig.text(
+        0.50,
+        0.955,
+        title,
+        ha="center",
+        va="center",
+        fontsize=18,
+        fontweight="bold",
+        color=PALETTE["text_dark"],
+        fontproperties=fp,
+    )
+    fig.text(
+        0.50,
+        0.935,
+        f"Backend: {matplotlib.get_backend()}  |  Font: {fp.get_name()}",
+        ha="center",
+        va="center",
+        fontsize=9,
+        color=PALETTE["text_mid"],
+        style="italic",
+        fontproperties=fp,
+    )
+    fig.add_artist(
+        Rectangle(
+            (0.04, 0.925),
+            0.92,
+            0.0016,
+            transform=fig.transFigure,
+            linewidth=0,
+            facecolor=PALETTE["border"],
+        )
+    )
+
+    ax = fig.add_axes([0.04, 0.08, 0.92, 0.80])
+    ax.set_axis_off()
+
+    _draw_text_panel(
+        ax,
+        0.03,
+        0.03,
+        0.94,
+        0.90,
+        "Key Facts / मुख्य तथ्य",
+        content["keyfacts_lines"],
+        box_face="#ffffff",
+        title_color=PALETTE["accent"],
+        text_color=PALETTE["text_dark"],
+        font_size=10.2,
+        line_gap=1.24,
+    )
+    return fig
+
+"""
 
 def build_keyfacts_figure(results: dict[str, Any], filename: str) -> Figure:
     content = prepare_report_content(results)
@@ -544,7 +618,7 @@ def build_keyfacts_figure(results: dict[str, Any], filename: str) -> Figure:
         line_gap=1.24,
     )
     return fig
-
+"""
 
 def build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
     fig = plt.figure(figsize=(16, 12))
