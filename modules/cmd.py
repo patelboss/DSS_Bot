@@ -687,3 +687,25 @@ async def testtext_handler(client, message: Message):
     out = render_texttest_pdf()
     out.name = "texttest.pdf"
     await message.reply_document(document=out, caption="Text shaping test PDF")
+
+
+
+from utils.dev_render import render_fake_report
+
+
+@Client.on_message(filters.command("testrender") & filters.user(ADMIN_IDS))
+async def testrender_handler(client, message: Message):
+    mode = "bundle"
+    if len(message.command) > 1:
+        mode = message.command[1].strip().lower()
+
+    if mode not in {"bundle", "fcm", "ftm", "dem"}:
+        mode = "bundle"
+
+    buf = render_fake_report(filename=f"testrender_{message.from_user.id}", map_mode=mode)
+    buf.name = f"testrender_{mode}.pdf"
+
+    await message.reply_document(
+        document=buf,
+        caption=f"Fake render test: {mode}",
+    )
