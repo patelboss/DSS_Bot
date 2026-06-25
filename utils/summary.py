@@ -24,9 +24,13 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib
-import mplcairo  # noqa: F401
 
-matplotlib.use("module://mplcairo.base", force=True)
+# Use the same backend fallback mechanism as testtext.py
+try:
+    import mplcairo  # noqa: F401
+    matplotlib.use("module://mplcairo.base", force=True)
+except Exception:
+    matplotlib.use("Agg", force=True)
 
 try:
     if "text.parse_math" in matplotlib.rcParams:
@@ -34,8 +38,10 @@ try:
 except Exception:
     pass
 
+# Set global rcParams that do NOT interfere with text shaping
 matplotlib.rcParams["pdf.fonttype"] = 42
 matplotlib.rcParams["ps.fonttype"] = 42
+matplotlib.rcParams["axes.unicode_minus"] = False
 
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
@@ -102,109 +108,76 @@ FCM_ALIASES = {
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 UTILS_DIR = PROJECT_ROOT / "utils"
 
-_DEVA_FONT_FAMILY: str | None = None
-_DEVA_FONT: fm.FontProperties | None = None
-_FONT_KWARGS: dict[str, Any] = {}
 _OUTPUT_DPI = int(getattr(cfg, "OUTPUT_DPI", 300) or 300) if cfg is not None else 300
 
+# Adopted FONT_CANDIDATES from testtext.py
+FONT_CANDIDATES: tuple[str, ...] = (
+    "/app/utils/fonts/Devanagari-Regular.ttf",
+    "/app/utils/fonts/mangal.ttf",
+    "/app/utils/fonts/NotoSansDevanagari-Regular.ttf",
+    "/app/fonts/NotoSansDevanagari-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+    "/usr/share/fonts/truetype/msttcorefonts/Mangal.ttf",
+    "/usr/local/share/fonts/NotoSansDevanagari-Regular.ttf",
+    "C:/Windows/Fonts/Nirmala.ttf",
+    "C:/Windows/Fonts/mangal.ttf",
+)
 
-def _iter_font_files(base: Path) -> list[Path]:
-    if not base.exists():
-        return []
-    if base.is_file():
-        return [base] if base.suffix.lower() in {".ttf", ".otf", ".ttc", ".TTF", ".OTF", ".TTC"} else []
-    out: list[Path] = []
-    for pattern in ("*.ttf", "*.otf", "*.ttc", "*.TTF", "*.OTF", "*.TTC"):
-        out.extend(base.rglob(pattern))
-    return out
+_DEVA_FONT: fm.FontProperties | None = None
+_FONT_KWARGS: dict[str, Any] = {}
 
 
-def _find_devanagari_font() -> Path | None:
-    preferred_names = (
-        "devanagari-regular",
-        "devanagari-regular.ttf",
-        "devanagari-regular.otf",
-        "nirmala",
-        "mangal",
-        "noto sans devanagari",
-        "notosansdevanagari",
-        "noto_sans_devanagari",
-        "devanagari",
-        "lohit-devanagari",
-        "samyak-devanagari",
-        "gargi",
-        "mukta",
-    )
+def _safe_font_path() -> Path | None:
+    for candidate in FONT_CANDIDATES:
+        p = Path(candidate)
+        if p.exists():
+            return p
 
     search_dirs = [
         UTILS_DIR,
         UTILS_DIR / "fonts",
         PROJECT_ROOT / "fonts",
         Path("/app/fonts"),
-        Path("/usr/share/fonts/truetype/noto"),
-        Path("/usr/share/fonts/truetype/lohit-devanagari"),
-        Path("/usr/share/fonts/truetype/samyak-fonts"),
-        Path("/usr/share/fonts/truetype/gargi"),
-        Path("/usr/share/fonts/truetype/msttcorefonts"),
         Path("/usr/local/share/fonts"),
-        Path("/Library/Fonts"),
-        Path("C:/Windows/Fonts"),
+        Path("/usr/share/fonts/truetype/noto"),
+        Path("/usr/share/fonts/truetype/msttcorefonts"),
     ]
-
-    candidates: list[Path] = []
     for base in search_dirs:
-        candidates.extend(_iter_font_files(base))
-
-    if not candidates:
-        return None
-
-    def score(path: Path) -> tuple[int, str]:
-        name = path.name.lower()
-        return (0 if any(token in name for token in preferred_names) else 1, name)
-
-    unique_sorted = sorted(set(candidates), key=score)
-    return unique_sorted[0] if unique_sorted else None
+        if not base.exists():
+            continue
+        for suffix in ("*.ttf", "*.otf", "*.ttc", "*.TTF", "*.OTF", "*.TTC"):
+            found = sorted(base.rglob(suffix))
+            if found:
+                return found
+    return None
 
 
-def _configure_fonts() -> str | None:
-    global _DEVA_FONT_FAMILY, _DEVA_FONT, _FONT_KWARGS
+def _configure_fonts() -> None:
+    global _DEVA_FONT, _FONT_KWARGS
 
-    default_sans = ["DejaVu Sans", "Arial", "sans-serif"]
-    font_path = _find_devanagari_font()
+    font_path = _safe_font_path()
 
     if font_path is not None:
         try:
             fm.fontManager.addfont(str(font_path))
             _DEVA_FONT = fm.FontProperties(fname=str(font_path))
-            family_name = _DEVA_FONT.get_name()
-            _DEVA_FONT_FAMILY = family_name
-
-            plt.rcParams["font.family"] = "sans-serif"
-            plt.rcParams["font.sans-serif"] = [family_name] + default_sans
-            plt.rcParams["axes.unicode_minus"] = False
-            plt.rcParams["pdf.fonttype"] = 42
-            plt.rcParams["ps.fonttype"] = 42
-
+            # CRITICAL FIX: Do not set plt.rcParams["font.sans-serif"] here.
+            # Only rely on explicit kwargs for accurate shaping via mplcairo.
             _FONT_KWARGS = {"fontproperties": _DEVA_FONT}
 
-            log.info("Hindi font configured: %s (%s)", family_name, font_path.name)
+            log.info("Hindi font configured: %s", font_path)
             log.info("Matplotlib resolved font: %s", fm.findfont(_DEVA_FONT))
-            return family_name
+            return
         except Exception as exc:
             log.warning("Failed to load Hindi font %s: %s", font_path, exc)
 
-    _DEVA_FONT = None
-    plt.rcParams["font.family"] = "sans-serif"
-    plt.rcParams["font.sans-serif"] = default_sans
-    plt.rcParams["axes.unicode_minus"] = False
-    plt.rcParams["pdf.fonttype"] = 42
-    plt.rcParams["ps.fonttype"] = 42
-    _FONT_KWARGS = {}
     log.warning("No Devanagari font found; falling back to DejaVu Sans.")
-    return None
+    _DEVA_FONT = fm.FontProperties(family="DejaVu Sans")
+    _FONT_KWARGS = {"fontproperties": _DEVA_FONT}
 
 
-_DEVA_FONT_FAMILY = _configure_fonts()
+# Initialize fonts globally upon import
+_configure_fonts()
 
 
 def PathSafe(name: str) -> str:
@@ -240,7 +213,7 @@ def _auto_sort_fcm_classes(fcm_classes: dict[str, dict[str, Any]]) -> list[tuple
     for label, metrics in (fcm_classes or {}).items():
         pct = _safe_float((metrics or {}).get("percentage", 0.0), 0.0) or 0.0
         items.append((_normalize_fcm_label(label), pct))
-    items.sort(key=lambda x: x[1], reverse=True)
+    items.sort(key=lambda x: x, reverse=True)
     return items
 
 
@@ -259,7 +232,7 @@ def prepare_report_content(results: dict[str, Any]) -> dict[str, Any]:
 
     dominant_raw = _normalize_fcm_label(fcm.get("dominant", ""))
     if dominant_raw not in normalized_classes and normalized_classes:
-        dominant_raw = max(normalized_classes.items(), key=lambda kv: kv[1]["percentage"])[0]
+        dominant_raw = max(normalized_classes.items(), key=lambda kv: kv["percentage"])
 
     dominant_en = _friendly_fcm_label(dominant_raw, "en")
     dominant_hi = _friendly_fcm_label(dominant_raw, "hi")
@@ -477,80 +450,6 @@ def build_summary_figure(results: dict[str, Any], filename: str) -> Figure:
     )
     return fig
 
-def build_keyfacts_figure(
-    font_path: str | None = None,
-    lines: Sequence[str] | None = None,
-    title: str = "TEXT SHAPING TEST",
-) -> Figure:
-    fp = _make_font_properties(font_path)
-    fig = plt.figure(figsize=(16, 12))
-    fig.patch.set_facecolor(PALETTE["bg"])
-    fig.add_artist(
-        Rectangle(
-            (0.01, 0.01),
-            0.98,
-            0.98,
-            transform=fig.transFigure,
-            linewidth=3,
-            edgecolor=PALETTE["border"],
-            facecolor="none",
-            zorder=10,
-        )
-    )
-
-    fig.text(
-        0.50,
-        0.955,
-        title,
-        ha="center",
-        va="center",
-        fontsize=18,
-        fontweight="bold",
-        color=PALETTE["text_dark"],
-        fontproperties=fp,
-    )
-    fig.text(
-        0.50,
-        0.935,
-        f"Backend: {matplotlib.get_backend()}  |  Font: {fp.get_name()}",
-        ha="center",
-        va="center",
-        fontsize=9,
-        color=PALETTE["text_mid"],
-        style="italic",
-        fontproperties=fp,
-    )
-    fig.add_artist(
-        Rectangle(
-            (0.04, 0.925),
-            0.92,
-            0.0016,
-            transform=fig.transFigure,
-            linewidth=0,
-            facecolor=PALETTE["border"],
-        )
-    )
-
-    ax = fig.add_axes([0.04, 0.08, 0.92, 0.80])
-    ax.set_axis_off()
-
-    _draw_text_panel(
-        ax,
-        0.03,
-        0.03,
-        0.94,
-        0.90,
-        "Key Facts / मुख्य तथ्य",
-        content["keyfacts_lines"],
-        box_face="#ffffff",
-        title_color=PALETTE["accent"],
-        text_color=PALETTE["text_dark"],
-        font_size=10.2,
-        line_gap=1.24,
-    )
-    return fig
-
-"""
 
 def build_keyfacts_figure(results: dict[str, Any], filename: str) -> Figure:
     content = prepare_report_content(results)
@@ -618,7 +517,7 @@ def build_keyfacts_figure(results: dict[str, Any], filename: str) -> Figure:
         line_gap=1.24,
     )
     return fig
-"""
+
 
 def build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
     fig = plt.figure(figsize=(16, 12))
@@ -710,7 +609,7 @@ def build_thankyou_figure(results: dict[str, Any], filename: str) -> Figure:
         **_FONT_KWARGS,
     )
     return fig
-"""
+
 
 def _draw_text_panel(
     ax,
@@ -784,86 +683,7 @@ def _draw_text_panel(
         cursor_y -= 0.006
         if cursor_y < y + 0.02:
             break
-"""
 
-def _draw_text_panel(
-    ax,
-    x: float,
-    y: float,
-    w: float,
-    h: float,
-    title: str,
-    body_text: str | list[str],
-    *,
-    box_face: str,
-    title_color: str,
-    text_color: str,
-    font_size: float,
-    line_gap: float = 1.20,
-    fontproperties: fm.FontProperties | None = None,
-) -> None:
-    ax.add_patch(
-        FancyBboxPatch(
-            (x, y),
-            w,
-            h,
-            boxstyle="round,pad=0.012,rounding_size=0.02",
-            transform=ax.transAxes,
-            facecolor=box_face,
-            edgecolor=PALETTE["border"],
-            linewidth=1.0,
-        )
-    )
-
-    text_kwargs: dict[str, Any] = {}
-    if fontproperties is not None:
-        text_kwargs["fontproperties"] = fontproperties
-
-    ax.text(
-        x + 0.02,
-        y + h - 0.04,
-        title,
-        transform=ax.transAxes,
-        fontsize=11,
-        fontweight="bold",
-        color=title_color,
-        va="top",
-        **text_kwargs,
-    )
-
-    raw_lines = body_text.splitlines() if isinstance(body_text, str) else [str(item) for item in body_text]
-    cursor_y = y + h - 0.09
-    max_width = 92 if w >= 0.9 else 72
-
-    for raw_line in raw_lines:
-        if raw_line.strip() == "":
-            cursor_y -= 0.02
-            continue
-
-        wrapped = textwrap.wrap(
-            raw_line,
-            width=max_width,
-            break_long_words=False,
-            break_on_hyphens=False,
-        ) or [""]
-
-        for wrapped_line in wrapped:
-            ax.text(
-                x + 0.02,
-                cursor_y,
-                wrapped_line,
-                transform=ax.transAxes,
-                fontsize=font_size,
-                color=text_color,
-                va="top",
-                ha="left",
-                **text_kwargs,
-            )
-            cursor_y -= 0.032 * line_gap
-
-        cursor_y -= 0.006
-        if cursor_y < y + 0.02:
-            break
 
 def _draw_page_footer(fig: Figure, page_index: int, total_pages: int) -> None:
     fig.text(
