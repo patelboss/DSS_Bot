@@ -18,16 +18,16 @@ import tempfile
 import zlib
 from pathlib import Path
 from typing import Any, Iterable
-
 import matplotlib
+import mplcairo  # noqa: F401
 
-try:
-    import mplcairo  # noqa: F401
+matplotlib.use("module://mplcairo.base", force=True)
 
-    matplotlib.use("module://mplcairo.base")
-except Exception:
-    matplotlib.use("Agg")
-
+import logging
+logging.getLogger(__name__).info(
+    "Matplotlib backend: %s",
+    matplotlib.get_backend()
+)
 # FORCE Matplotlib to pass literal strings to Cairo without internal parsing
 if "text.parse_math" in matplotlib.rcParams:
     matplotlib.rcParams["text.parse_math"] = False
