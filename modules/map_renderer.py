@@ -241,7 +241,7 @@ def _friendly_fcm_label(raw_label: str | None, lang: str = "en") -> str:
     key = _normalize_fcm_label(raw_label)
     en, hi = FCM_LABELS.get(key, (key or "No Data", "डेटा अनुपलब्ध"))
     return en if lang == "en" else hi
-
+"""
 
 def _match_fcm_color(class_attr: str) -> str:
     s = str(class_attr or "").strip().upper()
@@ -257,8 +257,35 @@ def _match_fcm_color(class_attr: str) -> str:
         return PALETTE["scrub"]
     if "WATER" in s:
         return PALETTE["water"]
+
     return PALETTE["fallback"]
 
+"""
+def _match_fcm_color(class_attr: str) -> str:
+    # Coerce to string to safely process missing or None attributes
+    s = str(class_attr or "").strip().upper()
+    
+    if "VERY DENSE" in s or s == "VDF":
+        return PALETTE["vdf"]
+    if "MODERATELY DENSE" in s or s == "MDF":
+        return PALETTE["mdf"]
+    if "OPEN" in s:
+        return PALETTE["open"]
+#    if "NON FOREST" in s or "NON-FOREST" in s:
+#        return PALETTE["nonforest"]
+    if "SCRUB" in s:
+        return PALETTE["scrub"]
+    if "WATER" in s:
+        return PALETTE["water"]
+
+    # If the attribute string itself explicitly specifies no data
+    if "NO DATA" in s or "NO-DATA" in s or "NODATA" in s:
+        return PALETTE.get("nodata", PALETTE["fallback"])
+
+    # Fallback default: when there is no matching class attribute string, 
+    # it treats it as an unmapped space/missing data tile
+    return PALETTE.get("nodata", PALETTE["fallback"])
+    
 
 def _stable_color_for_label(label: str) -> str:
     idx = zlib.crc32(str(label).encode("utf-8")) % len(FTM_FALLBACK_PALETTE)
@@ -433,7 +460,7 @@ def _build_thematic_figure(mode: str, geojson_feature: dict, results: dict, file
     fig.text(
         0.50,
         0.935,
-        f"MP Forest Department  |  File: {filename}",
+        f"Developed by Pankaj Patidar for use in MP Forest Department  |  File: {filename}",
         ha="center",
         va="center",
         fontsize=9,
@@ -878,7 +905,7 @@ def _draw_legend(ax, results: dict, mode: str) -> None:
         if not normalized:
             ax.text(0.05, y, "No class summary available", fontsize=7, color=PALETTE["text_mid"], transform=ax.transAxes, va="top")
         else:
-            order = ["VDF", "MDF", "OPEN FOREST", "NON FOREST", "SCRUB", "WATER", "NO-DATA"]
+            order = ["VDF", "MDF", "OPEN FOREST", "SCRUB", "WATER", "NON FOREST", "NO-DATA"]
             used = set()
 
             for label in order:
