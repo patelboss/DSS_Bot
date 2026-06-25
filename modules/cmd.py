@@ -693,7 +693,7 @@ async def testtext_handler(client, message: Message):
 from utils.dev_render import render_fake_report
 
 
-@Client.on_message(filters.command("testrender") & filters.user(ADMIN_IDS))
+@Client.on_message(filters.command("testrender"))
 async def testrender_handler(client, message: Message):
     mode = "bundle"
     if len(message.command) > 1:
