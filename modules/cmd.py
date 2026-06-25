@@ -84,45 +84,81 @@ def _build_bilingual_summary(
     ftm_area_ha: Optional[float] = None,
     has_raster_dem: bool = False,
 ) -> tuple[str, str, list[str], list[str]]:
-    dominant_pct = float(fcm_class_summary.get(dominant_cover_type, {}).get("percentage", 0.0) or 0.0)
-    classes_text = ", ".join(fcm_class_summary.keys()) if fcm_class_summary else "No FCM data available"
-    classes_hi = ", ".join(_class_hi(k) for k in fcm_class_summary.keys()) if fcm_class_summary else "एफसीएम डेटा उपलब्ध नहीं है"
+    # 1. Check if we actually have any valid FCM metrics data collected
+    if not fcm_class_summary:
+        classes_text = "No FCM data available"
+        classes_hi = "एफसीएम डेटा उपलब्ध नहीं है"
+        
+        summary_en = (
+            f"The analysed area covers {area_ha:.2f} hectares. Forest Cover Mapping data was not available for this region. "
+            f"{'Forest Type Mapping data was not available.' if ftm_area_ha is None else f'Forest Type Mapping area is {ftm_area_ha:.2f} hectares.'} "
+            f"Terrain analysis could not be completed because elevation data was not available."
+        )
+        summary_hi = (
+            f"विश्लेषित क्षेत्र {area_ha:.2f} हेक्टेयर है। इस क्षेत्र के लिए वन आच्छादन मानचित्रण डेटा उपलब्ध नहीं है। "
+            f"{'वन प्रकार मानचित्रण डेटा उपलब्ध नहीं है।' if ftm_area_ha is None else f'वन प्रकार मानचित्रण का क्षेत्रफल {ftm_area_ha:.2f} हेक्टेयर है।'0} "
+            f"ऊँचाई डेटा उपलब्ध न होने के कारण भू-आकृतिक विश्लेषण पूरा नहीं हो सका।"
+        )
+        
+        key_facts_en = [
+            f"Total Area: {area_ha:.2f} ha",
+            f"Dominant Forest Class: No Data Available",
+            f"Forest Cover Type: {classes_text}",
+        ]
+        key_facts_hi = [
+            f"कुल क्षेत्रफल: {area_ha:.2f} हेक्टेयर",
+            f"प्रमुख वन वर्ग: डेटा अनुपलब्ध",
+            f"वन आच्छादन वर्ग: {classes_hi}",
+        ]
+    else:
+        # Extract percentage safely using the unified tracker keys
+        dominant_pct = float(fcm_class_summary.get(dominant_cover_type, {}).get("percentage", 0.0) or 0.0)
+        classes_text = ", ".join(k if k != "NO-DATA" else "Non Forest" for k in fcm_class_summary.keys())
+        classes_hi = ", ".join(_class_hi(k) for k in fcm_class_summary.keys())
 
+        friendly_dominant_en = "Non Forest" if dominant_cover_type == "NO-DATA" else dominant_cover_type
+        friendly_dominant_hi = _class_hi(dominant_cover_type)
+
+        dem_min = dem_metrics.get("elevation_min_m")
+        dem_max = dem_metrics.get("elevation_max_m")
+        dem_mean = dem_metrics.get("elevation_mean_m")
+
+        if dem_min is not None and dem_max is not None and dem_mean is not None:
+            dem_sentence_en = (
+                f"Terrain analysis derived from {'raster DEM' if has_raster_dem else 'DEM data'} shows an elevation range of {dem_min}–{dem_max} metres above mean sea level, with a mean elevation of {dem_mean} metres."
+            )
+            dem_sentence_hi = (
+                f"{ 'रास्टर DEM' if has_raster_dem else 'DEM डेटा' } पर आधारित भू-आकृतिक विश्लेषण में समुद्र तल से ऊँचाई {dem_min}–{dem_max} मीटर के बीच पाई गई है, तथा औसत ऊँचाई {dem_mean} मीटर है।"
+            )
+        else:
+            dem_sentence_en = "Terrain analysis could not be completed because elevation data was not available."
+            dem_sentence_hi = "ऊँचाई डेटा उपलब्ध न होने के कारण भू-आकृतिक विश्लेषण पूरा नहीं हो सका।"
+
+        ftm_text_en = f"Forest Type Mapping area is {ftm_area_ha:.2f} hectares." if ftm_area_ha is not None else "Forest Type Mapping data was not available."
+        ftm_text_hi = f"वन प्रकार मानचित्रण का क्षेत्रफल {ftm_area_ha:.2f} हेक्टेयर है।" if ftm_area_ha is not None else "वन प्रकार मानचित्रण डेटा उपलब्ध नहीं है।"
+
+        summary_en = (
+            f"The analysed area covers {area_ha:.2f} hectares. Forest Cover Mapping indicates that {friendly_dominant_en} is the dominant class, accounting for {dominant_pct:.1f}% of the area. {ftm_text_en} {dem_sentence_en} The area contains the forest cover classes: {classes_text}."
+        )
+        summary_hi = (
+            f"विश्लेषित क्षेत्र {area_ha:.2f} हेक्टेयर है। वन आच्छादन मानचित्रण के अनुसार { friendly_dominant_hi } प्रमुख वर्ग है, जो कुल क्षेत्र का {dominant_pct:.1f}% भाग घेरता है। {ftm_text_hi} {dem_sentence_hi} उपलब्ध वन आच्छादन वर्ग: {classes_hi}।"
+        )
+
+        key_facts_en = [
+            f"Total Area: {area_ha:.2f} ha",
+            f"Dominant Forest Class: {friendly_dominant_en} ({dominant_pct:.1f}%)",
+            f"Forest Cover Type: {classes_text}",
+        ]
+        key_facts_hi = [
+            f"कुल क्षेत्रफल: {area_ha:.2f} हेक्टेयर",
+            f"प्रमुख वन वर्ग: { friendly_dominant_hi } ({dominant_pct:.1f}%)",
+            f"वन आच्छादन वर्ग: {classes_hi}",
+        ]
+
+    # Append topographic descriptors safely if they exist
     dem_min = dem_metrics.get("elevation_min_m")
     dem_max = dem_metrics.get("elevation_max_m")
     dem_mean = dem_metrics.get("elevation_mean_m")
-
-    if dem_min is not None and dem_max is not None and dem_mean is not None:
-        dem_sentence_en = (
-            f"Terrain analysis derived from {'raster DEM' if has_raster_dem else 'DEM data'} shows an elevation range of {dem_min}–{dem_max} metres above mean sea level, with a mean elevation of {dem_mean} metres."
-        )
-        dem_sentence_hi = (
-            f"{ 'रास्टर DEM' if has_raster_dem else 'DEM डेटा' } पर आधारित भू-आकृतिक विश्लेषण में समुद्र तल से ऊँचाई {dem_min}–{dem_max} मीटर के बीच पाई गई है, तथा औसत ऊँचाई {dem_mean} मीटर है।"
-        )
-    else:
-        dem_sentence_en = "Terrain analysis could not be completed because elevation data was not available."
-        dem_sentence_hi = "ऊँचाई डेटा उपलब्ध न होने के कारण भू-आकृतिक विश्लेषण पूरा नहीं हो सका।"
-
-    ftm_text_en = f"Forest Type Mapping area is {ftm_area_ha:.2f} hectares." if ftm_area_ha is not None else "Forest Type Mapping data was not available."
-    ftm_text_hi = f"वन प्रकार मानचित्रण का क्षेत्रफल {ftm_area_ha:.2f} हेक्टेयर है।" if ftm_area_ha is not None else "वन प्रकार मानचित्रण डेटा उपलब्ध नहीं है।"
-
-    summary_en = (
-        f"The analysed area covers {area_ha:.2f} hectares. Forest Cover Mapping indicates that {dominant_cover_type} is the dominant class, accounting for {dominant_pct:.1f}% of the area. {ftm_text_en} {dem_sentence_en} The area contains the forest cover classes: {classes_text}."
-    )
-    summary_hi = (
-        f"विश्लेषित क्षेत्र {area_ha:.2f} हेक्टेयर है। वन आच्छादन मानचित्रण के अनुसार { _class_hi(dominant_cover_type) } प्रमुख वर्ग है, जो कुल क्षेत्र का {dominant_pct:.1f}% भाग घेरता है। {ftm_text_hi} {dem_sentence_hi} उपलब्ध वन आच्छादन वर्ग: {classes_hi}।"
-    )
-
-    key_facts_en = [
-        f"Total Area: {area_ha:.2f} ha",
-        f"Dominant Forest Class: {dominant_cover_type}",
-        f"Forest Cover Type: {classes_text}",
-    ]
-    key_facts_hi = [
-        f"कुल क्षेत्रफल: {area_ha:.2f} हेक्टेयर",
-        f"प्रमुख वन वर्ग: { _class_hi(dominant_cover_type) }",
-        f"वन आच्छादन वर्ग: {classes_hi}",
-    ]
     if dem_min is not None and dem_max is not None and dem_mean is not None:
         key_facts_en.extend([
             f"Elevation Range: {dem_min}–{dem_max} m",
@@ -143,7 +179,7 @@ def _summarize_raster_dem(paths: list[str], study_geom) -> tuple[dict, list[str]
         try:
             with rasterio.open(path) as src:
                 arr, _ = rio_mask(src, [study_geom.__geo_interface__], crop=True, filled=True, nodata=src.nodata)
-                data = np.array(arr[0], dtype="float64")
+                data = np.array(arr, dtype="float64")
                 if src.nodata is not None:
                     data[data == src.nodata] = np.nan
                 else:
@@ -388,7 +424,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                 single_feature = {
                     "type": "Feature",
                     "properties": {"polygon_id": polygon_number, "source_file": filename},
-                    "geometry": mapping(_align_gdf_crs(single_gdf.copy(), "EPSG:4326").geometry.iloc[0]),
+                    "geometry": mapping(_align_gdf_crs(single_gdf.copy(), "EPSG:4326").geometry.iloc),
                 }
 
                 await status_msg.edit_text(f"📍 *Processing polygon `{polygon_number}/{polygon_total}`…*", parse_mode=ParseMode.MARKDOWN)
@@ -459,7 +495,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                 )
 
                 fcm_class_summary: dict = {}
-                dominant_cover_type = "NON FOREST"
+                dominant_cover_type = "NO-DATA"
                 passed_fcm_list: list[gpd.GeoDataFrame] = []
                 passed_ftm_list: list[gpd.GeoDataFrame] = []
                 passed_dem_list: list[gpd.GeoDataFrame] = []
@@ -467,77 +503,83 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                 dem_metrics: dict = {}
                 ftm_area_ha: Optional[float] = None
 
-                # FCM
+                # FCM — LIGHTWEIGHT WORKFLOW (Deduces Non-Forest mathematically by subtraction)
                 if fcm_intersected_gdfs:
                     fcm_compiled = pd.concat(fcm_intersected_gdfs, ignore_index=True)
                     logger.info("FCM Columns = %s", fcm_compiled.columns.tolist())
-                    logger.info("FCM Sample = %s", fcm_compiled.head(3).to_dict("records"))
                     fcm_compiled["geometry"] = fcm_compiled.geometry.intersection(user_geom)
                     fcm_compiled = fcm_compiled[~fcm_compiled.geometry.is_empty].copy()
-                    fcm_utm = fcm_compiled.to_crs(epsg=32644)
-                    class_col = next((c for c in fcm_utm.columns if c.lower() == "class_name"), None)
-                    if class_col and not fcm_utm.empty:
-                        fcm_utm["part_area_ha"] = fcm_utm.geometry.area / 10000.0
+                    
+                    if not fcm_compiled.empty:
+                        fcm_utm = fcm_compiled.to_crs(epsg=32644)
+                        class_col = next((c for c in fcm_utm.columns if c.lower() == "class_name"), None)
                         
-                        # ─── 1. INITIALIZE FIXED ACCUMULATOR BUCKETS ───
-                        fcm_area_agg = {
-                            "VDF": 0.0,
-                            "MDF": 0.0,
-                            "OPEN FOREST": 0.0,
-                            "SCRUB": 0.0,
-                            "WATER": 0.0,
-                            "NO-DATA": 0.0
-                        }
+                        if class_col:
+                            fcm_utm["part_area_ha"] = fcm_utm.geometry.area / 10000.0
+                            fcm_area_agg = {"VDF": 0.0, "MDF": 0.0, "OPEN FOREST": 0.0, "SCRUB": 0.0, "WATER": 0.0}
+                            total_detected_canopy_ha = 0.0
+                            
+                            # Gather active canopy metrics returned from database segments
+                            for _, row_cell in fcm_utm.iterrows():
+                                c_str = str(row_cell[class_col]).strip().upper()
+                                cell_ha = float(row_cell["part_area_ha"])
+                                
+                                if "VDF" in c_str:
+                                    standard_label = "VDF"
+                                elif "MDF" in c_str:
+                                    standard_label = "MDF"
+                                elif "OPEN FOREST" in c_str or "OPEN" in c_str:
+                                    standard_label = "OPEN FOREST"
+                                elif "SCRUB" in c_str:
+                                    standard_label = "SCRUB"
+                                elif "WATER" in c_str:
+                                    standard_label = "WATER"
+                                else:
+                                    continue
+                                    
+                                fcm_area_agg[standard_label] += cell_ha
+                                total_detected_canopy_ha += cell_ha
+
+                            # DEDUCE NON FOREST: Subtract active values from total layout boundary
+                            non_forest_balance_ha = max(0.0, calculated_area_ha - total_detected_canopy_ha)
+                            fcm_area_agg["NO-DATA"] = non_forest_balance_ha
+
+                            max_area = 0.0
+                            for standard_label, class_ha in fcm_area_agg.items():
+                                if class_ha <= 0.001:
+                                    continue
+                                    
+                                c_pct = (class_ha / calculated_area_ha) * 100.0 if calculated_area_ha else 0.0
+                                fcm_class_summary[standard_label] = {"hectares": float(class_ha), "percentage": float(c_pct)}
+                                
+                                if standard_label not in {"WATER", "NO-DATA"} and class_ha > max_area:
+                                    max_area = class_ha
+                                    dominant_cover_type = standard_label
+
+                            if non_forest_balance_ha > max_area:
+                                dominant_cover_type = "NO-DATA"
                         
-                        # ─── 2. LOOP AND AGGREGATE AREA BY STANDARDIZED LABELS ───
-                        for _, row_cell in fcm_utm.iterrows():
-                            c_str = str(row_cell[class_col]).strip().upper()
-                            cell_ha = float(row_cell["part_area_ha"])
-                            
-                            if "VDF" in c_str:
-                                standard_label = "VDF"
-                            elif "MDF" in c_str:
-                                standard_label = "MDF"
-                            elif "OPEN FOREST" in c_str or "OPEN" in c_str:
-                                standard_label = "OPEN FOREST"
-                            elif "SCRUB" in c_str:
-                                standard_label = "SCRUB"
-                            elif "WATER" in c_str:
-                                standard_label = "WATER"
-                            else:
-                                # Treats old "NON FOREST", missing text, or gaps as NO-DATA ("Non Forest")
-                                standard_label = "NO-DATA"
-                                
-                            fcm_area_agg[standard_label] += cell_ha
-
-                        # ─── 3. COMPUTE METRICS OVER ACCUMULATED TOTALS ───
-                        max_area = 0.0
-                        for standard_label, class_ha in fcm_area_agg.items():
-                            if class_ha <= 0:
-                                continue  # Don't add empty classes to summary
-                                
-                            c_pct = (class_ha / calculated_area_ha) * 100.0 if calculated_area_ha else 0.0
-                            fcm_class_summary[standard_label] = {"hectares": float(class_ha), "percentage": float(c_pct)}
-                            
-                            if standard_label not in {"WATER", "NO-DATA"} and class_ha > max_area:
-                                max_area = class_ha
-                                dominant_cover_type = standard_label
-
-                        # Fallback: If the area contains zero forest classes, set "NO-DATA" as dominant
-                        if max_area == 0.0 and fcm_area_agg["NO-DATA"] > 0:
-                            dominant_cover_type = "NO-DATA"
-
-                    report_text += "🌲 *Forest Canopy Cover (FCM):*\n"
-                    if fcm_class_summary:
-                        for label, metrics in fcm_class_summary.items():
-                            report_text += f"• {label}: `{metrics['hectares']:.2f} ha` ({metrics['percentage']:.1f}%)\n"
-                        report_text += "• Processing Status: `[Natively Evaluated]` ✅\n\n"
+                        passed_fcm_list = [fcm_compiled]
+                        report_text += "🌲 *Forest Canopy Cover (FCM):*\n• Processing Status: `[Natively Evaluated]` ✅\n\n"
                     else:
-                        report_text += "• Processing Status: `[Evaluated - class_name column not usable]` ⚠️\n\n"
-                    passed_fcm_list = [fcm_compiled]
+                        # Inside grid bounds but completely flat, open clearings
+                        fcm_class_summary["NO-DATA"] = {"hectares": float(calculated_area_ha), "percentage": 100.0}
+                        dominant_cover_type = "NO-DATA"
+                        passed_fcm_list = []  
+                        report_text += "🌲 *Forest Canopy Cover (FCM):*\n• Non Forest Area: `100.0%` ✅\n\n"
+
+                elif target_grid_ids:
+                    # Safely within study area coordinates but no forest polygons overlap the site
+                    fcm_class_summary["NO-DATA"] = {"hectares": float(calculated_area_ha), "percentage": 100.0}
+                    dominant_cover_type = "NO-DATA"
+                    passed_fcm_list = []  
+                    report_text += "🌲 *Forest Canopy Cover (FCM):*\n• Non Forest Area: `100.0%` ✅\n\n"
+                
                 else:
-                    report_text += "🌲 *Forest Canopy Cover (FCM):*\n"
-                    report_text += "• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
+                    # Outside study boundary entirely: Flag as None to drop map page generation
+                    passed_fcm_list = None
+                    report_text += "🌲 *Forest Canopy Cover (FCM):*\n• Processing Status: `[Skipped - Outside Study Boundary Grid]` ⏳\n\n"
+
                 # FTM
                 if ftm_intersected_gdfs:
                     ftm_compiled = pd.concat(ftm_intersected_gdfs, ignore_index=True)
@@ -624,7 +666,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                     "_raw_ftm_gdfs": passed_ftm_list,
                     "_raw_dem_gdfs": passed_dem_list,
                     "_raw_demr_paths": passed_demr_paths,
-                    "_map_modes": [m for m in ["fcm" if passed_fcm_list else None, "ftm" if passed_ftm_list else None, "dem" if (passed_demr_paths or passed_dem_list) else None] if m],
+                    "_map_modes": [m for m in ["fcm" if passed_fcm_list is not None else None, "ftm" if passed_ftm_list else None, "dem" if (passed_demr_paths or passed_dem_list) else None] if m],
                     "_has_water": "WATER" in fcm_class_summary,
                     "_contour_interval_m": 20,
                 }
@@ -634,11 +676,11 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
 
                 try:
                     logger.info(
-                        "RENDER_TRACE | file=%s | area=%.2f | fcm_classes=%s | raw_fcm=%d | raw_ftm=%d | raw_dem=%d | raw_demr=%d",
+                        "RENDER_TRACE | file=%s | area=%.2f | fcm_classes=%s | raw_fcm=%s | raw_ftm=%d | raw_dem=%d | raw_demr=%d",
                         polygon_filename,
                         results.get("area_ha", 0),
                         list(results.get("fcm", {}).get("classes", {}).keys()),
-                        len(results.get("_raw_fcm_gdfs", [])),
+                        len(results.get("_raw_fcm_gdfs")) if results.get("_raw_fcm_gdfs") is not None else "None",
                         len(results.get("_raw_ftm_gdfs", [])),
                         len(results.get("_raw_dem_gdfs", [])),
                         len(results.get("_raw_demr_paths", [])),
@@ -695,13 +737,12 @@ async def catch_all_text(client: Client, message: Message) -> None:
     sys.stdout.flush()
 
 
-#from utils.texttest import *
 from utils.texttest import render_texttest_pdf, render_texttest_png
 @Client.on_message(filters.command("testtext"))
 async def testtext_handler(client, message: Message):
     arg = None
     if len(message.command) > 1:
-        arg = message.command[1].strip().lower()
+        [cite_start]arg = message.command[1].strip().lower()
 
     if arg == "png":
         out = render_texttest_png()
@@ -714,7 +755,6 @@ async def testtext_handler(client, message: Message):
     await message.reply_document(document=out, caption="Text shaping test PDF")
 
 
-
 from utils.dev_render import render_fake_report
 
 
@@ -722,7 +762,7 @@ from utils.dev_render import render_fake_report
 async def testrender_handler(client, message: Message):
     mode = "bundle"
     if len(message.command) > 1:
-        mode = message.command[1].strip().lower()
+        [cite_start]mode = message.command[1].strip().lower()
 
     if mode not in {"bundle", "fcm", "ftm", "dem"}:
         mode = "bundle"
