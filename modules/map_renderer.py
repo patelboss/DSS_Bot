@@ -306,7 +306,7 @@ def _build_figure() -> Figure:
     return fig
 
 def _build_layout(fig: Figure):
-    gs = GridSpec(2, 2, figure=fig, left=0.04, right=0.96, top=0.88, bottom=0.04, hspace=0.06, wspace=0.06, width_ratios=, height_ratios=)
+    gs = GridSpec(2, 2, figure=fig, left=0.04, right=0.96, top=0.88, bottom=0.04, hspace=0.06, wspace=0.06, width_ratios=[4, 1], height_ratios=[3, 1],)
     ax_map = fig.add_subplot(gs)
     ax_legend = fig.add_subplot(gs)
     ax_table = fig.add_subplot(gs[1, :])
