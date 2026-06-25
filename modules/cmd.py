@@ -68,10 +68,10 @@ def _class_hi(label: str) -> str:
         "VDF": "अत्यंत घना वन",
         "MDF": "मध्यम घना वन",
         "OPEN FOREST": "खुला वन",
-        "NON FOREST": "गैर वन",
         "SCRUB": "झाड़ी",
         "WATER": "जल निकाय",
-        "NO-DATA": "डेटा नहीं",
+        "NON FOREST": "गैर वन",
+        "NO-DATA": "गैर वन",
     }
     return mapping_hi.get(s, s)
 
