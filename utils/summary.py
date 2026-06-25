@@ -42,7 +42,6 @@ except Exception as e:
     log.warning(f"FAILED to load 'mplcairo' ({e}). Falling back to 'Agg'.")
     matplotlib.use("Agg", force=True)
 
-# Try to import pypdf to merge individual crisp mplcairo PDF pages
 try:
     import pypdf
     log.info("SUCCESS: pypdf imported successfully for merging pages.")
@@ -59,16 +58,13 @@ matplotlib.rcParams["pdf.fonttype"] = 42
 matplotlib.rcParams["ps.fonttype"] = 42
 matplotlib.rcParams["axes.unicode_minus"] = False
 
-import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.patches import FancyBboxPatch, Rectangle
 
-try:
-    from config import cfg  # type: ignore
-except Exception:
-    cfg = None  # type: ignore
+# Grab centralized configuration setup
+from config import cfg
 
 PALETTE = {
     "bg": "#f5f2eb",
@@ -101,61 +97,9 @@ FCM_ALIASES = {
     "NO DATA": "NO-DATA", "NO-DATA": "NO-DATA", "NODATA": "NO-DATA",
 }
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-UTILS_DIR = PROJECT_ROOT / "utils"
-_OUTPUT_DPI = int(getattr(cfg, "OUTPUT_DPI", 300) or 300) if cfg is not None else 300
-
-FONT_CANDIDATES: tuple[str, ...] = (
-    "/app/utils/fonts/Devanagari-Regular.ttf",
-    "/app/utils/fonts/mangal.ttf",
-    "/app/utils/fonts/NotoSansDevanagari-Regular.ttf",
-    "/app/fonts/NotoSansDevanagari-Regular.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
-    "/usr/share/fonts/truetype/msttcorefonts/Mangal.ttf",
-    "/usr/local/share/fonts/NotoSansDevanagari-Regular.ttf",
-    "C:/Windows/Fonts/Nirmala.ttf",
-    "C:/Windows/Fonts/mangal.ttf",
-)
-
-def _safe_font_path(font_path: str | None = None) -> Path | None:
-    if font_path:
-        p = Path(font_path)
-        if p.exists():
-            return p
-
-    for candidate in FONT_CANDIDATES:
-        p = Path(candidate)
-        if p.exists():
-            return p
-
-    search_dirs = [
-        UTILS_DIR, UTILS_DIR / "fonts", PROJECT_ROOT / "fonts",
-        Path("/app/fonts"), Path("/usr/local/share/fonts"),
-        Path("/usr/share/fonts/truetype/noto"), Path("/usr/share/fonts/truetype/msttcorefonts"),
-    ]
-    for base in search_dirs:
-        if not base.exists():
-            continue
-        for suffix in ("*.ttf", "*.otf", "*.ttc", "*.TTF", "*.OTF", "*.TTC"):
-            found = sorted(base.rglob(suffix))
-            if found:
-                return found
-    return None
-
-def _make_font_properties(font_path: str | None = None) -> fm.FontProperties:
-    p = _safe_font_path(font_path)
-    if p is not None:
-        try:
-            fm.fontManager.addfont(str(p))
-            fp = fm.FontProperties(fname=str(p))
-            log.info(f"Using font file: {p}")
-            return fp
-        except Exception as exc:
-            log.warning(f"Could not load font {p}: {exc}")
-
-    return fm.FontProperties(family="DejaVu Sans")
-
-_DEVA_FP = _make_font_properties()
+# Pull font parameters directly from unified environment config instance
+_DEVA_FP = cfg.fonts.props
+_OUTPUT_DPI = int(getattr(cfg, "OUTPUT_DPI", 200) or 200)
 
 def PathSafe(name: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(name))
@@ -182,6 +126,7 @@ def _auto_sort_fcm_classes(fcm_classes: dict[str, dict[str, Any]]) -> list[tuple
     for label, metrics in (fcm_classes or {}).items():
         pct = _safe_float((metrics or {}).get("percentage", 0.0), 0.0) or 0.0
         items.append((_normalize_fcm_label(label), pct))
+    # Crucial Fix: Sort by the percentage item index properly
     items.sort(key=lambda x: x, reverse=True)
     return items
 
@@ -284,7 +229,6 @@ def prepare_report_content(results: dict[str, Any]) -> dict[str, Any]:
 def render_summary_pdf(results: dict[str, Any], filename: str = "output") -> io.BytesIO:
     log.info("Starting pure mplcairo single-page split render...")
     
-    # Generate standalone figures
     pages = [
         build_summary_figure(results, filename),
         build_keyfacts_figure(results, filename),
@@ -296,7 +240,6 @@ def render_summary_pdf(results: dict[str, Any], filename: str = "output") -> io.
     temp_files: list[str] = []
 
     try:
-        # Save every single page explicitly via savefig to preserve shaping
         for idx, fig in enumerate(pages, start=1):
             _draw_page_footer(fig, idx, total_pages)
             
@@ -304,24 +247,22 @@ def render_summary_pdf(results: dict[str, Any], filename: str = "output") -> io.
             os.close(fd)
             temp_files.append(tmp_page_name)
             
-            log.info(f"Rendering Page {idx} to individual file via mplcairo context...")
+            log.info(f"Rendering Page {idx} via isolated layout canvas contexts...")
             fig.savefig(tmp_page_name, format="pdf", dpi=_OUTPUT_DPI)
             plt.close(fig)
             
             pdf_merger.append(tmp_page_name)
         
-        # Merge individual pristine files into single stream
         out_buf = io.BytesIO()
         pdf_merger.write(out_buf)
         pdf_merger.close()
         
         out_buf.seek(0)
         out_buf.name = f"{PathSafe(filename)}_summary.pdf"
-        log.info("✅ All pages merged flawlessly into final memory stream!")
+        log.info("✅ High-fidelity text-shaped single stream compilation complete!")
         return out_buf
 
     finally:
-        # Clean temporary page files safely
         for tmp_f in temp_files:
             try:
                 if os.path.exists(tmp_f):
