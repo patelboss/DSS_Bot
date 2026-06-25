@@ -670,9 +670,8 @@ async def catch_all_text(client: Client, message: Message) -> None:
     sys.stdout.flush()
 
 
-from utils import *
-
-
+#from utils.texttest import *
+from utils.texttest import render_texttest_pdf, render_texttest_png
 @Client.on_message(filters.command("testtext"))
 async def testtext_handler(client, message: Message):
     arg = None
