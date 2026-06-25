@@ -74,8 +74,6 @@ def _class_hi(label: str) -> str:
         "NO-DATA": "गैर वन",
     }
     return mapping_hi.get(s, s)
-
-
 def _build_bilingual_summary(
     area_ha: float,
     fcm_class_summary: dict,
@@ -84,81 +82,45 @@ def _build_bilingual_summary(
     ftm_area_ha: Optional[float] = None,
     has_raster_dem: bool = False,
 ) -> tuple[str, str, list[str], list[str]]:
-    # 1. Check if we actually have any valid FCM metrics data collected
-    if not fcm_class_summary:
-        classes_text = "No FCM data available"
-        classes_hi = "एफसीएम डेटा उपलब्ध नहीं है"
-        
-        summary_en = (
-            f"The analysed area covers {area_ha:.2f} hectares. Forest Cover Mapping data was not available for this region. "
-            f"{'Forest Type Mapping data was not available.' if ftm_area_ha is None else f'Forest Type Mapping area is {ftm_area_ha:.2f} hectares.'} "
-            f"Terrain analysis could not be completed because elevation data was not available."
-        )
-        summary_hi = (
-            f"विश्लेषित क्षेत्र {area_ha:.2f} हेक्टेयर है। इस क्षेत्र के लिए वन आच्छादन मानचित्रण डेटा उपलब्ध नहीं है। "
-            f"{'वन प्रकार मानचित्रण डेटा उपलब्ध नहीं है।' if ftm_area_ha is None else f'वन प्रकार मानचित्रण का क्षेत्रफल {ftm_area_ha:.2f} हेक्टेयर है।'0} "
-            f"ऊँचाई डेटा उपलब्ध न होने के कारण भू-आकृतिक विश्लेषण पूरा नहीं हो सका।"
-        )
-        
-        key_facts_en = [
-            f"Total Area: {area_ha:.2f} ha",
-            f"Dominant Forest Class: No Data Available",
-            f"Forest Cover Type: {classes_text}",
-        ]
-        key_facts_hi = [
-            f"कुल क्षेत्रफल: {area_ha:.2f} हेक्टेयर",
-            f"प्रमुख वन वर्ग: डेटा अनुपलब्ध",
-            f"वन आच्छादन वर्ग: {classes_hi}",
-        ]
-    else:
-        # Extract percentage safely using the unified tracker keys
-        dominant_pct = float(fcm_class_summary.get(dominant_cover_type, {}).get("percentage", 0.0) or 0.0)
-        classes_text = ", ".join(k if k != "NO-DATA" else "Non Forest" for k in fcm_class_summary.keys())
-        classes_hi = ", ".join(_class_hi(k) for k in fcm_class_summary.keys())
+    dominant_pct = float(fcm_class_summary.get(dominant_cover_type, {}).get("percentage", 0.0) or 0.0)
+    classes_text = ", ".join(fcm_class_summary.keys()) if fcm_class_summary else "No FCM data available"
+    classes_hi = ", ".join(_class_hi(k) for k in fcm_class_summary.keys()) if fcm_class_summary else "एफसीएम डेटा उपलब्ध नहीं है"
 
-        friendly_dominant_en = "Non Forest" if dominant_cover_type == "NO-DATA" else dominant_cover_type
-        friendly_dominant_hi = _class_hi(dominant_cover_type)
-
-        dem_min = dem_metrics.get("elevation_min_m")
-        dem_max = dem_metrics.get("elevation_max_m")
-        dem_mean = dem_metrics.get("elevation_mean_m")
-
-        if dem_min is not None and dem_max is not None and dem_mean is not None:
-            dem_sentence_en = (
-                f"Terrain analysis derived from {'raster DEM' if has_raster_dem else 'DEM data'} shows an elevation range of {dem_min}–{dem_max} metres above mean sea level, with a mean elevation of {dem_mean} metres."
-            )
-            dem_sentence_hi = (
-                f"{ 'रास्टर DEM' if has_raster_dem else 'DEM डेटा' } पर आधारित भू-आकृतिक विश्लेषण में समुद्र तल से ऊँचाई {dem_min}–{dem_max} मीटर के बीच पाई गई है, तथा औसत ऊँचाई {dem_mean} मीटर है।"
-            )
-        else:
-            dem_sentence_en = "Terrain analysis could not be completed because elevation data was not available."
-            dem_sentence_hi = "ऊँचाई डेटा उपलब्ध न होने के कारण भू-आकृतिक विश्लेषण पूरा नहीं हो सका।"
-
-        ftm_text_en = f"Forest Type Mapping area is {ftm_area_ha:.2f} hectares." if ftm_area_ha is not None else "Forest Type Mapping data was not available."
-        ftm_text_hi = f"वन प्रकार मानचित्रण का क्षेत्रफल {ftm_area_ha:.2f} हेक्टेयर है।" if ftm_area_ha is not None else "वन प्रकार मानचित्रण डेटा उपलब्ध नहीं है।"
-
-        summary_en = (
-            f"The analysed area covers {area_ha:.2f} hectares. Forest Cover Mapping indicates that {friendly_dominant_en} is the dominant class, accounting for {dominant_pct:.1f}% of the area. {ftm_text_en} {dem_sentence_en} The area contains the forest cover classes: {classes_text}."
-        )
-        summary_hi = (
-            f"विश्लेषित क्षेत्र {area_ha:.2f} हेक्टेयर है। वन आच्छादन मानचित्रण के अनुसार { friendly_dominant_hi } प्रमुख वर्ग है, जो कुल क्षेत्र का {dominant_pct:.1f}% भाग घेरता है। {ftm_text_hi} {dem_sentence_hi} उपलब्ध वन आच्छादन वर्ग: {classes_hi}।"
-        )
-
-        key_facts_en = [
-            f"Total Area: {area_ha:.2f} ha",
-            f"Dominant Forest Class: {friendly_dominant_en} ({dominant_pct:.1f}%)",
-            f"Forest Cover Type: {classes_text}",
-        ]
-        key_facts_hi = [
-            f"कुल क्षेत्रफल: {area_ha:.2f} हेक्टेयर",
-            f"प्रमुख वन वर्ग: { friendly_dominant_hi } ({dominant_pct:.1f}%)",
-            f"वन आच्छादन वर्ग: {classes_hi}",
-        ]
-
-    # Append topographic descriptors safely if they exist
     dem_min = dem_metrics.get("elevation_min_m")
     dem_max = dem_metrics.get("elevation_max_m")
     dem_mean = dem_metrics.get("elevation_mean_m")
+
+    if dem_min is not None and dem_max is not None and dem_mean is not None:
+        dem_sentence_en = (
+            f"Terrain analysis derived from {'raster DEM' if has_raster_dem else 'DEM data'} shows an elevation range of {dem_min}–{dem_max} metres above mean sea level, with a mean elevation of {dem_mean} metres."
+        )
+        dem_sentence_hi = (
+            f"{ 'रास्टर DEM' if has_raster_dem else 'DEM डेटा' } पर आधारित भू-आकृतिक विश्लेषण में समुद्र तल से ऊँचाई {dem_min}–{dem_max} मीटर के बीच पाई गई है, तथा औसत ऊँचाई {dem_mean} मीटर है।"
+        )
+    else:
+        dem_sentence_en = "Terrain analysis could not be completed because elevation data was not available."
+        dem_sentence_hi = "ऊँचाई डेटा उपलब्ध न होने के कारण भू-आकृतिक विश्लेषण पूरा नहीं हो सका।"
+
+    ftm_text_en = f"Forest Type Mapping area is {ftm_area_ha:.2f} hectares." if ftm_area_ha is not None else "Forest Type Mapping data was not available."
+    ftm_text_hi = f"वन प्रकार मानचित्रण का क्षेत्रफल {ftm_area_ha:.2f} हेक्टेयर है।" if ftm_area_ha is not None else "वन प्रकार मानचित्रण डेटा उपलब्ध नहीं है।"
+
+    summary_en = (
+        f"The analysed area covers {area_ha:.2f} hectares. Forest Cover Mapping indicates that {dominant_cover_type} is the dominant class, accounting for {dominant_pct:.1f}% of the area. {ftm_text_en} {dem_sentence_en} The area contains the forest cover classes: {classes_text}."
+    )
+    summary_hi = (
+        f"विश्लेषित क्षेत्र {area_ha:.2f} हेक्टेयर है। वन आच्छादन मानचित्रण के अनुसार { _class_hi(dominant_cover_type) } प्रमुख वर्ग है, जो कुल क्षेत्र का {dominant_pct:.1f}% भाग घेरता है। {ftm_text_hi} {dem_sentence_hi} उपलब्ध वन आच्छादन वर्ग: {classes_hi}।"
+    )
+
+    key_facts_en = [
+        f"Total Area: {area_ha:.2f} ha",
+        f"Dominant Forest Class: {dominant_cover_type}",
+        f"Forest Cover Type: {classes_text}",
+    ]
+    key_facts_hi = [
+        f"कुल क्षेत्रफल: {area_ha:.2f} हेक्टेयर",
+        f"प्रमुख वन वर्ग: { _class_hi(dominant_cover_type) }",
+        f"वन आच्छादन वर्ग: {classes_hi}",
+    ]
     if dem_min is not None and dem_max is not None and dem_mean is not None:
         key_facts_en.extend([
             f"Elevation Range: {dem_min}–{dem_max} m",
@@ -169,7 +131,7 @@ def _build_bilingual_summary(
             f"औसत ऊँचाई: {dem_mean} मीटर",
         ])
     return summary_en, summary_hi, key_facts_en, key_facts_hi
-
+    
 
 def _summarize_raster_dem(paths: list[str], study_geom) -> tuple[dict, list[str]]:
     accum = {"min": None, "max": None, "sum": 0.0, "count": 0}
