@@ -476,7 +476,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                     fcm_compiled = fcm_compiled[~fcm_compiled.geometry.is_empty].copy()
                     fcm_utm = fcm_compiled.to_crs(epsg=32644)
                     class_col = next((c for c in fcm_utm.columns if c.lower() == "class_name"), None)
-                                        if class_col and not fcm_utm.empty:
+                    if class_col and not fcm_utm.empty:
                         fcm_utm["part_area_ha"] = fcm_utm.geometry.area / 10000.0
                         
                         # ─── 1. INITIALIZE FIXED ACCUMULATOR BUCKETS ───
