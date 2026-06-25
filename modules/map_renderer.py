@@ -228,14 +228,32 @@ def _iter_geoms(geom) -> list:
         return [geom]
     return []
 
-
+"""
 def _normalize_fcm_label(label: Any) -> str:
-    key = str(label or "").strip().upper()
+    key = str(label or "").strip).upper()
     if not key:
         return "NO-DATA"
     if key in FCM_LABELS:
         return key
     return FCM_ALIASES.get(key, key)
+"""
+
+def _normalize_fcm_label(label: Any) -> str:
+    # 1. Clean and normalize the raw input string
+    key = str(label or "").strip().upper()
+    if key in FCM_ALIASES:
+        key = FCM_ALIASES[key]
+
+    # 2. Define the strict array of validated forest/water classes
+    valid_forest_classes = {"VDF", "MDF", "OPEN FOREST", "SCRUB", "WATER"}
+
+    # 3. If it doesn't match a core forest class, force it to fall back to the "NO-DATA" index
+    # (which we mapped to "Non Forest" / "गैर-वन" in FCM_LABELS)
+    if key not in valid_forest_classes:
+        return "NO-DATA"
+        
+    return key
+
 
 
 def _friendly_fcm_label(raw_label: str | None, lang: str = "en") -> str:
@@ -263,30 +281,26 @@ def _match_fcm_color(class_attr: str) -> str:
 
 """
 def _match_fcm_color(class_attr: str) -> str:
-    # Coerce to string to safely process missing or None attributes
     s = str(class_attr or "").strip().upper()
     
+    # Check configurations against your text structures
     if "VERY DENSE" in s or s == "VDF":
         return PALETTE["vdf"]
     if "MODERATELY DENSE" in s or s == "MDF":
         return PALETTE["mdf"]
     if "OPEN" in s:
         return PALETTE["open"]
-#    if "NON FOREST" in s or "NON-FOREST" in s:
-#        return PALETTE["nonforest"]
     if "SCRUB" in s:
         return PALETTE["scrub"]
     if "WATER" in s:
         return PALETTE["water"]
 
-    # If the attribute string itself explicitly specifies no data
-    if "NO DATA" in s or "NO-DATA" in s or "NODATA" in s:
-        return PALETTE.get("nodata", PALETTE["fallback"])
+    # 🚀 FALLBACK: Any text data or gap that drops through here gets painted 
+    # as your uniform NON FOREST grey hex (#8c8c88)
+    return PALETTE["nonforest"]
 
-    # Fallback default: when there is no matching class attribute string, 
-    # it treats it as an unmapped space/missing data tile
-    return PALETTE.get("nodata", PALETTE["fallback"])
-    
+
+
 
 def _stable_color_for_label(label: str) -> str:
     idx = zlib.crc32(str(label).encode("utf-8")) % len(FTM_FALLBACK_PALETTE)
@@ -906,7 +920,7 @@ def _draw_legend(ax, results: dict, mode: str) -> None:
         if not normalized:
             ax.text(0.05, y, "No class summary available", fontsize=7, color=PALETTE["text_mid"], transform=ax.transAxes, va="top")
         else:
-            order = ["VDF", "MDF", "OPEN FOREST", "SCRUB", "WATER", "NON FOREST", "NO-DATA"]
+            order = ["VDF", "MDF", "OPEN FOREST", "SCRUB", "WATER", "NO-DATA"]
             used = set()
 
             for label in order:
