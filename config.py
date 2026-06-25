@@ -125,7 +125,7 @@ cfg = Config()
 
 # ── Forest Cover class mapping (FSI legend) ───────────────────────────────────
 FCM_CLASSES: dict[int, str] = {
-    0: "NON FOREST",
+    0: "NO-DATA",
     1: "VDF",
     2: "MDF",
     3: "OPEN FOREST",
