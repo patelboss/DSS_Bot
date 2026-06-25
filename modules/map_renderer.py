@@ -14,7 +14,6 @@ import logging
 import math
 import os
 import sys
-import tempfile
 import zlib
 from pathlib import Path
 from typing import Any, Iterable
@@ -46,7 +45,6 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 import rasterio
-from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
@@ -62,6 +60,7 @@ from shapely.geometry import (
     shape,
 )
 
+from utils.pdf_renderer import render_pages
 from utils.summary import (
     build_keyfacts_figure,
     build_summary_figure,
@@ -340,40 +339,30 @@ def render_map(
 
     thematic_modes = _resolve_thematic_modes(results, mode)
     page_specs: list[str] = thematic_modes + ["summary", "keyfacts", "thanks"]
-    total_pages = len(page_specs)
 
-    fd, tmp_name = tempfile.mkstemp(prefix=f"{PathSafe(filename)}_", suffix=".pdf")
-    os.close(fd)
-    tmp_pdf = Path(tmp_name)
-
+    figures: list[Figure] = []
     try:
-        with PdfPages(str(tmp_pdf)) as pdf:
-            for page_index, page_kind in enumerate(page_specs, start=1):
-                if page_kind in {"fcm", "ftm", "dem"}:
-                    fig = _build_thematic_figure(page_kind, geojson_feature, results, filename)
-                elif page_kind == "summary":
-                    fig = build_summary_figure(results, filename)
-                elif page_kind == "keyfacts":
-                    fig = build_keyfacts_figure(results, filename)
-                else:
-                    fig = build_thankyou_figure(results, filename)
+        for page_kind in page_specs:
+            if page_kind in {"fcm", "ftm", "dem"}:
+                fig = _build_thematic_figure(page_kind, geojson_feature, results, filename)
+            elif page_kind == "summary":
+                fig = build_summary_figure(results, filename)
+            elif page_kind == "keyfacts":
+                fig = build_keyfacts_figure(results, filename)
+            else:
+                fig = build_thankyou_figure(results, filename)
+            figures.append(fig)
 
-                _draw_page_footer(fig, page_index, total_pages)
-                pdf.savefig(fig, dpi=_OUTPUT_DPI)
-                plt.close(fig)
-                gc.collect()
-
-        buf = io.BytesIO(tmp_pdf.read_bytes())
-        buf.seek(0)
-        buf.name = f"{PathSafe(filename)}.pdf"
-        log.info("✅ Map successfully rendered | pages=%d | format=PDF | dpi=%d", total_pages, _OUTPUT_DPI)
+        buf = render_pages(figures, filename=filename, close_figures=False)
+        log.info("✅ Map successfully rendered | pages=%d | format=PDF | dpi=%d", len(page_specs), _OUTPUT_DPI)
         return buf
     finally:
-        try:
-            if tmp_pdf.exists():
-                tmp_pdf.unlink()
-        except Exception:
-            pass
+        for fig in figures:
+            try:
+                plt.close(fig)
+            except Exception:
+                pass
+        gc.collect()
 
 
 def _build_figure() -> Figure:
