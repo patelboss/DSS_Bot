@@ -13,12 +13,8 @@ single report.
 
 from __future__ import annotations
 
-import gc
-import io
 import logging
-import os
 import sys
-import tempfile
 import textwrap
 from pathlib import Path
 from typing import Any
@@ -42,11 +38,6 @@ except Exception as e:
     log.warning(f"FAILED to load 'mplcairo' ({e}). Falling back to 'Agg'.")
     matplotlib.use("Agg", force=True)
 
-try:
-    import pypdf
-    log.info("SUCCESS: pypdf imported successfully for merging pages.")
-except ImportError:
-    raise ImportError("Please install pypdf via 'pip install pypdf' to merge high-quality shaped PDF pages.")
 
 try:
     if "text.parse_math" in matplotlib.rcParams:
@@ -225,51 +216,6 @@ def prepare_report_content(results: dict[str, Any]) -> dict[str, Any]:
         "summary_hi": summary_hi.strip(),
         "keyfacts_lines": [str(x) for x in keyfacts_lines],
     }
-
-def render_summary_pdf(results: dict[str, Any], filename: str = "output") -> io.BytesIO:
-    log.info("Starting pure mplcairo single-page split render...")
-    
-    pages = [
-        build_summary_figure(results, filename),
-        build_keyfacts_figure(results, filename),
-        build_thankyou_figure(results, filename),
-    ]
-    total_pages = len(pages)
-    
-    pdf_merger = pypdf.PdfMerger()
-    temp_files: list[str] = []
-
-    try:
-        for idx, fig in enumerate(pages, start=1):
-            _draw_page_footer(fig, idx, total_pages)
-            
-            fd, tmp_page_name = tempfile.mkstemp(prefix=f"page_{idx}_", suffix=".pdf")
-            os.close(fd)
-            temp_files.append(tmp_page_name)
-            
-            log.info(f"Rendering Page {idx} via isolated layout canvas contexts...")
-            fig.savefig(tmp_page_name, format="pdf", dpi=_OUTPUT_DPI)
-            plt.close(fig)
-            
-            pdf_merger.append(tmp_page_name)
-        
-        out_buf = io.BytesIO()
-        pdf_merger.write(out_buf)
-        pdf_merger.close()
-        
-        out_buf.seek(0)
-        out_buf.name = f"{PathSafe(filename)}_summary.pdf"
-        log.info("✅ High-fidelity text-shaped single stream compilation complete!")
-        return out_buf
-
-    finally:
-        for tmp_f in temp_files:
-            try:
-                if os.path.exists(tmp_f):
-                    os.unlink(tmp_f)
-            except Exception:
-                pass
-        gc.collect()
 
 def build_summary_figure(results: dict[str, Any], filename: str) -> Figure:
     content = prepare_report_content(results)
