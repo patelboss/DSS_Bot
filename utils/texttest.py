@@ -1,4 +1,3 @@
-
 # utils/texttest.py
 from __future__ import annotations
 
@@ -33,6 +32,9 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.patches import FancyBboxPatch, Rectangle
 
+# Grab centralized configuration setup
+from config import cfg
+
 log = logging.getLogger(__name__)
 if not log.handlers:
     handler = logging.StreamHandler()
@@ -43,7 +45,7 @@ log.setLevel(logging.INFO)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 UTILS_DIR = PROJECT_ROOT / "utils"
 
-_OUTPUT_DPI = 300
+_OUTPUT_DPI = int(getattr(cfg, "OUTPUT_DPI", 300) or 300) if cfg is not None else 300
 
 TEXTTEST_SIMPLE_LINES = [
     "मुख्य",
@@ -80,18 +82,6 @@ TEXTTEST_MIXED_LINES = [
     "MP Forest Department / मध्य प्रदेश वन विभाग",
 ]
 
-FONT_CANDIDATES: tuple[str, ...] = (
-    "/app/utils/fonts/Devanagari-Regular.ttf",
-    "/app/utils/fonts/mangal.ttf",
-    "/app/utils/fonts/NotoSansDevanagari-Regular.ttf",
-    "/app/fonts/NotoSansDevanagari-Regular.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
-    "/usr/share/fonts/truetype/msttcorefonts/Mangal.ttf",
-    "/usr/local/share/fonts/NotoSansDevanagari-Regular.ttf",
-    "C:/Windows/Fonts/Nirmala.ttf",
-    "C:/Windows/Fonts/mangal.ttf",
-)
-
 PALETTE = {
     "bg": "#f5f2eb",
     "panel": "#ffffff",
@@ -101,52 +91,6 @@ PALETTE = {
     "text_mid": "#3d5c3f",
     "table_alt": "#e8f0e9",
 }
-
-
-def _safe_font_path(font_path: str | None = None) -> Path | None:
-    if font_path:
-        p = Path(font_path)
-        if p.exists():
-            return p
-
-    for candidate in FONT_CANDIDATES:
-        p = Path(candidate)
-        if p.exists():
-            return p
-
-    search_dirs = [
-        UTILS_DIR,
-        UTILS_DIR / "fonts",
-        PROJECT_ROOT / "fonts",
-        Path("/app/fonts"),
-        Path("/usr/local/share/fonts"),
-        Path("/usr/share/fonts/truetype/noto"),
-        Path("/usr/share/fonts/truetype/msttcorefonts"),
-    ]
-    for base in search_dirs:
-        if not base.exists():
-            continue
-        for suffix in ("*.ttf", "*.otf", "*.ttc", "*.TTF", "*.OTF", "*.TTC"):
-            found = sorted(base.rglob(suffix))
-            if found:
-                return found[0]
-    return None
-
-
-def _make_font_properties(font_path: str | None = None) -> fm.FontProperties:
-    p = _safe_font_path(font_path)
-    if p is not None:
-        try:
-            fm.fontManager.addfont(str(p))
-            fp = fm.FontProperties(fname=str(p))
-            log.info("Text test font: %s | family=%s", p, fp.get_name())
-            log.info("Resolved font file: %s", fm.findfont(fp))
-            return fp
-        except Exception as exc:
-            log.warning("Could not load font %s: %s", p, exc)
-
-    log.warning("Falling back to DejaVu Sans.")
-    return fm.FontProperties(family="DejaVu Sans")
 
 
 def _draw_text_panel(
@@ -234,7 +178,14 @@ def build_texttest_figure(
     lines: Sequence[str] | None = None,
     title: str = "TEXT SHAPING TEST",
 ) -> Figure:
-    fp = _make_font_properties(font_path)
+    
+    # Use explicit path if provided for dynamic testing, otherwise fallback to global config
+    if font_path:
+        fp = fm.FontProperties(fname=font_path)
+        log.info(f"Using explicitly provided font override: {font_path}")
+    else:
+        fp = cfg.fonts.props
+
     fig = plt.figure(figsize=(16, 12))
     fig.patch.set_facecolor(PALETTE["bg"])
     fig.add_artist(
