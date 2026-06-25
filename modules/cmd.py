@@ -11,6 +11,7 @@ import logging
 import shutil
 import sys
 import tempfile
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -44,7 +45,8 @@ def _align_gdf_crs(gdf: gpd.GeoDataFrame, target_crs) -> gpd.GeoDataFrame:
     if gdf is None or gdf.empty:
         return gdf
     if gdf.crs is None:
-        return gdf.set_crs(target_crs)
+        logger.warning("Layer missing CRS data (.prj). Assuming EPSG:4326 to prevent crash.")
+        gdf = gdf.set_crs("EPSG:4326")
     try:
         if gdf.crs.to_string().upper() != str(target_crs).upper():
             return gdf.to_crs(target_crs)
@@ -52,14 +54,6 @@ def _align_gdf_crs(gdf: gpd.GeoDataFrame, target_crs) -> gpd.GeoDataFrame:
         if str(gdf.crs).upper() != str(target_crs).upper():
             return gdf.to_crs(target_crs)
     return gdf
-
-
-def _normalize_channel_id() -> int | str:
-    raw = str(cfg.TELEGRAM_CHANNEL_ID).strip()
-    try:
-        return int(raw)
-    except ValueError:
-        return raw
 
 
 def _class_hi(label: str) -> str:
@@ -74,6 +68,8 @@ def _class_hi(label: str) -> str:
         "NO-DATA": "गैर वन",
     }
     return mapping_hi.get(s, s)
+
+
 def _build_bilingual_summary(
     area_ha: float,
     fcm_class_summary: dict,
@@ -82,45 +78,88 @@ def _build_bilingual_summary(
     ftm_area_ha: Optional[float] = None,
     has_raster_dem: bool = False,
 ) -> tuple[str, str, list[str], list[str]]:
-    dominant_pct = float(fcm_class_summary.get(dominant_cover_type, {}).get("percentage", 0.0) or 0.0)
-    classes_text = ", ".join(fcm_class_summary.keys()) if fcm_class_summary else "No FCM data available"
-    classes_hi = ", ".join(_class_hi(k) for k in fcm_class_summary.keys()) if fcm_class_summary else "एफसीएम डेटा उपलब्ध नहीं है"
+
+    if not fcm_class_summary:
+        classes_text = "No FCM data available"
+        classes_hi = "एफसीएम डेटा उपलब्ध नहीं है"
+
+        summary_en = (
+            f"The analysed area covers {area_ha:.2f} hectares. Forest Cover Mapping data was not available for this region. "
+            f"{'Forest Type Mapping data was not available.' if ftm_area_ha is None else f'Forest Type Mapping area is {ftm_area_ha:.2f} hectares.'} "
+            f"Terrain analysis could not be completed because elevation data was not available."
+        )
+        summary_hi = (
+            f"विश्लेषित क्षेत्र {area_ha:.2f} हेक्टेयर है। इस क्षेत्र के लिए वन आच्छादन मानचित्रण डेटा उपलब्ध नहीं है। "
+            f"{'वन प्रकार मानचित्रण डेटा उपलब्ध नहीं है।' if ftm_area_ha is None else f'वन प्रकार मानचित्रण का क्षेत्रफल {ftm_area_ha:.2f} हेक्टेयर है।'} "
+            f"ऊँचाई डेटा उपलब्ध न होने के कारण भू-आकृतिक विश्लेषण पूरा नहीं हो सका।"
+        )
+
+        key_facts_en = [
+            f"Total Area: {area_ha:.2f} ha",
+            f"Dominant Forest Class: No Data Available",
+            f"Forest Cover Type: {classes_text}",
+        ]
+        key_facts_hi = [
+            f"कुल क्षेत्रफल: {area_ha:.2f} हेक्टेयर",
+            f"प्रमुख वन वर्ग: डेटा अनुपलब्ध",
+            f"वन आच्छादन वर्ग: {classes_hi}",
+        ]
+    else:
+        dominant_pct = float(fcm_class_summary.get(dominant_cover_type, {}).get("percentage", 0.0) or 0.0)
+        classes_text = ", ".join(k if k != "NO-DATA" else "Non Forest" for k in fcm_class_summary.keys())
+        classes_hi = ", ".join(_class_hi(k) for k in fcm_class_summary.keys())
+
+        friendly_dominant_en = "Non Forest" if dominant_cover_type == "NO-DATA" else dominant_cover_type
+        friendly_dominant_hi = _class_hi(dominant_cover_type)
+
+        dem_min = dem_metrics.get("elevation_min_m")
+        dem_max = dem_metrics.get("elevation_max_m")
+        dem_mean = dem_metrics.get("elevation_mean_m")
+
+        if dem_min is not None and dem_max is not None and dem_mean is not None:
+            dem_sentence_en = (
+                f"Terrain analysis derived from {'raster DEM' if has_raster_dem else 'DEM data'} shows an elevation range of {dem_min}–{dem_max} metres above mean sea level, with a mean elevation of {dem_mean} metres."
+            )
+            dem_sentence_hi = (
+                f"{'रास्टर DEM' if has_raster_dem else 'DEM डेटा'} पर आधारित भू-आकृतिक विश्लेषण में समुद्र तल से ऊँचाई {dem_min}–{dem_max} मीटर के बीच पाई गई है, तथा औसत ऊँचाई {dem_mean} मीटर है।"
+            )
+        else:
+            dem_sentence_en = "Terrain analysis could not be completed because elevation data was not available."
+            dem_sentence_hi = "ऊँचाई डेटा उपलब्ध न होने के कारण भू-आकृतिक विश्लेषण पूरा नहीं हो सका।"
+
+        ftm_text_en = (
+            f"Forest Type Mapping area is {ftm_area_ha:.2f} hectares."
+            if ftm_area_ha is not None
+            else "Forest Type Mapping data was not available."
+        )
+        ftm_text_hi = (
+            f"वन प्रकार मानचित्रण का क्षेत्रफल {ftm_area_ha:.2f} हेक्टेयर है।"
+            if ftm_area_ha is not None
+            else "वन प्रकार मानचित्रण डेटा उपलब्ध नहीं है।"
+        )
+
+        summary_en = (
+            f"The analysed area covers {area_ha:.2f} hectares. Forest Cover Mapping indicates that {friendly_dominant_en} is the dominant class, accounting for {dominant_pct:.1f}% of the area. {ftm_text_en} {dem_sentence_en} The area contains the forest cover classes: {classes_text}."
+        )
+        summary_hi = (
+            f"विश्लेषित क्षेत्र {area_ha:.2f} हेक्टेयर है। वन आच्छादन मानचित्रण के अनुसार {friendly_dominant_hi} प्रमुख वर्ग है, जो कुल क्षेत्र का {dominant_pct:.1f}% भाग घेरता है। {ftm_text_hi} {dem_sentence_hi} उपलब्ध वन आच्छादन वर्ग: {classes_hi}।"
+        )
+
+        key_facts_en = [
+            f"Total Area: {area_ha:.2f} ha",
+            f"Dominant Forest Class: {friendly_dominant_en} ({dominant_pct:.1f}%)",
+            f"Forest Cover Type: {classes_text}",
+        ]
+        key_facts_hi = [
+            f"कुल क्षेत्रफल: {area_ha:.2f} हेक्टेयर",
+            f"प्रमुख वन वर्ग: {friendly_dominant_hi} ({dominant_pct:.1f}%)",
+            f"वन आच्छादन वर्ग: {classes_hi}",
+        ]
 
     dem_min = dem_metrics.get("elevation_min_m")
     dem_max = dem_metrics.get("elevation_max_m")
     dem_mean = dem_metrics.get("elevation_mean_m")
 
-    if dem_min is not None and dem_max is not None and dem_mean is not None:
-        dem_sentence_en = (
-            f"Terrain analysis derived from {'raster DEM' if has_raster_dem else 'DEM data'} shows an elevation range of {dem_min}–{dem_max} metres above mean sea level, with a mean elevation of {dem_mean} metres."
-        )
-        dem_sentence_hi = (
-            f"{ 'रास्टर DEM' if has_raster_dem else 'DEM डेटा' } पर आधारित भू-आकृतिक विश्लेषण में समुद्र तल से ऊँचाई {dem_min}–{dem_max} मीटर के बीच पाई गई है, तथा औसत ऊँचाई {dem_mean} मीटर है।"
-        )
-    else:
-        dem_sentence_en = "Terrain analysis could not be completed because elevation data was not available."
-        dem_sentence_hi = "ऊँचाई डेटा उपलब्ध न होने के कारण भू-आकृतिक विश्लेषण पूरा नहीं हो सका।"
-
-    ftm_text_en = f"Forest Type Mapping area is {ftm_area_ha:.2f} hectares." if ftm_area_ha is not None else "Forest Type Mapping data was not available."
-    ftm_text_hi = f"वन प्रकार मानचित्रण का क्षेत्रफल {ftm_area_ha:.2f} हेक्टेयर है।" if ftm_area_ha is not None else "वन प्रकार मानचित्रण डेटा उपलब्ध नहीं है।"
-
-    summary_en = (
-        f"The analysed area covers {area_ha:.2f} hectares. Forest Cover Mapping indicates that {dominant_cover_type} is the dominant class, accounting for {dominant_pct:.1f}% of the area. {ftm_text_en} {dem_sentence_en} The area contains the forest cover classes: {classes_text}."
-    )
-    summary_hi = (
-        f"विश्लेषित क्षेत्र {area_ha:.2f} हेक्टेयर है। वन आच्छादन मानचित्रण के अनुसार { _class_hi(dominant_cover_type) } प्रमुख वर्ग है, जो कुल क्षेत्र का {dominant_pct:.1f}% भाग घेरता है। {ftm_text_hi} {dem_sentence_hi} उपलब्ध वन आच्छादन वर्ग: {classes_hi}।"
-    )
-
-    key_facts_en = [
-        f"Total Area: {area_ha:.2f} ha",
-        f"Dominant Forest Class: {dominant_cover_type}",
-        f"Forest Cover Type: {classes_text}",
-    ]
-    key_facts_hi = [
-        f"कुल क्षेत्रफल: {area_ha:.2f} हेक्टेयर",
-        f"प्रमुख वन वर्ग: { _class_hi(dominant_cover_type) }",
-        f"वन आच्छादन वर्ग: {classes_hi}",
-    ]
     if dem_min is not None and dem_max is not None and dem_mean is not None:
         key_facts_en.extend([
             f"Elevation Range: {dem_min}–{dem_max} m",
@@ -130,8 +169,9 @@ def _build_bilingual_summary(
             f"ऊँचाई सीमा: {dem_min}–{dem_max} मीटर",
             f"औसत ऊँचाई: {dem_mean} मीटर",
         ])
+
     return summary_en, summary_hi, key_facts_en, key_facts_hi
-    
+
 
 def _summarize_raster_dem(paths: list[str], study_geom) -> tuple[dict, list[str]]:
     accum = {"min": None, "max": None, "sum": 0.0, "count": 0}
@@ -140,7 +180,13 @@ def _summarize_raster_dem(paths: list[str], study_geom) -> tuple[dict, list[str]
     for path in paths:
         try:
             with rasterio.open(path) as src:
-                arr, _ = rio_mask(src, [study_geom.__geo_interface__], crop=True, filled=True, nodata=src.nodata)
+                arr, _ = rio_mask(
+                    src,
+                    [study_geom.__geo_interface__],
+                    crop=True,
+                    filled=True,
+                    nodata=src.nodata,
+                )
                 data = np.array(arr, dtype="float64")
                 if src.nodata is not None:
                     data[data == src.nodata] = np.nan
@@ -168,42 +214,6 @@ def _summarize_raster_dem(paths: list[str], study_geom) -> tuple[dict, list[str]
             "slope_max_deg": "—",
         }, kept_paths
     return {}, kept_paths
-
-
-def _summarize_vector_dem(gdfs: list[gpd.GeoDataFrame], study_geom) -> tuple[dict, list[gpd.GeoDataFrame]]:
-    kept: list[gpd.GeoDataFrame] = []
-    values = []
-    mins = []
-    maxs = []
-    for gdf in gdfs:
-        if gdf is None or gdf.empty:
-            continue
-        if getattr(gdf, "crs", None) and str(gdf.crs).upper() != "EPSG:4326":
-            gdf = gdf.to_crs("EPSG:4326")
-        gdf = gdf.copy()
-        gdf["geometry"] = gdf.geometry.intersection(study_geom)
-        gdf = gdf[~gdf.geometry.is_empty].copy()
-        if gdf.empty:
-            continue
-        elev_col = next((c for c in gdf.columns if str(c).lower() in {"elevation", "elev", "contour", "z"}), None)
-        if elev_col is None:
-            continue
-        series = pd.to_numeric(gdf[elev_col], errors="coerce").dropna()
-        if series.empty:
-            continue
-        kept.append(gdf)
-        values.extend(series.tolist())
-        mins.append(float(series.min()))
-        maxs.append(float(series.max()))
-    if not values:
-        return {}, kept
-    return {
-        "elevation_min_m": round(float(min(mins)), 1),
-        "elevation_max_m": round(float(max(maxs)), 1),
-        "elevation_mean_m": round(float(sum(values) / len(values)), 1),
-        "slope_mean_deg": "—",
-        "slope_max_deg": "—",
-    }, kept
 
 
 @Client.on_message(filters.command("start") & filters.private)
@@ -258,25 +268,31 @@ async def handle_document(client: Client, message: Message) -> None:
         return
 
     status_msg = await message.reply_text("📥 *Processing vector layout properties…*", parse_mode=ParseMode.MARKDOWN)
-    tmp_path = Path(tempfile.gettempdir()) / f"{user.id}_{document.file_name}"
+
+    file_uuid = uuid.uuid4().hex[:8]
+    tmp_path = Path(tempfile.gettempdir()) / f"{user.id}_{file_uuid}_{document.file_name}"
     tmp_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
         await client.download_media(message, file_name=str(tmp_path))
         geojson_feature, gdf_attributes = load_vector_file(tmp_path)
-        attr_df = gdf_attributes.drop(columns=["geometry"], errors="ignore")
+
         USER_SESSION_CACHE[user.id] = {
             "current_feature": geojson_feature,
             "current_gdf": gdf_attributes,
             "filename": document.file_name,
-            "cached_df_dict": attr_df.to_dict(orient="records"),
         }
 
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📋 View Attributes Table", callback_data="action_attributes")],
             [InlineKeyboardButton("🔬 Run Spatial DSS Analysis", callback_data="action_analysis")],
         ])
-        await status_msg.delete()
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
         await message.reply_text(
             f"✅ *Layer Ingested Successfully!*\n\n"
             f"📁 *File:* `{document.file_name}`\n"
@@ -287,8 +303,10 @@ async def handle_document(client: Client, message: Message) -> None:
         )
     except Exception as exc:
         logger.error("Failed to parse or ingest uploaded vector document.", exc_info=True)
-        if status_msg:
+        try:
             await status_msg.edit_text(f"❌ *Vector ingestion failed:* {exc}", parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
     finally:
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
@@ -304,10 +322,9 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
     uploaded_gdf = user_session.get("current_gdf")
     if uploaded_gdf is None and user_session.get("current_feature") is not None:
         uploaded_gdf = gpd.GeoDataFrame.from_features([user_session["current_feature"]])
-    cached_records = user_session.get("cached_df_dict")
     filename = user_session.get("filename", "layer")
 
-    if uploaded_gdf is None or cached_records is None:
+    if uploaded_gdf is None:
         await callback_query.edit_message_text("❌ Session expired. Please upload your vector file again.")
         return
 
@@ -315,7 +332,9 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
 
     if action == "action_attributes":
         await client.send_chat_action(chat_id=user.id, action=ChatAction.UPLOAD_DOCUMENT)
-        df = pd.DataFrame(cached_records)
+
+        df = pd.DataFrame(uploaded_gdf.drop(columns=["geometry"], errors="ignore").to_dict(orient="records"))
+
         text_preview = f"📊 *Attributes Table Preview for `{filename}`*\n"
         text_preview += f"Total rows detected: `{len(df)}` \n\n"
         text_preview += "```text\n"
@@ -363,6 +382,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
             return
 
         from modules.storage import _get_supabase
+
         await status_msg.edit_text("🛰 *Aligning layout against Spatial Mesh Framework Grid…*")
         supabase = _get_supabase()
         with open(grid_local_path, "wb") as f:
@@ -375,6 +395,9 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
 
         for poly_index, row in uploaded_gdf.iterrows():
             polygon_number = poly_index + 1
+            demr_paths: list[str] = []
+            passed_demr_paths: list[str] = []
+
             try:
                 user_geom = row.geometry
                 if user_geom is None or user_geom.is_empty:
@@ -382,16 +405,29 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
 
                 single_gdf = gpd.GeoDataFrame([row.to_dict()], geometry="geometry", crs=uploaded_gdf.crs)
                 user_utm = single_gdf.to_crs(epsg=32644)
+
                 calculated_area_ha = float(user_utm.geometry.area.sum() / 10000.0)
+                if pd.isna(calculated_area_ha) or calculated_area_ha <= 0:
+                    logger.warning("Polygon %s area is zero or NaN.", polygon_number)
+                    continue
+
+                centroid_series = gpd.GeoSeries([user_utm.geometry.unary_union.centroid], crs=user_utm.crs).to_crs("EPSG:4326")
+                centroid_lonlat = centroid_series.iloc[0]
+
+                user_geom_wgs84 = _align_gdf_crs(single_gdf.copy(), "EPSG:4326").geometry.iloc[0]
                 single_feature = {
                     "type": "Feature",
                     "properties": {"polygon_id": polygon_number, "source_file": filename},
-                    "geometry": mapping(_align_gdf_crs(single_gdf.copy(), "EPSG:4326").geometry.iloc),
+                    "geometry": mapping(user_geom_wgs84),
                 }
 
-                await status_msg.edit_text(f"📍 *Processing polygon `{polygon_number}/{polygon_total}`…*", parse_mode=ParseMode.MARKDOWN)
+                await status_msg.edit_text(
+                    f"📍 *Processing polygon `{polygon_number}/{polygon_total}`…*",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
                 intersecting_cells = grid_gdf[grid_gdf.geometry.intersects(user_geom)]
                 target_grid_ids = intersecting_cells["TopoSheet_No"].dropna().astype(str).unique().tolist()
+
                 if not target_grid_ids:
                     await callback_query.message.reply_text(
                         f"⚠️ *Polygon `{polygon_number}/{polygon_total}`:* The uploaded boundary does not intersect the study framework grid area.",
@@ -402,11 +438,9 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                 fcm_intersected_gdfs: list[gpd.GeoDataFrame] = []
                 ftm_intersected_gdfs: list[gpd.GeoDataFrame] = []
                 dem_intersected_gdfs: list[gpd.GeoDataFrame] = []
-                demr_paths: list[str] = []
 
                 for grid_id in target_grid_ids:
-                    # FCM
-                    fcm_doc = getattr(db, "fcm_layers").find_one({"grid_id": grid_id, "data_type": "FCM"})
+                    fcm_doc = db["fcm_layers"].find_one({"grid_id": grid_id, "data_type": "FCM"})
                     if fcm_doc:
                         fcm_local = tmp_workspace / f"fcm_{grid_id}.gpkg"
                         await client.download_media(fcm_doc["file_id"], file_name=str(fcm_local))
@@ -416,8 +450,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                             fcm_intersected_gdfs.append(clip_part)
                         fcm_local.unlink(missing_ok=True)
 
-                    # FTM
-                    ftm_doc = getattr(db, "ftm_layers").find_one({"grid_id": grid_id, "data_type": "FTM"})
+                    ftm_doc = db["ftm_layers"].find_one({"grid_id": grid_id, "data_type": "FTM"})
                     if ftm_doc:
                         ftm_local = tmp_workspace / f"ftm_{grid_id}.gpkg"
                         await client.download_media(ftm_doc["file_id"], file_name=str(ftm_local))
@@ -427,8 +460,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                             ftm_intersected_gdfs.append(clip_part)
                         ftm_local.unlink(missing_ok=True)
 
-                    # DEM vector
-                    dem_doc = getattr(db, "dem_layers").find_one({"grid_id": grid_id, "data_type": "DEM"})
+                    dem_doc = db["dem_layers"].find_one({"grid_id": grid_id, "data_type": "DEM"})
                     if dem_doc:
                         dem_local = tmp_workspace / f"dem_{grid_id}.gpkg"
                         await client.download_media(dem_doc["file_id"], file_name=str(dem_local))
@@ -438,16 +470,11 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                             dem_intersected_gdfs.append(clip_part)
                         dem_local.unlink(missing_ok=True)
 
-                    # DEMR raster
-                    demr_doc = getattr(db, "demr_layers", None)
-                    if demr_doc is not None:
-                        demr_doc = demr_doc.find_one({"grid_id": grid_id, "data_type": "DEMR"})
+                    demr_doc = db["demr_layers"].find_one({"grid_id": grid_id, "data_type": "DEMR"})
                     if demr_doc:
                         demr_local = tmp_workspace / f"demr_{grid_id}.tif"
                         await client.download_media(demr_doc["file_id"], file_name=str(demr_local))
                         demr_paths.append(str(demr_local))
-
-                    gc.collect()
 
                 report_text = (
                     f"🔬 *Conditional Spatial Analysis Report for `{filename}`*\n"
@@ -458,34 +485,34 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
 
                 fcm_class_summary: dict = {}
                 dominant_cover_type = "NO-DATA"
-                passed_fcm_list: list[gpd.GeoDataFrame] = []
+                passed_fcm_list: list[gpd.GeoDataFrame] | None = []
                 passed_ftm_list: list[gpd.GeoDataFrame] = []
                 passed_dem_list: list[gpd.GeoDataFrame] = []
-                passed_demr_paths: list[str] = []
                 dem_metrics: dict = {}
                 ftm_area_ha: Optional[float] = None
 
-                # FCM — LIGHTWEIGHT WORKFLOW (Deduces Non-Forest mathematically by subtraction)
                 if fcm_intersected_gdfs:
-                    fcm_compiled = pd.concat(fcm_intersected_gdfs, ignore_index=True)
-                    logger.info("FCM Columns = %s", fcm_compiled.columns.tolist())
+                    fcm_compiled = gpd.GeoDataFrame(
+                        pd.concat(fcm_intersected_gdfs, ignore_index=True),
+                        geometry="geometry",
+                        crs=uploaded_gdf.crs,
+                    )
                     fcm_compiled["geometry"] = fcm_compiled.geometry.intersection(user_geom)
                     fcm_compiled = fcm_compiled[~fcm_compiled.geometry.is_empty].copy()
-                    
+
                     if not fcm_compiled.empty:
                         fcm_utm = fcm_compiled.to_crs(epsg=32644)
                         class_col = next((c for c in fcm_utm.columns if c.lower() == "class_name"), None)
-                        
+
                         if class_col:
                             fcm_utm["part_area_ha"] = fcm_utm.geometry.area / 10000.0
                             fcm_area_agg = {"VDF": 0.0, "MDF": 0.0, "OPEN FOREST": 0.0, "SCRUB": 0.0, "WATER": 0.0}
                             total_detected_canopy_ha = 0.0
-                            
-                            # Gather active canopy metrics returned from database segments
+
                             for _, row_cell in fcm_utm.iterrows():
                                 c_str = str(row_cell[class_col]).strip().upper()
                                 cell_ha = float(row_cell["part_area_ha"])
-                                
+
                                 if "VDF" in c_str:
                                     standard_label = "VDF"
                                 elif "MDF" in c_str:
@@ -498,11 +525,10 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                                     standard_label = "WATER"
                                 else:
                                     continue
-                                    
+
                                 fcm_area_agg[standard_label] += cell_ha
                                 total_detected_canopy_ha += cell_ha
 
-                            # DEDUCE NON FOREST: Subtract active values from total layout boundary
                             non_forest_balance_ha = max(0.0, calculated_area_ha - total_detected_canopy_ha)
                             fcm_area_agg["NO-DATA"] = non_forest_balance_ha
 
@@ -510,41 +536,40 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                             for standard_label, class_ha in fcm_area_agg.items():
                                 if class_ha <= 0.001:
                                     continue
-                                    
+
                                 c_pct = (class_ha / calculated_area_ha) * 100.0 if calculated_area_ha else 0.0
                                 fcm_class_summary[standard_label] = {"hectares": float(class_ha), "percentage": float(c_pct)}
-                                
-                                if standard_label not in {"WATER", "NO-DATA"} and class_ha > max_area:
+
+                                if standard_label != "NO-DATA" and class_ha > max_area:
                                     max_area = class_ha
                                     dominant_cover_type = standard_label
 
                             if non_forest_balance_ha > max_area:
                                 dominant_cover_type = "NO-DATA"
-                        
+
                         passed_fcm_list = [fcm_compiled]
                         report_text += "🌲 *Forest Canopy Cover (FCM):*\n• Processing Status: `[Natively Evaluated]` ✅\n\n"
                     else:
-                        # Inside grid bounds but completely flat, open clearings
                         fcm_class_summary["NO-DATA"] = {"hectares": float(calculated_area_ha), "percentage": 100.0}
                         dominant_cover_type = "NO-DATA"
-                        passed_fcm_list = []  
+                        passed_fcm_list = []
                         report_text += "🌲 *Forest Canopy Cover (FCM):*\n• Non Forest Area: `100.0%` ✅\n\n"
 
                 elif target_grid_ids:
-                    # Safely within study area coordinates but no forest polygons overlap the site
                     fcm_class_summary["NO-DATA"] = {"hectares": float(calculated_area_ha), "percentage": 100.0}
                     dominant_cover_type = "NO-DATA"
-                    passed_fcm_list = []  
+                    passed_fcm_list = []
                     report_text += "🌲 *Forest Canopy Cover (FCM):*\n• Non Forest Area: `100.0%` ✅\n\n"
-                
                 else:
-                    # Outside study boundary entirely: Flag as None to drop map page generation
                     passed_fcm_list = None
                     report_text += "🌲 *Forest Canopy Cover (FCM):*\n• Processing Status: `[Skipped - Outside Study Boundary Grid]` ⏳\n\n"
 
-                # FTM
                 if ftm_intersected_gdfs:
-                    ftm_compiled = pd.concat(ftm_intersected_gdfs, ignore_index=True)
+                    ftm_compiled = gpd.GeoDataFrame(
+                        pd.concat(ftm_intersected_gdfs, ignore_index=True),
+                        geometry="geometry",
+                        crs=uploaded_gdf.crs,
+                    )
                     ftm_compiled["geometry"] = ftm_compiled.geometry.intersection(user_geom)
                     ftm_compiled = ftm_compiled[~ftm_compiled.geometry.is_empty].copy()
                     ftm_utm = ftm_compiled.to_crs(epsg=32644)
@@ -557,11 +582,12 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                     report_text += "🌿 *Forest Type Mapping (FTM):*\n"
                     report_text += "• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
 
-                # DEM vector
                 if dem_intersected_gdfs:
-                    dem_compiled = pd.concat(dem_intersected_gdfs, ignore_index=True)
-                    logger.info("DEM Columns = %s", dem_compiled.columns.tolist())
-                    logger.info("DEM Sample = %s", dem_compiled.head(3).to_dict("records"))
+                    dem_compiled = gpd.GeoDataFrame(
+                        pd.concat(dem_intersected_gdfs, ignore_index=True),
+                        geometry="geometry",
+                        crs=uploaded_gdf.crs,
+                    )
                     elev_col = next((c for c in dem_compiled.columns if c.lower() in {"elevation", "elev", "contour", "z"}), None)
                     if elev_col:
                         dem_compiled["geometry"] = dem_compiled.geometry.intersection(user_geom)
@@ -590,7 +616,6 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                     report_text += "⛰️ *Topographic Elevation Profiles (DEM):*\n"
                     report_text += "• Processing Status: `[Skipped - Layer Data Inactive/Not Found]` ⏳\n\n"
 
-                # DEMR raster (preferred for contour rendering if present)
                 if demr_paths:
                     demr_metrics, kept_paths = _summarize_raster_dem(demr_paths, user_geom)
                     if demr_metrics:
@@ -616,7 +641,7 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
 
                 results = {
                     "area_ha": calculated_area_ha,
-                    "centroid": [round(float(user_geom.centroid.x), 6), round(float(user_geom.centroid.y), 6)],
+                    "centroid": [round(float(centroid_lonlat.x), 6), round(float(centroid_lonlat.y), 6)],
                     "fcm": {"dominant": dominant_cover_type, "classes": fcm_class_summary},
                     "ftm": {"area_ha": ftm_area_ha},
                     "dem": dem_metrics,
@@ -628,7 +653,13 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                     "_raw_ftm_gdfs": passed_ftm_list,
                     "_raw_dem_gdfs": passed_dem_list,
                     "_raw_demr_paths": passed_demr_paths,
-                    "_map_modes": [m for m in ["fcm" if passed_fcm_list is not None else None, "ftm" if passed_ftm_list else None, "dem" if (passed_demr_paths or passed_dem_list) else None] if m],
+                    "_map_modes": [
+                        m for m in [
+                            "fcm" if passed_fcm_list is not None else None,
+                            "ftm" if passed_ftm_list else None,
+                            "dem" if (passed_demr_paths or passed_dem_list) else None,
+                        ] if m
+                    ],
                     "_has_water": "WATER" in fcm_class_summary,
                     "_contour_interval_m": 20,
                 }
@@ -637,16 +668,6 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                 log_analysis(user.id, polygon_filename, single_feature, {"status": "completed"}, results["centroid"])
 
                 try:
-                    logger.info(
-                        "RENDER_TRACE | file=%s | area=%.2f | fcm_classes=%s | raw_fcm=%s | raw_ftm=%d | raw_dem=%d | raw_demr=%d",
-                        polygon_filename,
-                        results.get("area_ha", 0),
-                        list(results.get("fcm", {}).get("classes", {}).keys()),
-                        len(results.get("_raw_fcm_gdfs")) if results.get("_raw_fcm_gdfs") is not None else "None",
-                        len(results.get("_raw_ftm_gdfs", [])),
-                        len(results.get("_raw_dem_gdfs", [])),
-                        len(results.get("_raw_demr_paths", [])),
-                    )
                     pdf_path = render_map(single_feature, results, polygon_filename, map_mode="bundle")
                     pdf_path.name = f"{polygon_filename}.pdf"
                     await client.send_chat_action(chat_id=user.id, action=ChatAction.UPLOAD_DOCUMENT)
@@ -659,12 +680,10 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                         ),
                         parse_mode=ParseMode.MARKDOWN,
                     )
+                    processed_any = True
                 except Exception as map_err:
                     logger.error("Map rendering module encountered non-fatal dropout error: %s", map_err, exc_info=True)
                     await callback_query.message.reply_text(report_text, parse_mode=ParseMode.MARKDOWN)
-
-                processed_any = True
-                gc.collect()
 
             except Exception as polygon_err:
                 logger.error("Polygon %s analysis failed.", polygon_number, exc_info=True)
@@ -673,15 +692,28 @@ async def handle_button_click(client: Client, callback_query: CallbackQuery) -> 
                     parse_mode=ParseMode.MARKDOWN,
                 )
                 continue
+            finally:
+                for p in demr_paths:
+                    Path(p).unlink(missing_ok=True)
+                gc.collect()
 
         if not processed_any:
-            await callback_query.message.reply_text("⚠️ No valid polygon reports could be generated from the uploaded file.", parse_mode=ParseMode.MARKDOWN)
-        await status_msg.delete()
+            await callback_query.message.reply_text(
+                "⚠️ No valid polygon reports could be generated from the uploaded file.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
     except Exception as err:
         logger.error("Error executing dynamic channel vector intersections pipeline", exc_info=True)
-        if "status_msg" in locals():
+        try:
             await status_msg.edit_text(f"❌ *Analysis Execution Failed:* {err}", parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
     finally:
         if tmp_workspace.exists():
             shutil.rmtree(tmp_workspace, ignore_errors=True)
@@ -700,11 +732,13 @@ async def catch_all_text(client: Client, message: Message) -> None:
 
 
 from utils.texttest import render_texttest_pdf, render_texttest_png
+
+
 @Client.on_message(filters.command("testtext"))
 async def testtext_handler(client, message: Message):
     arg = None
     if len(message.command) > 1:
-        [cite_start]arg = message.command[1].strip().lower()
+        arg = message.command[1].strip().lower()
 
     if arg == "png":
         out = render_texttest_png()
@@ -724,7 +758,7 @@ from utils.dev_render import render_fake_report
 async def testrender_handler(client, message: Message):
     mode = "bundle"
     if len(message.command) > 1:
-        [cite_start]mode = message.command[1].strip().lower()
+        mode = message.command[1].strip().lower()
 
     if mode not in {"bundle", "fcm", "ftm", "dem"}:
         mode = "bundle"
